@@ -1,0 +1,7 @@
+[Unit]
+Description=Moses infrastructure inventory — describe Reserve as it actually is
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/moses/agent/moses-inventory

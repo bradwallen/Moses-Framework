@@ -1,0 +1,765 @@
+#!/usr/bin/env bash
+# knight-run — the detached worker. Not called by hand; `knight start` launches it.
+#
+#   knight-run <job-dir> <repo> <branch>
+#
+# WHY THIS IS ITS OWN FILE
+# The permission lists are ARRAYS containing patterns with spaces, like "Bash(git push:*)".
+# Threading arrays through a quoted `bash -c` and back out of positional parameters is exactly how
+# they got flattened into a string and silently shredded by word-splitting. This sources guards.env
+# directly and expands "${KNIGHT_ALLOW[@]}" properly, so the rules that run are the rules as written.
+#
+# ── THE PUSH IS DONE HERE, NOT BY THE AGENT ──────────────────────────────────
+# Brad reviews the description and then looks at the feature in Viatica, so Knight's work has to
+# reach Customs. That does NOT mean handing the agent push rights:
+#
+#   * `Bash(git push:*)` stays denied for the agent, and the guard suite proves it fires.
+#   * The remote is added only AFTER the gate is green, and removed immediately after the push. For
+#     the entire window the agent is running, the clone still has no remote — which was the original
+#     guarantee, and that window is where it matters.
+#   * The gate is objective and run HERE, in plain bash: the full vitest suite and tsc --noEmit.
+#     Not "the agent said tests pass" — an agent reporting its own green light is the thing that
+#     makes an unattended push dangerous. Red means no push, and the Slack report says so.
+
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+DIR="$1"; REPO="$2"; BRANCH="$3"; TARGET="${4:-viatica}"; INCIDENT="${5:-}"
+# shellcheck disable=SC1091
+source "$MOSES_ROOT/knight/guards.env"
+# The registry says what the gate is and where green work lands. Sourced here rather than passed in,
+# so the runner reads the same file `knight doctor` and `knight targets` print — one source of truth
+# for the three places that describe a target.
+# The same defaults `knight`'s load_target sets first. Without them a target file that leaves out an
+# optional field (KT_PUSH_REMOTE is one) killed this runner on its first line under `set -u` — and the
+# job stayed "running" forever, because the runner is what would have written anything else. Found
+# 2026-09-21 with a target written by test-runner.sh.
+KT_DESC=""; KT_SOURCE=""; KT_BRANCH=""; KT_PUSH_MODE=""; KT_PUSH_REMOTE=""; KT_PREP=(); KT_GATE=()
+# shellcheck disable=SC1090
+source "$MOSES_ROOT/knight/targets/$TARGET.env" || { echo failed > "$DIR/status"; exit 1; }
+[ -n "$KT_PUSH_REMOTE" ] || KT_PUSH_REMOTE=$(git -C "$KT_SOURCE" remote get-url origin 2>/dev/null)
+OPTENV=$MOSES_CONFIG_DIR/knight.env
+# THE ONE RUNNER (M20, 2026-09-14). The builder's and the reviewer's command lines are built by
+# agent/claude-run from guards.env, with --restricted and --strict-mcp-config always on and --tools and
+# --allowedTools built from one declaration. It execs the CLI, so the timeouts below still reach the
+# CLI itself, and result.json keeps the CLI's own shape.
+RUNNER=$MOSES_ROOT/agent/claude-run
+
+cd "$REPO" || { echo failed > "$DIR/status"; exit 1; }
+
+# ── Run the agent ────────────────────────────────────────────────────────────
+# KNIGHT_FAKE_AGENT is a TEST SEAM, not a feature: it substitutes `sleep N` for the model so the
+# timeout/kill/record path can be proven in seconds instead of an hour, and without spending any of
+# Brad's Pro allowance. The wall-clock SIGKILL is the backstop the entire unattended design leans
+# on, and it went a full day untested while `doctor` printed "wall-clock ceiling 60 min" with total
+# confidence — a claim nobody had ever exercised. It gets exercised now.
+if [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
+    timeout --signal=TERM --kill-after=5 "$KNIGHT_TIMEOUT_SEC" \
+        sleep "$KNIGHT_FAKE_AGENT" > "$DIR/result.json" 2> "$DIR/stderr.log"
+    rc=$?
+else
+    timeout --signal=TERM --kill-after=30 "$KNIGHT_TIMEOUT_SEC" \
+        "$RUNNER" --app knight-builder --prompt-file "$DIR/brief.txt" \
+        > "$DIR/result.json" 2> "$DIR/stderr.log"
+    rc=$?
+fi
+
+commits=$(git -C "$REPO" rev-list --count FETCH_HEAD.."$BRANCH" 2>/dev/null || echo 0)
+report=$(python3 -c "
+import json
+try: print(json.load(open('$DIR/result.json')).get('result') or '')
+except Exception: print('')" 2>/dev/null)
+printf '%s\n' "$report" > "$DIR/report.txt"
+
+# A REFUSED TOOL IS NOT A SUCCESS (M20). The CLI exits 0 when a tool is quietly denied, so the run is
+# classified as ok, degraded or failed and recorded, and a degraded build says what it was refused in
+# the report Brad reads.
+perm=$("$RUNNER" --classify "$DIR/result.json" 2>/dev/null || echo "unclassified")
+printf '%s\n' "$perm" > "$DIR/permission.txt"
+case "$perm" in
+    degraded*) printf '\n_Refused during the build: %s_\n' "${perm#degraded: }" >> "$DIR/report.txt" ;;
+esac
+
+# ── Reading the review's verdict ─────────────────────────────────────────────
+# Lives in lib/review-verdict.sh, because `knight-land` has to make the SAME judgement before it
+# merges a branch as this makes before it pushes one. Two copies would drift, and the drift would
+# be invisible until a branch landed that this runner would have blocked.
+source "$(dirname "$0")/../lib/review-verdict.sh"
+
+# ── Back to whoever asked ────────────────────────────────────────────────────
+# Brad, 2026-09-11, in #the_4_horsemen: "Ping me here when Knight is done." Moses promised it twice
+# and nothing could deliver it — this runner reported to #viatica-dev and nowhere else. Now, when the
+# listener recorded the conversation that started the job (agent/knight_notify.py writes
+# notify.json), the outcome goes back there too: the SAME headline as the full report, so the two can
+# never disagree, and a pointer to it.
+#
+# A FUNCTION so test-notify.sh drives the real payload. Prints nothing when there is nobody to tell,
+# including when the conversation IS the report channel's top level — the report is already there.
+notify_payload() {
+    local nfile=$1 headline=$2 report_chan=$3 job=$4
+    [ -r "$nfile" ] || return 0
+    jq -ce --arg h "$headline" --arg rc "$report_chan" --arg j "$job" '
+        select((.channel // "") != "" and (.channel != $rc or (.thread_ts // "") != ""))
+        | {channel, username: "Knight", icon_emoji: ":crossed_swords:", unfurl_links: false,
+           text: ((if (.user // "") != "" then "<@\(.user)> " else "" end)
+                  + "Knight finished `\($j)`\n\($h)"
+                  + (if $rc != "" and $rc != .channel then "\n_Full report in <#\($rc)>._" else "" end))}
+        + (if (.thread_ts // "") != "" then {thread_ts} else {} end)' "$nfile" 2>/dev/null || true
+}
+
+run_review() {
+    # Extracted 2026-09-04 so it can run on BOTH paths. It used to live inside the
+    # successful-rebase branch, which meant the one class of build most likely to need a
+    # second pair of eyes — the one that could not land cleanly — was the only class that got
+    # none. Moses spotted that within minutes of the first real end-to-end run: "a conflict is
+    # a merge problem, not a correctness problem; the diff was still reviewable."
+    #
+    # It does not push and never has. Whether the work lands is decided by the caller.
+    # Atlas, 2026-09-02: the reviewer being a separate agent from the author is the
+    # load-bearing part, not the review itself. An agent reading its own diff is a green
+    # that was never able to go red. And his sharper correction: a gate the checked thing
+    # invokes is still self-review even if it is compiled — so this is a fixed step in the
+    # runner, never something the brief asks the builder to run.
+    #
+    # CONFIRMED blocks the push exactly like a red test. PLAUSIBLE is recorded and the push
+    # proceeds, so "there might be a problem here" can neither quietly stop the build nor
+    # quietly vanish.
+    #
+    # A REVIEW THAT COULD NOT RUN BLOCKS. Not "could not look, therefore fine" — that is the
+    # failure this whole estate keeps paying for. If the reviewer times out, crashes or
+    # returns something unparseable, nothing ships and the report says exactly why.
+    review_ok=1; review_why=""; plausible=""
+    if [ "${regate:-1}" -eq 1 ]; then
+        git -C "$REPO" diff FETCH_HEAD..HEAD > "$DIR/review.diff" 2>/dev/null
+        if [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
+            # Test seam, same as the builder: exercise the parse and the block/allow paths
+            # without spending any of Brad's allowance.
+            printf '%s\n' "${KNIGHT_FAKE_REVIEW:-CLEAN}" > "$DIR/review.txt"
+            rrc=0
+        else
+            timeout --signal=TERM --kill-after=15 "$KNIGHT_REVIEW_TIMEOUT_SEC" \
+                "$RUNNER" --app zryachiy-reviewer --prompt-file "$DIR/review-brief.txt" --add-dir "$DIR" \
+                > "$DIR/review.json" 2> "$DIR/review.err"
+            rrc=$?
+            "$RUNNER" --classify "$DIR/review.json" > "$DIR/review-permission.txt" 2>/dev/null
+            python3 -c "
+import json,sys
+try: sys.stdout.write(json.load(open('$DIR/review.json')).get('result') or '')
+except Exception: pass" > "$DIR/review.txt" 2>/dev/null
+        fi
+
+        review_verdict "$rrc" "$DIR/review.txt"
+
+        # ── Zryachiy says it himself, in the channel ──────────────────
+        # His verdict used to reach Brad only as a clause inside Knight's report, which is
+        # the builder announcing his own review. Brad, 2026-09-04: put him in the dev
+        # channel. Posted BEFORE the push, so what the room sees is the decision that gated
+        # it — and a block is visible even though no report follows.
+        ZENV=$MOSES_CONFIG_DIR/knight.env
+        if [ -r "$ZENV" ]; then
+            # shellcheck disable=SC1090
+            ztok=$(. "$ZENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
+            # Overridable so the suite does not post into the real channel — see bin/knight for why
+            # this is an override and not a "do not post" flag.
+            if [ -n "${KNIGHT_SLACK_CHANNEL+x}" ]; then zchan=$KNIGHT_SLACK_CHANNEL; else
+                zchan=$(. "$ZENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
+            if [ -n "$ztok" ] && [ -n "$zchan" ]; then
+                if [ "$review_ok" -eq 1 ] && [ -z "$plausible" ]; then
+                    zmsg=":white_check_mark: *clean* — no defects, and it meets what was asked."
+                elif [ "$review_ok" -eq 1 ]; then
+                    zmsg=":warning: *passing, with a note recorded on the commit*
+\`\`\`
+$plausible
+\`\`\`"
+                else
+                    zmsg=":no_entry: *blocked — nothing was pushed*
+$review_why"
+                fi
+                # Say when the verdict is advisory. On a failed rebase nothing lands
+                # regardless, and a green tick with no deploy behind it is exactly the kind
+                # of report that trains people to skim past the ones that mean something.
+                [ "${rebase_failed:-0}" -eq 1 ] && zmsg="$zmsg
+_(advisory — the branch could not be rebased, so nothing lands from this run either way)_"
+                curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+                    -H "Authorization: Bearer $ztok" \
+                    -H 'Content-type: application/json; charset=utf-8' \
+                    --data "$(jq -n --arg c "$zchan" \
+                                    --arg t "$(printf '_reviewing %s on *%s*_\n%s' "$BRANCH" "$TARGET" "$zmsg")" \
+                                '{channel:$c,text:$t,username:"Zryachiy",icon_emoji:":eye:"}')" \
+                    > "$DIR/zryachiy-slack.json" 2>&1
+                jq -e '.ok == true' "$DIR/zryachiy-slack.json" >/dev/null 2>&1 \
+                    || echo "zryachiy_post=FAILED" >> "$DIR/gate.log"
+            fi
+        fi
+    fi
+}
+
+# ── The gate ─────────────────────────────────────────────────────────────────
+gate_ok=0; gate_why=""; rebase_failed=0
+if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    gate_why="hit the ${KNIGHT_TIMEOUT_SEC}s wall-clock ceiling and was killed"
+elif [ "$rc" -ne 0 ]; then
+    gate_why="the agent exited $rc"
+elif [ "$commits" -eq 0 ]; then
+    gate_why="nothing was committed, so there is nothing to push"
+else
+    # Every command from the target's KT_GATE, in order, first red wins. Named in the failure so the
+    # report says which check failed rather than "the gate failed" — Brad reads the report, not the log.
+    : > "$DIR/gate.log"
+    gate_ok=1
+    for step in "${KT_GATE[@]}"; do
+        echo "== gate: $step ==" >> "$DIR/gate.log"
+        if ! ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ); then
+            gate_ok=0
+            gate_why="the gate failed at: $step"
+            # Say what nobody could tell from the log: whether Knight broke it, or arrived to it
+            # already broken. A stale generated artifact in the clone made every Viatica job red for
+            # a week while the reports blamed the work. `knight provision` runs this same gate on an
+            # untouched checkout and answers it in one command.
+            gate_why="$gate_why (if this looks unrelated to the task, run: knight provision $TARGET — it runs the same gate on an untouched $KT_BRANCH)"
+            break
+        fi
+    done
+fi
+
+# ── Push, only on green ──────────────────────────────────────────────────────
+pushed=0; push_note=""
+# Never let git stop and ask. Without these it can block on a credential prompt or an unknown host
+# key until the wall-clock ceiling kills it — turning a one-line auth failure into a lost hour of
+# Brad's allowance. GIT_TERMINAL_PROMPT=0 makes https fail fast; BatchMode does the same for ssh.
+export GIT_TERMINAL_PROMPT=0
+export GIT_SSH_COMMAND='ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'
+if [ "$gate_ok" -eq 1 ]; then
+    # The mainline moves: Brad and other sessions push while Knight works. Rebase onto the current
+    # tip rather than force anything, and re-run the gate afterwards — a clean rebase can still break
+    # the build when someone else changed what this code depends on.
+    if git -C "$REPO" fetch -q "$KT_PUSH_REMOTE" "$KT_BRANCH" 2>>"$DIR/gate.log"; then
+        # --autostash BECAUSE THE BUILD DIRTIES THE TREE AND THAT IS NORMAL. 2026-09-04, the
+        # first real end-to-end run: `npm install` rewrote package-lock.json (Viatica's committed
+        # lockfile disagrees with its package.json), git refused with "cannot rebase: You have
+        # unstaged changes", and the whole chain stopped. Uncommitted files were never going to be
+        # pushed anyway — only commits are — so blocking on them protected nothing.
+        if git -C "$REPO" rebase -q --autostash FETCH_HEAD >>"$DIR/gate.log" 2>&1; then
+            regate=1
+            for step in "${KT_GATE[@]}"; do
+                echo "== re-gate after rebase: $step ==" >> "$DIR/gate.log"
+                ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ) || { regate=0; break; }
+            done
+            run_review
+
+            if [ "$regate" -eq 1 ] && [ "$review_ok" -eq 1 ]; then
+                # PLAUSIBLE travels with the code. A message-only amend cannot change what the gate
+                # just proved, and git log is where the next person actually looks.
+                if [ -n "$plausible" ]; then
+                    git -C "$REPO" commit -q --amend --no-edit -m "$(git -C "$REPO" log -1 --pretty=%B)
+
+Review (unconfirmed, recorded rather than blocking):
+$plausible" 2>>"$DIR/gate.log" || true
+                fi
+                git -C "$REPO" remote add push-target "$KT_PUSH_REMOTE" 2>/dev/null
+                # WHERE GREEN WORK LANDS — the one difference between the two modes, and it is read
+                # from the registry, never decided here. `direct` lands on the mainline and deploys.
+                # `branch` pushes the work branch and stops: the repositories that RUN Knight get a
+                # human between a green gate and a merge, because a change there can break the gate
+                # that would have caught it.
+                if [ "$KT_PUSH_MODE" = direct ]; then
+                    refspec="HEAD:$KT_BRANCH"
+                else
+                    refspec="HEAD:refs/heads/$BRANCH"
+                fi
+                if git -C "$REPO" push -q push-target "$refspec" >>"$DIR/gate.log" 2>&1; then
+                    pushed=1
+                    push_note="$(git -C "$REPO" rev-parse --short HEAD)"
+                    [ "$KT_PUSH_MODE" = direct ] || push_note="$push_note on branch $BRANCH — NOT merged"
+                else
+                    gate_why="push was rejected — see gate.log"
+                fi
+                # Off again immediately. The clone must be remote-less whenever an agent runs.
+                git -C "$REPO" remote remove push-target 2>/dev/null
+            elif [ "$regate" -eq 0 ]; then
+                gate_why="the gate passed alone but FAILED after rebasing onto current $KT_BRANCH — someone else's change conflicts with this work"
+                git -C "$REPO" rebase --abort 2>/dev/null
+            else
+                # SAY WHICH GATE STOPPED IT. This branch used to blame the rebase for everything,
+                # and with a review step in front of the push that would have reported a blocking
+                # finding as somebody else's merge conflict — sending Brad to look at the wrong thing.
+                gate_why="$review_why"
+                git -C "$REPO" rebase --abort 2>/dev/null
+            fi
+        else
+            # SAY WHAT ACTUALLY FAILED. This asserted a merge conflict for EVERY rebase failure. On
+            # 2026-09-04 the real error was "cannot rebase: You have unstaged changes" — the build
+            # had rewritten package-lock.json — and the report sent Brad, Moses and Claude all
+            # looking for a conflict that did not exist. Naming a cause nobody observed is the
+            # failure this estate keeps paying for; a message is a claim like any other.
+            rb_err=$(tail -20 "$DIR/gate.log" | grep -iE "^(error|fatal|CONFLICT)" | tail -2 | tr '\n' ' ')
+            case "$rb_err" in
+              *CONFLICT*|*"could not apply"*)
+                    gate_why="$KT_BRANCH moved and the rebase genuinely conflicted — needs a human merge" ;;
+              *"unstaged changes"*|*"local changes"*)
+                    gate_why="the rebase could not start: the working tree was dirty ($rb_err)" ;;
+              "")   gate_why="the rebase onto $KT_BRANCH failed and git printed no error this runner could find — see gate.log" ;;
+              *)    gate_why="the rebase onto $KT_BRANCH failed: $rb_err" ;;
+            esac
+            git -C "$REPO" rebase --abort 2>/dev/null
+            rebase_failed=1
+            # REVIEW IT ANYWAY. Nothing will be pushed — but the diff is readable, and the person
+            # who now has to merge by hand should start from a verdict instead of an unreviewed
+            # change. Moses, 2026-09-04: "review is wired behind a clean rebase, which means the one
+            # class of build most likely to need a second pair of eyes is exactly the class that
+            # gets none."
+            regate=1
+            run_review
+            case "$review_ok" in
+              0) gate_why="$gate_why · Zryachiy ALSO blocked it: $review_why" ;;
+              *) gate_why="$gate_why · Zryachiy reviewed it anyway and did not block" ;;
+            esac
+        fi
+    else
+        gate_why="could not fetch $KT_BRANCH to rebase onto"
+    fi
+fi
+
+# ── Did it actually reach customers, and is it working? ──────────────────────
+#
+# THE GATE RUNS IN A CLONE AND NEVER LEAVES THE PROCESS. Brad proved that by sabotage: a totally
+# broken PDF import passed the whole 711-test suite. So a green gate plus a successful push says the
+# code was pushed — it says nothing about whether the deploy landed or whether the product still
+# works for the people using it.
+#
+# Brad, 2026-09-04: "both report back to Moses that the deployment was a success". This is the half
+# that makes that sentence honest rather than assumed.
+#
+# TWO SOURCES, AND THEY ANSWER DIFFERENT QUESTIONS.
+#   1. Railway's own deployment record — the DECLARATION that our commit built and went live.
+#   2. The running product answering over the internet — the BEHAVIOR.
+# Either alone is the failure this estate keeps paying for. A platform can report SUCCESS for a
+# container that crash-loops on first request, and a site can answer 200 while still serving the
+# previous build.
+#
+# ONLY ON A TARGET THAT ACTUALLY DEPLOYS. `branch` targets land for a human to merge, so there is
+# nothing live to verify and nothing to roll back.
+deploy_state=""; deploy_why=""; rolled_back=0
+if [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ]; then
+    sha_full=$(git -C "$REPO" rev-parse HEAD)
+    sha_short=$(git -C "$REPO" rev-parse --short HEAD)
+    CUSTOMS_ENV=$MOSES_CONFIG_DIR/customs.env
+    app_url=""; app_sec=""
+    if [ -r "$CUSTOMS_ENV" ]; then
+        # shellcheck disable=SC1090
+        app_url=$(. "$CUSTOMS_ENV"; printf '%s' "${VIATICA_APP_URL:-}")
+        app_sec=$(. "$CUSTOMS_ENV"; printf '%s' "${CRON_SECRET:-}")
+    fi
+
+    # A User-Agent is required, not cosmetic: Cloudflare answers a default curl agent with 403,
+    # which reads exactly like an auth failure and once cost six days of wrong diagnosis.
+    UA='Knight/1.0 (+viatica-ops)'
+    probe() { curl -sS -o /dev/null -w '%{http_code}' --max-time 25 -A "$UA" "$@" 2>>"$DIR/deploy.log"; }
+
+    {
+        echo "== verifying deploy of $sha_short =="
+        date -Is
+    } >> "$DIR/deploy.log"
+
+    # ── 1. Railway's record ──────────────────────────────────────────────────
+    # Poll until our commit appears with a terminal status. A build takes minutes; the ceiling is
+    # generous and running out is a FAILURE, never a pass. "Could not look" is not "looked and it
+    # was fine" — the rule this whole estate keeps relearning.
+    rw_state="unknown"
+    for _i in $(seq 1 "${KT_DEPLOY_WAIT_TRIES:-40}"); do
+        line=$(sudo -n railway-read deploys 2>>"$DIR/deploy.log" | grep -m1 -- "$sha_short" || true)
+        case "$line" in
+            *SUCCESS*)                 rw_state=success; break ;;
+            *FAILED*|*CRASHED*)        rw_state=failed;  break ;;
+        esac
+        printf 'waiting for railway: %s\n' "${line:-our commit has not appeared yet}" >> "$DIR/deploy.log"
+        sleep "${KT_DEPLOY_WAIT_SEC:-15}"
+    done
+
+    if [ "$rw_state" = failed ]; then
+        deploy_state=failed; deploy_why="Railway reports the deployment of $sha_short FAILED"
+    elif [ "$rw_state" != success ]; then
+        deploy_state=unverified
+        deploy_why="Railway never reported $sha_short as deployed within the wait — this is NOT a pass"
+    else
+        # ── 2. The product itself ────────────────────────────────────────────
+        # Repeated on purpose. One 5xx during a rolling restart is normal; three in a row is the
+        # deploy. Rolling back good code because Cloudflare hiccuped would be the false positive
+        # that gets the whole mechanism switched off.
+        if [ -z "$app_url" ] || [ -z "$app_sec" ]; then
+            deploy_state=unverified
+            deploy_why="deployed, but Viatica credentials are not on this box so nothing checked the live site"
+        else
+            bad=0; last=""
+            for _i in 1 2 3; do
+                home=$(probe "${app_url%/}/")
+                deps=$(probe -H "Authorization: Bearer $app_sec" "${app_url%/}/api/health/deps")
+                echo "attempt $_i: home=$home deps=$deps" >> "$DIR/deploy.log"
+                if [ "$home" = 200 ] && [ "$deps" = 200 ]; then bad=0; break; fi
+                bad=$((bad+1)); last="home=$home deps=$deps"
+                sleep 10
+            done
+            if [ "$bad" -eq 0 ]; then
+                deploy_state=live
+                deploy_why="$sha_short is live and answering; dependencies green"
+            else
+                deploy_state=broken
+                deploy_why="deployed, but the live site is not healthy after 3 checks ($last)"
+            fi
+        fi
+    fi
+
+    # ── 3. Pull the plug ─────────────────────────────────────────────────────
+    # REVERT, NEVER RESET OR FORCE. A revert is a new commit: the history stays honest, the next
+    # deploy is triggered the same way every other one is, and nothing anybody else pushed is lost.
+    # Brad, 2026-09-04: Zryachiy should be "capable of pulling the plug if something is off".
+    #
+    # `unverified` deliberately does NOT roll back. Not knowing whether a deploy landed is not
+    # evidence that it broke something, and reverting on ignorance would make a Railway API blip
+    # revert good work. It is reported as loudly as a failure and left for a human.
+    case "$deploy_state" in
+      failed|broken)
+        if [ "${KT_ROLLBACK:-1}" = 1 ]; then
+            echo "== rolling back $sha_short ==" >> "$DIR/deploy.log"
+            git -C "$REPO" remote add push-target "$KT_PUSH_REMOTE" 2>/dev/null
+            if git -C "$REPO" revert --no-edit "$sha_full" >>"$DIR/deploy.log" 2>&1 &&
+               git -C "$REPO" push -q push-target "HEAD:$KT_BRANCH" >>"$DIR/deploy.log" 2>&1; then
+                rolled_back=1
+                deploy_why="$deploy_why — ROLLED BACK, $(git -C "$REPO" rev-parse --short HEAD) reverts it"
+            else
+                # The worst case, and it must never be quiet: broken code is live and the way back
+                # did not work either.
+                deploy_why="$deploy_why — ROLLBACK ALSO FAILED. Broken code is live. See deploy.log"
+            fi
+            git -C "$REPO" remote remove push-target 2>/dev/null
+        else
+            deploy_why="$deploy_why — rollback is disabled for this target"
+        fi ;;
+    esac
+    echo "$deploy_state: $deploy_why" >> "$DIR/deploy.log"
+    # ── THE VERIFICATION LEDGER ──────────────────────────────────────────────
+    # A DEPLOY THAT LANDED IS NOT A REQUEST THAT IS DONE. Brad, 2026-09-04: "a request isn't marked
+    # as closed until everything is verified, even if I'm one of the holdups."
+    #
+    # Zryachiy judged the criteria against the DIFF. Nobody has yet judged them against the running
+    # product, and some of them nobody in this pipeline can — an admin-gated change renders only for
+    # a logged-in admin, and Moses gets a 307 to /login. Giving him an admin session was considered
+    # and refused: this estate's line is that the agent never holds the credential.
+    #
+    # So the ledger names every criterion, says WHO can check it, and starts everything unverified.
+    # A criterion Moses can reach is his; one marked [admin] is Brad's. The job is not done until
+    # every row is verified, and the standup carries whatever is still open.
+    if [ -s "$DIR/acceptance.txt" ]; then
+        python3 - "$DIR/acceptance.txt" "$DIR/verification.json" "$deploy_state" "$DIR/review.txt" <<'PY'
+import json, sys, datetime
+crit_file, out_file, deploy = sys.argv[1], sys.argv[2], sys.argv[3]
+review_file = sys.argv[4] if len(sys.argv) > 4 else None
+
+# WHAT THE REVIEWER ALREADY SETTLED. Zryachiy reads the criteria one at a time against the diff, so
+# the ones a diff CAN answer — a file deleted, a string absent, the gate green — are closed by him
+# with the diff as evidence. Only what a diff cannot show reaches the live-site stage.
+#
+# Without this the ledger asked Moses to re-confirm "the test file is deleted" against a running
+# website, which he cannot honestly do. Seven rows on 2026-09-04, five of them already settled at
+# review time. Busywork in a ledger is how a ledger stops being read.
+import re as _re
+settled = {}
+if review_file:
+    try:
+        for line in open(review_file, encoding="utf-8"):
+            m = _re.match(r"\s*SETTLED:\s*(\d+)\s*[-—]\s*(.+)", line)
+            if m:
+                settled[int(m.group(1))] = m.group(2).strip()
+    except OSError:
+        pass
+rows = []
+for line in open(crit_file, encoding="utf-8"):
+    text = line.strip().lstrip("-*• ").strip()
+    if not text:
+        continue
+    # [admin] marks a criterion only Brad can see. Unmarked means Moses should be able to reach it —
+    # and if he cannot, he says so rather than assuming it holds.
+    who = "brad" if text.lower().startswith("[admin]") else "moses"
+    n = len(rows) + 1
+    # A reviewer may never settle an admin-gated row: he is reading a diff, and the whole reason
+    # that row exists is that rendering is not visible in one.
+    if n in settled and who != "brad":
+        rows.append({"criterion": text, "checkable_by": who, "status": "verified",
+                     "by": "zryachiy", "at": datetime.datetime.now().replace(microsecond=0).isoformat(),
+                     "note": "from the diff: " + settled[n][:160]})
+    else:
+        rows.append({"criterion": text, "checkable_by": who, "status": "unverified",
+                     "by": None, "at": None, "note": None})
+json.dump({"deploy": deploy,
+           "opened": datetime.datetime.now().replace(microsecond=0).isoformat(),
+           "criteria": rows}, open(out_file, "w"), indent=2)
+openn = [r for r in rows if r["status"] == "unverified"]
+print(f"   verification ledger: {len(rows)} criterion(s), {len(rows) - len(openn)} settled by "
+      f"Zryachiy from the diff, {len(openn)} open "
+      f"({sum(1 for r in openn if r['checkable_by'] == 'brad')} need Brad)")
+PY
+    fi
+    printf '%s\n' "$deploy_state" > "$DIR/deploy-state"
+    printf '%s\n' "$deploy_why"   > "$DIR/deploy-why"
+fi
+
+# ── Close the incident this job came from, only if the work actually landed ──
+#
+# THE AGENT IS NOT INVOLVED IN THIS. It has no network, no credential and no way to reach Viatica —
+# that sandbox is the reason Knight is safe to run unattended, and handing him an API token to tidy a
+# queue would trade the whole guarantee for a convenience. So the close belongs here, in the runner,
+# exactly like the push: the privileged step is taken by the thing that verified the work, never by
+# the thing that did it.
+#
+# Green gate is not enough on its own — a green gate with nothing pushed means nothing shipped, and
+# an incident closed against work that never reached anybody is a lie the queue then repeats.
+if [ -n "$INCIDENT" ]; then
+    # ROLLED BACK MEANS NOT FIXED. Closing an incident against a change that was reverted minutes
+    # later tells the queue a lie it will then repeat back — the same reason a green gate alone was
+    # never enough to close one.
+    if [ "$pushed" -eq 1 ] && [ "$rolled_back" -eq 0 ] && [ "$deploy_state" != broken ] \
+                           && [ "$deploy_state" != failed ]; then
+        CUSTOMS_ENV=$MOSES_CONFIG_DIR/customs.env
+        if [ -r "$CUSTOMS_ENV" ]; then
+            # shellcheck disable=SC1090
+            via_url=$(. "$CUSTOMS_ENV"; printf '%s' "${VIATICA_APP_URL:-}")
+            via_sec=$(. "$CUSTOMS_ENV"; printf '%s' "${CRON_SECRET:-}")
+            if [ -n "$via_url" ] && [ -n "$via_sec" ]; then
+                note="fixed by Knight in ${push_note%% *} on $BRANCH ($TARGET)"
+                # A User-Agent is required, not cosmetic: Cloudflare's bot rules answer a default
+                # curl/urllib agent with a 403, which reads exactly like an auth failure.
+                if curl -sS --max-time 20 -X POST "${via_url%/}/api/incidents/agent" \
+                     -H "Authorization: Bearer $via_sec" \
+                     -H "Content-Type: application/json" \
+                     -H "User-Agent: Knight/1.0 (+viatica-ops)" \
+                     --data "$(printf '{"id":"%s","resolved":true,"by":"knight","note":"%s"}' "$INCIDENT" "$note")" \
+                     >>"$DIR/gate.log" 2>&1; then
+                    incident_note="closed incident $INCIDENT"
+                else
+                    incident_note="COULD NOT close incident $INCIDENT — see gate.log"
+                fi
+            else
+                incident_note="incident $INCIDENT left open — Viatica credentials not configured on this box"
+            fi
+        else
+            incident_note="incident $INCIDENT left open — $CUSTOMS_ENV unreadable"
+        fi
+    else
+        # Say it rather than staying quiet. "I did not close it" is information; silence looks like
+        # the incident was never attached to the job at all.
+        incident_note="incident $INCIDENT left OPEN — nothing was pushed, so nothing is fixed"
+    fi
+fi
+
+{
+  echo "exit_code=$rc"
+  echo "commits=$commits"
+  echo "gate=$([ "$gate_ok" -eq 1 ] && echo green || echo "red: $gate_why")"
+  [ -n "${incident_note:-}" ] && echo "incident=$incident_note"
+  # Say WHY when a green build did not land. The summary used to print "gate=green / pushed=no" and
+  # stop there, so the reason existed only in the Slack post — and `knight status` showed a job that
+  # succeeded at everything with no hint of what went wrong at the last step.
+  if [ "$pushed" -eq 1 ]; then
+      echo "pushed=yes ($push_note)"
+  else
+      echo "pushed=no$([ "$gate_ok" -eq 1 ] && [ -n "$gate_why" ] && printf ' — %s' "$gate_why")"
+  fi
+  # WHAT HAPPENED AFTER THE PUSH, in the summary rather than only in Slack — `knight status` used
+  # to show a job that succeeded at everything with no hint that the deploy then broke.
+  case "${deploy_state:-}" in
+    live)       echo "deploy=LIVE — $deploy_why" ;;
+    broken)     echo "deploy=BROKEN — $deploy_why" ;;
+    failed)     echo "deploy=FAILED — $deploy_why" ;;
+    unverified) echo "deploy=UNVERIFIED — $deploy_why" ;;
+  esac
+  git -C "$REPO" diff --stat FETCH_HEAD.."$BRANCH" 2>/dev/null | tail -1
+  if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then
+      echo "UNCOMMITTED CHANGES LEFT IN THE TREE — not on the branch, not pushed:"
+      git -C "$REPO" status --short 2>/dev/null | head -10
+  fi
+} > "$DIR/summary"
+
+# THE STATUS IS WHAT ACTUALLY HAPPENED, not what was attempted. A job that pushed, broke Customs
+# and reverted itself is not "pushed" — reading that word later would be actively misleading.
+case "$rc" in
+    124|137) echo timeout > "$DIR/status" ;;
+    0)       if [ "$pushed" -ne 1 ]; then echo "done-not-pushed" > "$DIR/status"
+             else
+                 case "${deploy_state:-}" in
+                   broken|failed) [ "$rolled_back" -eq 1 ] && echo "rolled-back" > "$DIR/status" \
+                                                          || echo "deploy-broken" > "$DIR/status" ;;
+                   unverified)    echo "deploy-unverified" > "$DIR/status" ;;
+                   live)          if [ -s "$DIR/verification.json" ] && \
+                                     python3 -c "
+import json,sys
+d=json.load(open('$DIR/verification.json'))
+sys.exit(0 if any(c['status']=='unverified' for c in d['criteria']) else 1)" 2>/dev/null; then
+                                      echo "awaiting-verification" > "$DIR/status"
+                                  else
+                                      echo "live" > "$DIR/status"
+                                  fi ;;
+                   *)             echo pushed > "$DIR/status" ;;
+                 esac
+             fi ;;
+    *)       echo failed > "$DIR/status" ;;
+esac
+date +%Y-%m-%dT%H:%M:%S%z > "$DIR/ended"
+
+# ── Slack ────────────────────────────────────────────────────────────────────
+# The delivery format Brad already reads from every Viatica push: what shipped, what was decided,
+# what is blocked, what is left. He does not read the diff, so the report IS the deliverable —
+# a vague one is a failed delivery even when the code is fine.
+if [ -r "$OPTENV" ]; then
+    # shellcheck disable=SC1090
+    tok=$(. "$OPTENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
+    # Overridable so the suite does not post into the real channel — see bin/knight for why
+    # this is an override and not a "do not post" flag.
+    if [ -n "${KNIGHT_SLACK_CHANNEL+x}" ]; then chan=$KNIGHT_SLACK_CHANNEL; else
+        chan=$(. "$OPTENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
+    if [ -n "$tok" ] && [ -n "$chan" ]; then
+        # The FIRST LINE only. Brad briefs from his phone with a full spec (SCOPE…, REQUIREMENTS…),
+        # and `head -c 300` dumped that wall into the quote block, burying the report under the ask.
+        task=$(head -1 "$DIR/task.txt" | head -c 200)
+        # SAY WHERE IT WENT, from the registry — not from a sentence written when Viatica was the
+        # only target. This headline was hardcoded to "Pushed to `master` → Customs deploying" and
+        # said that for EVERY successful job: for branch-mode work on the moses target, which lands
+        # on a branch and deploys nothing, and for scratch runs during testing that never touched
+        # Viatica at all. #viatica-dev carried a column of green ticks claiming deploys that had not
+        # happened. The landing mode is the one distinction Brad asked for, and the report was the
+        # one place it was thrown away.
+        # "deploying" WAS A PROMISE, NOT A FACT. It said the same thing whether the deploy then
+        # went live, crash-looped, or was reverted a minute later. Brad, 2026-09-04: the report has
+        # to say the deployment succeeded, and mean it.
+        # THE FIRST SECTION'S LABEL IS DECIDED HERE, BESIDE THE BANNER, so the two can never
+        # disagree. Brad, 2026-09-08, after asking Knight to drop Labs from the Hardware page and
+        # reading back that he had: the banner said "NOT merged, nothing is live" and the very next
+        # line said "*What shipped* — the Hardware page now lists Reserve alone". Both were written
+        # by the same honest run. The banner was right; the label is hardcoded and asserted an
+        # outcome the message itself denied, and that is the line a human remembers.
+        #
+        # Set from the same conditions as $head rather than asked of the agent in the brief — a
+        # label that must be correct is not something to request in prose and hope for.
+        ship_label="What this would do"
+        if [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ] && [ -n "${deploy_state:-}" ]; then
+            case "$deploy_state" in
+              live)       # LANDED IS NOT DONE. If criteria remain unverified the report says so and
+                          # names the ones Brad has to look at himself — the request stays open until
+                          # every row is ticked, including his.
+                          pend=$(python3 -c "
+import json
+try: d=json.load(open('$DIR/verification.json'))
+except Exception: raise SystemExit
+u=[c for c in d['criteria'] if c['status']=='unverified']
+b=[c for c in u if c['checkable_by']=='brad']
+if u: print(f\"{len(u)}|{len(b)}\")" 2>/dev/null)
+                          if [ -n "$pend" ]; then
+                              head="🟡 *$TARGET → deployed, NOT yet done* · \`$push_note\` · ${pend%%|*} criterion(s) unverified, ${pend##*|} need Brad"
+                          else
+                              head="✅ *$TARGET → LIVE on \`$KT_BRANCH\`* · verified answering · \`$push_note\`"
+                          fi
+                          ship_label="What shipped" ;;
+              broken|failed)
+                          if [ "$rolled_back" -eq 1 ]; then
+                              head="↩️ *$TARGET → ROLLED BACK* — the deploy was bad and has been reverted · $deploy_why"
+                              # It shipped and was taken back out, so neither "shipped" nor "would do" is true.
+                              ship_label="What was tried"
+                          else
+                              head="🔴 *$TARGET → BROKEN AND STILL LIVE* — $deploy_why"
+                              ship_label="What shipped"
+                          fi ;;
+              unverified) head="⚠️ *$TARGET → pushed, DEPLOY UNVERIFIED* — $deploy_why"
+                          ship_label="What shipped" ;;
+              *)          head="✅ *$TARGET → pushed to \`$KT_BRANCH\`* · \`$push_note\`"
+                          ship_label="What shipped" ;;
+            esac
+        elif [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ]; then
+            head="✅ *$TARGET → pushed to \`$KT_BRANCH\`* · deploying · \`$push_note\`"
+            ship_label="What shipped"
+        elif [ "$pushed" -eq 1 ]; then
+            head="✅ *$TARGET → pushed for review* · \`$BRANCH\` · NOT merged, nothing is live · \`${push_note%% *}\`"
+        elif [ "$gate_ok" -eq 1 ]; then
+            head="⚠️ *$TARGET → built but NOT pushed* — $gate_why"
+        else
+            head="🔴 *$TARGET → not pushed* — $gate_why"
+        fi
+        # Slack mrkdwn is NOT Markdown (bold is ONE asterisk; ** renders literally), and Brad
+        # reads this on a phone — so the post is normalized AND collapsed to four lines here rather
+        # than trusting the brief alone. The brief asks for compact; this guarantees it. A model
+        # mid-coding-task will occasionally revert to the essay format it writes everywhere else,
+        # and one verbose post trains him to stop reading the channel.
+        slack_report=$(python3 - "$DIR/report.txt" "$ship_label" <<'CONV'
+import re, sys
+
+t = open(sys.argv[1]).read()
+# What the first section is CALLED is decided by the runner from what actually landed, never by the
+# agent writing the report. The brief still asks for "What shipped"; anything in SHIP_FAMILY is
+# matched and re-emitted under the true label. A report cannot claim to have shipped work that is
+# sitting on an unmerged branch, however it was written.
+SHIP = sys.argv[2] if len(sys.argv) > 2 else "What shipped"
+t = re.sub(r"\*\*(.+?)\*\*", r"*\1*", t, flags=re.S)          # **bold** -> *bold*
+t = re.sub(r"^#{1,6}\s*(.+?)\s*$", r"*\1*", t, flags=re.M)     # ## Heading -> *Heading*
+
+CAP = 400                                  # chars per line; Brad reads this on a phone
+# Every name the first section has ever gone by, so an older report still parses and a future brief
+# can reword it without silently falling through to the "unrecognized shape" branch below.
+SHIP_FAMILY = ("What shipped", "What this would do", "What was tried")
+LABELS = SHIP_FAMILY + ("Decisions", "Stoppers", "Notes")
+lines, cur = [], None
+for raw in t.splitlines():
+    s = raw.strip()
+    if not s:
+        continue
+    m = re.match(r"^\*(" + "|".join(LABELS) + r")\*\s*[—:-]?\s*(.*)$", s)
+    if m:
+        cur = [m.group(1), m.group(2).strip()]
+        lines.append(cur)
+    elif cur is not None:
+        # A section written as a heading followed by prose: fold the prose up into its label.
+        cur[1] = (cur[1] + " " + re.sub(r"^[-*\u2022]\s*", "", s)).strip()
+
+if len(lines) >= 2:
+    out = []
+    for label, body in lines:
+        body = re.sub(r"\s+", " ", body).strip() or "None."
+        # Backstop only — the brief asks for two sentences, so this should rarely fire. Cut at a
+        # SENTENCE boundary rather than mid-clause: a line ending "Behavior…" reads like a bug,
+        # and the point of trimming is legibility on a phone, not hitting a character count.
+        if len(body) > CAP:
+            head = body[:CAP]
+            # Semicolons and em-dashes count as boundaries too. With only ". ? !" this fell
+            # through to the crude word-cut on every real report, because Opus writes long
+            # semicolon-joined sentences and there was no period inside the cap.
+            cut = max(head.rfind(". "), head.rfind("? "), head.rfind("! "),
+                      head.rfind("; "), head.rfind(" — "))
+            body = (head[:cut + 1] if cut > CAP // 3 else head.rsplit(" ", 1)[0] + "…")
+        out.append(f"*{SHIP if label in SHIP_FAMILY else label}* — {body}")
+    print("\n".join(out))
+else:
+    # Unrecognized shape: post it as-is rather than mangling it, but keep it bounded.
+    print(t.strip()[:1500])
+CONV
+)
+        body="$head
+
+> $task
+
+$slack_report"
+        curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+            --data "$(jq -nc --arg c "$chan" --arg t "$body" \
+                '{channel:$c,text:$t,username:"Knight",icon_emoji:":crossed_swords:"}')" \
+            > "$DIR/slack.json" 2>&1
+        jq -e '.ok == true' "$DIR/slack.json" >/dev/null 2>&1 || echo "slack_post=FAILED" >> "$DIR/summary"
+
+        # And to the conversation that asked, when there was one. Inside this block on purpose: the
+        # suites empty the channel to post nowhere, and that must silence this too.
+        npay=$(notify_payload "$DIR/notify.json" "$head" "$chan" "$(basename "$DIR")")
+        if [ -n "$npay" ]; then
+            curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+                -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+                --data "$npay" > "$DIR/notify-slack.json" 2>&1
+            jq -e '.ok == true' "$DIR/notify-slack.json" >/dev/null 2>&1 \
+                || echo "notify_post=FAILED" >> "$DIR/summary"
+        fi
+    fi
+fi

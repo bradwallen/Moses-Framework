@@ -1,0 +1,20 @@
+[Unit]
+Description=moses-mcp-public (Moses MCP — user service, no root required to deploy)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/moses/customs.env
+Type=simple
+Environment=MOSES_MCP_HOST=127.0.0.1
+Environment=MOSES_MCP_PORT=8766
+Environment=MOSES_MCP_PROFILE=full
+# The public hostnames this answers to, in ~/.config/moses/mcp-public.env — empty refuses them all.
+Environment=MOSES_MCP_ALLOWED_HOSTS=
+EnvironmentFile=-%h/.config/moses/mcp-public.env
+Environment=MOSES_MEMORY_DIR=%h/.claude/memory
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/mcp_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

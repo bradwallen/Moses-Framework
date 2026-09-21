@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""claude-run — the runner (claude_runner.py) for callers that are not Python.
+
+    claude-run --app knight-builder --prompt-file brief.txt        runs the CLI in place of this process
+    claude-run --app zryachiy-reviewer --prompt-file b.txt --add-dir DIR
+    claude-run --app zryachiy-explorer --prompt-file b.txt --mcp-config cfg.json --approve mcp__x__browser_click ...
+    claude-run --app APP ... --print-argv                          the command, as JSON, instead of running it
+    claude-run --classify result.json                              ok | degraded: <refused tools> | failed
+    claude-run --list                                              every profile, as JSON
+
+It EXECS the CLI, so the caller's `timeout` and kill signals reach the CLI itself, and stdout is the
+CLI's own output: result.json and session.jsonl keep exactly the shape they had.
+
+A request the profile does not allow is refused with exit 64 and nothing runs.
+"""
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import claude_runner as R  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="claude-run")
+    ap.add_argument("--app")
+    ap.add_argument("--prompt")
+    ap.add_argument("--prompt-file")
+    ap.add_argument("--system-prompt-file")
+    ap.add_argument("--mcp-config")
+    ap.add_argument("--add-dir", action="append", default=[])
+    ap.add_argument("--approve", action="append", default=[])
+    ap.add_argument("--deny", action="append", default=[])
+    ap.add_argument("--model")
+    ap.add_argument("--effort")
+    ap.add_argument("--print-argv", action="store_true")
+    ap.add_argument("--classify", metavar="RESULT_JSON")
+    ap.add_argument("--list", action="store_true")
+    a = ap.parse_args()
+
+    if a.list:
+        print(json.dumps({app: R.describe(app) for app in R.APPS}, indent=2))
+        return 0
+    if a.classify:
+        try:
+            with open(a.classify, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = None
+        names = R.denials(data) if isinstance(data, dict) else []
+        print(R.classify(data) + (": " + ", ".join(names) if names else ""))
+        return 0
+    if not a.app or (a.prompt is None and not a.prompt_file):
+        ap.error("--app and one of --prompt / --prompt-file are required")
+
+    prompt = a.prompt
+    if prompt is None:
+        with open(a.prompt_file, encoding="utf-8") as fh:
+            prompt = fh.read()
+    system = None
+    if a.system_prompt_file:
+        with open(a.system_prompt_file, encoding="utf-8") as fh:
+            system = fh.read()
+    try:
+        argv = R.build_argv(a.app, prompt, system_prompt=system, mcp_config=a.mcp_config,
+                            add_dirs=a.add_dir, approve=a.approve, deny=a.deny, model=a.model, effort=a.effort)
+    except R.ProfileError as e:
+        print(f"claude-run: refused, nothing was run: {e}", file=sys.stderr)
+        return 64
+    if a.print_argv:
+        print(json.dumps(argv))
+        return 0
+    os.execv(argv[0], argv)
+    return 127  # unreachable: execv replaces this process or raises
+
+
+if __name__ == "__main__":
+    sys.exit(main())

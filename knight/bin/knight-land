@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# knight-land — finish a job that is sitting on a branch: merge it, make it live, and check it is.
+#
+#   knight-land <job-id|branch>          merge, restart what runs it, verify, report
+#   knight-land <job-id|branch> --anyway land despite a PLAUSIBLE note (Brad said so)
+#   knight-land --list                   branches waiting, and whether each one may land
+#
+# WHY THIS EXISTS. Brad, 2026-09-17, after watching a job go green: *"Just need Moses to be able to
+# finish up the job on command."* Knight's moses work stops at a branch on purpose — a change here
+# can break the gate that would have caught it — but "a human merges" had quietly become "Brad is
+# handed two git commands", which is the one thing he does not do. The branch rule was never about
+# who types; it was about a decision being made deliberately, on a reviewed branch. Saying "merge
+# it" IS that decision. This performs it and then proves it landed.
+#
+# WHAT IT REFUSES, and each one is a real failure it was built against:
+#   • a job whose review was not clean          — the gate that blocks a push must block a merge
+#   • a PLAUSIBLE note nobody has answered      — 2026-09-17: Zryachiy passed a branch "with a note",
+#                                                 and the note was the thing that mattered. Landing
+#                                                 it silently is exactly the mistake not made that day
+#   • a target that does not land on a branch   — viatica already deploys itself; nothing to do here
+#   • a dirty tree, or a branch already merged  — say so rather than guess
+#
+# IT REPORTS WHAT IS LIVE, NOT WHAT IT COPIED. The merge is not the end: the listener runs from this
+# source tree as a systemd USER unit, so the change is live only once that unit has restarted and
+# come back up. Knight's own briefing said `/opt/moses` for months, which does not exist, and both
+# Knight and Moses repeated it to Brad. So this reads the restart command from the target registry,
+# runs it, and then checks the unit is actually up before it says the word "live".
+set -uo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+KNIGHT=${KNIGHT_HOME:-$(cd "$HERE/.." && pwd)}
+JOBS=${KNIGHT_JOBS:-$KNIGHT/jobs}
+TARGETS=${KNIGHT_TARGETS:-$KNIGHT/targets}
+# BESIDE THE JOBS IT DESCRIBES, and owned by the user that writes it. It was /var/lib/moses at first,
+# which is root-owned: the very first real land (2026-09-17) merged correctly and then could not
+# record itself, and the redirection error leaked into Moses's answer in Slack. The proposal that came
+# out of that was to chown the file — the better fix is to stop needing root for a log written by a
+# script that runs as brad.
+LOG=${KNIGHT_LAND_LOG:-$KNIGHT/lands.jsonl}
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf 'REFUSED: %s\n' "$*"; record "refused" "$*"; exit 2; }
+
+record() {
+    # THE WHOLE BLOCK IS WRAPPED, not just the printf. `printf … >> "$LOG" 2>/dev/null` does NOT
+    # silence a redirection failure: the shell opens the file before the command runs, so the
+    # "Permission denied" comes from the shell itself and lands on ITS stderr. That is how the first
+    # real land reported an error alongside a merge that had worked perfectly.
+    {
+        mkdir -p "$(dirname "$LOG")" || true
+        printf '{"at":"%s","job":"%s","branch":"%s","target":"%s","outcome":"%s","detail":"%s"}\n' \
+            "$(date -Is)" "${JOB_ID:-}" "${BRANCH:-}" "${TARGET:-}" "$1" \
+            "$(printf '%s' "${2:-}" | tr -d '"\n' | head -c 300)" >> "$LOG"
+    } 2>/dev/null || true
+}
+
+# ── Which job? ───────────────────────────────────────────────────────────────
+# Accepts a job id or a branch name, because Brad reads branch names in Slack and job ids in reports,
+# and being told "no such job" for a name you just read is the kind of friction that sends people
+# back to typing git themselves.
+find_job() {
+    local want=$1 d
+    [ -d "$JOBS/$want" ] && { printf '%s' "$want"; return; }
+    for d in "$JOBS"/*/; do
+        [ -r "$d/branch" ] || continue
+        if [ "$(cat "$d/branch")" = "$want" ]; then printf '%s' "$(basename "$d")"; return; fi
+    done
+    return 1
+}
+
+landable() {
+    # Echoes "" when it may land, or the reason it may not. Used by --list and by the land path, so
+    # the list cannot say "ready" about something the lander would then refuse.
+    local d=$1 status target branch
+    status=$(cat "$d/status" 2>/dev/null || echo "?")
+    target=$(cat "$d/target" 2>/dev/null || echo "?")
+    branch=$(cat "$d/branch" 2>/dev/null || echo "")
+    [ "$status" = "pushed" ] || { echo "the job is '$status', not 'pushed'"; return; }
+    [ -n "$branch" ] || { echo "the job recorded no branch"; return; }
+    local env="$TARGETS/$target.env"
+    [ -r "$env" ] || { echo "no target registry entry for '$target'"; return; }
+    # shellcheck disable=SC1090
+    local KT_PUSH_MODE="" KT_SOURCE="" KT_BRANCH=""; . "$env"
+    [ "$KT_PUSH_MODE" = "branch" ] || { echo "target '$target' lands with push mode '$KT_PUSH_MODE', so there is no branch to merge"; return; }
+    [ -d "$KT_SOURCE/.git" ] || { echo "no repository at $KT_SOURCE"; return; }
+    git -C "$KT_SOURCE" rev-parse --verify "$branch" >/dev/null 2>&1 || { echo "branch '$branch' is not in $KT_SOURCE"; return; }
+    if git -C "$KT_SOURCE" merge-base --is-ancestor "$branch" "${KT_BRANCH:-main}" 2>/dev/null; then
+        echo "already merged into ${KT_BRANCH:-main}"; return
+    fi
+    # The same verdict the push gate read. A job only reaches "pushed" if this passed once, but it is
+    # re-read here rather than trusted: the file is on disk, the check costs nothing, and "it must
+    # have been fine earlier" is how a stale pass survives a rewritten history.
+    local review_ok=1 review_why="" plausible=""
+    # shellcheck disable=SC1091
+    . "$KNIGHT/lib/review-verdict.sh"
+    review_verdict 0 "$d/review.txt"
+    [ "$review_ok" = 1 ] || { echo "$review_why"; return; }
+    if [ -n "$plausible" ] && [ "${ANYWAY:-0}" != 1 ]; then
+        echo "the review left a note nobody has answered — $(printf '%s' "$plausible" | head -1)"
+        return
+    fi
+    echo ""
+}
+
+# ── --list ───────────────────────────────────────────────────────────────────
+if [ "${1:-}" = "--list" ]; then
+    found=0
+    for d in "$JOBS"/*/; do
+        [ -r "$d/branch" ] || continue
+        [ "$(cat "$d/status" 2>/dev/null)" = "pushed" ] || continue
+        why=$(landable "$d")
+        [ -n "$why" ] && [ "$why" = "already merged into main" ] && continue
+        found=1
+        if [ -z "$why" ]; then say "READY   $(cat "$d/branch")  [$(basename "$d")]"
+        else                  say "BLOCKED $(cat "$d/branch")  [$(basename "$d")] — $why"; fi
+    done
+    [ "$found" = 1 ] || say "Nothing is waiting on a branch."
+    exit 0
+fi
+
+WANT=${1:-}
+ANYWAY=0
+[ "${2:-}" = "--anyway" ] && ANYWAY=1
+[ -n "$WANT" ] || { say "usage: knight-land <job-id|branch> [--anyway] | --list"; exit 64; }
+
+JOB_ID=$(find_job "$WANT") || die "no job or branch called '$WANT'. Try: knight-land --list"
+DIR="$JOBS/$JOB_ID"
+BRANCH=$(cat "$DIR/branch" 2>/dev/null || echo "")
+TARGET=$(cat "$DIR/target" 2>/dev/null || echo "")
+
+why=$(landable "$DIR")
+[ -z "$why" ] || die "$why"
+
+# shellcheck disable=SC1090
+KT_SOURCE=""; KT_BRANCH=""; KT_LIVE_CMD=""; KT_LIVE_CHECK=""; . "$TARGETS/$TARGET.env"
+MAIN=${KT_BRANCH:-main}
+
+# A DIRTY TREE IS A REFUSAL, NOT SOMETHING TO TIDY. Somebody may be mid-edit in this checkout; a
+# merge that stashes their work to make room for itself is a much worse failure than not merging.
+dirty=$(git -C "$KT_SOURCE" status --porcelain | head -5)
+[ -z "$dirty" ] || die "$KT_SOURCE has uncommitted changes, so nothing was merged:
+$dirty"
+
+was=$(git -C "$KT_SOURCE" rev-parse --abbrev-ref HEAD)
+[ "$was" = "$MAIN" ] || git -C "$KT_SOURCE" checkout "$MAIN" >/dev/null 2>&1 \
+    || die "could not switch $KT_SOURCE to $MAIN (it is on $was)"
+
+before=$(git -C "$KT_SOURCE" rev-parse HEAD)
+# --no-ff so the branch is legible in the history afterwards: what landed, when, and as one unit that
+# can be reverted as one unit.
+merge_out=$(git -C "$KT_SOURCE" merge --no-ff -m "Land $BRANCH (Knight job $JOB_ID, reviewed clean)" "$BRANCH" 2>&1)
+merge_rc=$?
+if [ "$merge_rc" -ne 0 ]; then
+    git -C "$KT_SOURCE" merge --abort >/dev/null 2>&1
+    die "the merge did not apply cleanly, so it was backed out and nothing changed:
+$(printf '%s' "$merge_out" | head -10)"
+fi
+after=$(git -C "$KT_SOURCE" rev-parse HEAD)
+say "Merged \`$BRANCH\` into $MAIN — \`${after:0:7}\`"
+
+# ── Making it live ───────────────────────────────────────────────────────────
+# HANDED OFF, NOT RUN HERE. Every unit that runs Moses starts from this source tree — the Slack
+# listener and both MCP servers — so whichever one is asking for this merge is a process the restart
+# is about to kill. Restarting in-line would take down the caller mid-answer and the result would
+# reach nobody. knight-land-live does it detached and reports the outcome to the conversation that
+# asked. See that file for the failure this was written from.
+#
+# No live command recorded for this target means merging IS the whole job, and this says that rather
+# than implying something was activated.
+# shellcheck disable=SC1090
+KT_LIVE_CMD=""; . "$TARGETS/$TARGET.env"
+record "merged" "${after:0:7}"
+
+if [ -z "$KT_LIVE_CMD" ]; then
+    say "Nothing needs restarting for this target — the merge is the whole job."
+    say ""
+    say "Branch \`$BRANCH\` is merged and can be deleted."
+    exit 0
+fi
+
+# SETSID IS NOT ENOUGH, and the first real land proved it. `setsid` gives the child a new session; it
+# leaves it in the CALLER'S CGROUP. systemd kills a unit's whole cgroup when it stops it, so the
+# restart command killed the very script that was running it, halfway through: `moses` and `moses-mcp`
+# came back, `moses-mcp-public` never restarted, the health check never ran, and the Slack report that
+# is this script's entire reason for existing was never sent. Measured afterwards — a setsid child
+# reads the same cgroup path as its parent, a systemd-run child gets its own.
+#
+# So the live step is launched as its own transient unit, which survives its parent being stopped.
+# --collect so the finished unit does not linger in the failed/inactive list.
+LIVE_UNIT="knight-land-live-${JOB_ID}"
+# A TRANSIENT UNIT STARTS FROM A CLEAN ENVIRONMENT — it inherits nothing from this shell. Found by
+# running the whole thing end to end rather than trusting that "it launched": the unit came up, could
+# not see KNIGHT_JOBS, exited "no such job", and NOTHING restarted while this script had already said
+# it was restarting. Every override this script honors is handed over explicitly, or the same silence
+# comes back the first time anything runs outside the default paths.
+setenvs=(--setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+for v in KNIGHT_HOME KNIGHT_JOBS KNIGHT_TARGETS KNIGHT_LAND_LOG KNIGHT_SLACK_ENV KNIGHT_SLACK_CHANNEL; do
+    [ -n "${!v+x}" ] && setenvs+=(--setenv="$v=${!v}")
+done
+if command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user --collect --quiet --unit="$LIVE_UNIT" "${setenvs[@]}" \
+        "$HERE/knight-land-live" "$JOB_ID" "${after:0:7}" 2>>"$DIR/land-live.log"; then
+    :
+else
+    # No user systemd (a container, a test box): better to run it attached than not at all. It may be
+    # cut short by its own restart, which is exactly the failure above — so say so rather than let a
+    # silent half-deploy look like a success.
+    say "(no systemd-run available — running the restart in line; if this message is the last thing"
+    say " you see, the restart cut this process off and the services need checking by hand)"
+    setsid "$HERE/knight-land-live" "$JOB_ID" "${after:0:7}" \
+        >> "$DIR/land-live.log" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+fi
+
+say "Restarting what runs it now — the result posts back here in a few seconds."
+say ""
+say "Branch \`$BRANCH\` is merged and can be deleted."
+exit 0

@@ -1,0 +1,11 @@
+[Unit]
+Description=Moses — weekly connection sweep
+
+[Timer]
+# Weekly, not daily. Each pair is announced once, so a daily run would mostly print nothing and
+# train Brad to ignore it; a week's accumulation gives the scan something to actually find.
+OnCalendar=Mon 08:45
+Persistent=true
+
+[Install]
+WantedBy=timers.target

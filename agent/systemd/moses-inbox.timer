@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for captured work that never reached a project, daily
+
+[Timer]
+# 07:45 — before the 07:50 drift check and the 08:00 standup, so the day starts with everything that
+# is unaccounted for in one place rather than three.
+OnCalendar=*-*-* 07:45:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

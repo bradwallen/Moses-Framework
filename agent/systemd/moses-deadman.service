@@ -1,0 +1,10 @@
+[Unit]
+Description=Moses — is anything still checking that he can answer?
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=%h/Projects/moses/agent/moses-deadman
+# A quiet probe is a FINDING, not a fault in the watchdog. Same reasoning as moses-drift and
+# moses-liveness: a unit that goes `failed` on a successful detection gets masked within a week.
+SuccessExitStatus=0 1

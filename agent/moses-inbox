@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# moses-inbox — what has been captured but never landed on a project?
+#
+#   moses-inbox            report; alarm to Slack on a state change
+#   moses-inbox --print    print the report, post nothing
+#   moses-inbox --force    post it even if nothing changed
+#
+# WHY. `projects.json` is the single source of truth for WORK. Two inboxes legitimately feed it and
+# are not going away, because each does something the registry cannot:
+#
+#   ideas.md              cross-project capture that auto-links a new idea to prior work — which is
+#                         how an overlap between the whitepaper and Viatica gets spotted at all
+#   look-into-further.md  things another agent said that looked worth Brad's time, with attribution
+#
+# An inbox is only useful if it is DRAINED. Three proposals sat in an unread store for 17 days,
+# including a Stripe go-live checklist filed five days before Viatica took real money. Nothing was
+# broken — nothing was watching. This is the watching.
+#
+# It does not move anything. Filing work is Brad's call and stays Brad's call; this only refuses to
+# let an item age quietly.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+MEM=${MOSES_MEMORY_DIR:-$MOSES_HOME/.claude/memory}
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+OWN="$STATE/inbox.json"
+CHANNEL=${MOSES_INBOX_CHANNEL:-}          # the ops channel, from the operator's settings
+STALE_DAYS=${MOSES_INBOX_STALE_DAYS:-14}
+MODE=${1:-}
+mkdir -p "$STATE" 2>/dev/null
+
+REPORT=$(python3 - "$MEM" "$STALE_DAYS" <<'PY'
+import json, os, re, sys, time
+mem, stale_days = sys.argv[1], int(sys.argv[2])
+now = time.time()
+lines, stale_total = [], 0
+
+# What is already on a project, so an inbox item that has landed is not nagged about twice.
+try:
+    d = json.load(open(os.path.join(mem, "projects.json")))
+except Exception as e:
+    print(f"UNREADABLE could not read the registry ({type(e).__name__}) — reporting nothing rather "
+          f"than reporting all-clear"); raise SystemExit
+landed = set()
+for p in d.get("projects", []):
+    for m in (p.get("milestones") or []):
+        landed.add((m.get("title") or "").strip().lower())
+    for i in (p.get("ideas") or []):
+        landed.add((i.get("title") or "").strip().lower())
+
+def scan(fname, label):
+    global stale_total
+    path = os.path.join(mem, fname)
+    if not os.path.exists(path):
+        return
+    age_days = (now - os.path.getmtime(path)) / 86400
+    open_items = []
+    for ln in open(path, encoding="utf-8", errors="ignore"):
+        m = re.match(r"\s*- \[ \]\s+(.*)", ln)
+        if not m:
+            continue
+        text = re.sub(r"_\(.*?\)_|<https?://[^>]*>|\*\*.*?\*\*", "", m.group(1)).strip()
+        if not text:
+            continue
+        # Matched on the leading words: an inbox entry is usually reworded on the way to a project,
+        # so demanding an exact match would report everything as undrained forever.
+        head = " ".join(text.lower().split()[:6])
+        if any(head and head in t for t in landed):
+            continue
+        open_items.append(text)
+    if open_items:
+        stale_total += len(open_items) if age_days >= stale_days else 0
+        lines.append(f"{label} ({fname}): {len(open_items)} open, file untouched "
+                     f"{int(age_days)}d")
+        for t in open_items[:4]:
+            lines.append(f"    - {t[:150]}")
+        if len(open_items) > 4:
+            lines.append(f"    - …and {len(open_items) - 4} more")
+
+scan("ideas.md", "Ideas inbox")
+scan("look-into-further.md", "Lessons from other agents")
+
+if not lines:
+    print("DRAINED every captured item has landed on a project")
+else:
+    verdict = "STALE" if stale_total else "OPEN"
+    print(verdict + " " + "\n".join(lines))
+PY
+)
+  [ "$_xt" = 1 ] && set -x
+VERDICT=${REPORT%% *}
+BODY=${REPORT#* }
+
+PREV=$(python3 -c "import json;print(json.load(open('$OWN'))['verdict'])" 2>/dev/null || echo unknown)
+python3 - "$OWN" "$VERDICT" <<'PY'
+import json, sys, time
+own, verdict = sys.argv[1:3]
+json.dump({"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "verdict": verdict}, open(own, "w"))
+PY
+
+if [ "$MODE" = "--print" ]; then
+  echo "moses-inbox: $VERDICT"; echo "$BODY"
+  [ "$VERDICT" = DRAINED ] && exit 0 || exit 1
+fi
+
+# Only STALE alarms. OPEN is normal — an inbox with things in it is an inbox being used. What is not
+# normal is an item nobody has looked at in a fortnight.
+if [ "$VERDICT" = STALE ] && [ "$PREV" != STALE ] || [ "$MODE" = "--force" ]; then
+  # TRACE-SAFE. `bash -x` echoes every expansion, so sourcing a credential file — or testing the
+  # variable it sets — prints the secret. That is exactly how the Slack bot token reached a
+  # transcript on 2026-09-03, while someone was tracing this very script to find out why it hung.
+  # xtrace is disabled around the credential handling and restored afterwards, so debugging a script
+  # can never be the thing that leaks from it.
+  local _xt=0; case $- in *x*) _xt=1; set +x ;; esac
+  set -a; . "$MOSES_CONFIG_DIR/slack.env" 2>/dev/null; set +a
+  python3 - "$CHANNEL" ":inbox_tray: *Captured but never filed against a project*
+
+$BODY
+
+These are in an inbox, not on a project, so nothing is tracking them. File them where they belong or drop them — an item nobody has looked at in ${STALE_DAYS} days is how a Stripe go-live checklist sat unread for 17." <<'PY'
+import json, os, sys, urllib.request
+chan, text = sys.argv[1], sys.argv[2]
+req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+    data=json.dumps({"channel": chan, "text": text, "username": "Moses",
+                     "icon_emoji": ":scroll:", "unfurl_links": False}).encode(),
+    headers={"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN','')}",
+             "Content-Type": "application/json; charset=utf-8"})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=20))
+    print("ok" if r.get("ok") else f"error:{r.get('error')}", file=sys.stderr)
+except Exception as e:
+    print(f"error:{type(e).__name__}", file=sys.stderr)
+PY
+fi
+
+[ "$VERDICT" = DRAINED ] && exit 0 || exit 1

@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# moses-hardware — collect resource usage for Reserve into one state file.
+#
+#   moses-hardware            collect, write the state file
+#   moses-hardware --print    collect and print it, write nothing
+#
+# LABS IS GONE. The Pi was retired and its card wiped on 2026-09-03, so it is no longer a host here —
+# the collector used to SSH to 100.67.190.7 every five minutes and would now do nothing but time out.
+#
+# WHY A COLLECTOR AND NOT A PAGE. The dashboard auto-refreshes, and reading disks and uptime shells
+# out; doing that inside a page render makes every view wait on it. The page reads a file; this
+# writes it. That is also what the dashboard's own footer promises — "rendered from the files that
+# own it".
+#
+# STILL A LIST OF HOSTS, AND STILL ok/NOT-ok. The dashboard renders a card per entry and shows the
+# reason when one could not be read, so a future second host needs no change on either side — and a
+# collector that failed silently would render identically to "using no resources".
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+PROBE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/hwprobe.py"
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+OUT="$STATE/hardware.json"
+mkdir -p "$STATE" 2>/dev/null
+
+# ── Reserve, read locally ─────────────────────────────────────────────────────
+reserve_json() {
+  MOSES_HW_SPEC=$(python3 "$PROBE" 2>/dev/null) python3 - <<'PY'
+import json, os, glob, subprocess
+
+def read(p, d=""):
+    try:
+        with open(p) as fh: return fh.read().strip()
+    except OSError: return d
+
+def sh(cmd):
+    try:
+        return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=8).stdout.strip()
+    except Exception: return ""
+
+mem = {}
+for ln in read("/proc/meminfo").splitlines():
+    k, _, v = ln.partition(":")
+    mem[k] = int(v.split()[0]) if v.split() else 0
+total, avail = mem.get("MemTotal", 0), mem.get("MemAvailable", 0)
+swt, swf = mem.get("SwapTotal", 0), mem.get("SwapFree", 0)
+
+# Every thermal zone, named. A single "temperature" is a guess about which sensor matters.
+temps = []
+for z in sorted(glob.glob("/sys/class/thermal/thermal_zone*")):
+    t, raw = read(f"{z}/type"), read(f"{z}/temp")
+    if t and raw.isdigit():
+        temps.append({"name": t, "celsius": round(int(raw) / 1000, 1)})
+
+disks = []
+for ln in sh("df -PB1 -x tmpfs -x devtmpfs -x efivarfs -x overlay").splitlines()[1:]:
+    f = ln.split()
+    if len(f) >= 6 and f[0].startswith("/dev"):
+        disks.append({"mount": f[5], "bytes": int(f[1]), "used": int(f[2]),
+                      "pct": round(int(f[2]) / int(f[1]) * 100) if int(f[1]) else 0})
+
+load = read("/proc/loadavg").split()[:3]
+spec = {}
+try:
+    spec = json.loads(os.environ.get("MOSES_HW_SPEC") or "{}")
+except Exception:
+    spec = {}
+
+print(json.dumps({
+    "ok": True,
+    "name": "Reserve",
+    "spec": spec,
+    "model": read("/sys/devices/virtual/dmi/id/product_name", "unknown"),
+    "cores": os.cpu_count() or 0,
+    "load": [float(x) for x in load] if len(load) == 3 else [],
+    "mem": {"total_kb": total, "used_kb": max(0, total - avail)},
+    "swap": {"total_kb": swt, "used_kb": max(0, swt - swf)},
+    "temps": temps,
+    "disks": sorted(disks, key=lambda d: -d["pct"]),
+    "uptime": sh("uptime -p"),
+}))
+PY
+}
+
+BODY=$(python3 - "$(reserve_json)" <<'PY'
+import json, sys, time
+reserve = sys.argv[1]
+def load(s, name):
+    try: return json.loads(s)
+    except Exception as e: return {"ok": False, "name": name, "reason": f"{type(e).__name__}: {e}"}
+print(json.dumps({"at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  "hosts": [load(reserve, "Reserve")]}, indent=1))
+PY
+)
+
+if [ "${1:-}" = "--print" ]; then echo "$BODY"; exit 0; fi
+printf '%s' "$BODY" > "$OUT.tmp" && mv "$OUT.tmp" "$OUT"
+echo "moses-hardware: wrote $OUT"

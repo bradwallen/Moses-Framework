@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""moses-project — the same project registry Moses keeps, from a terminal.
+
+  moses-project                          the dashboard
+  moses-project list                     one line per project
+  moses-project show <id>
+  moses-project add "<name>" [--rank N] [--scope "..."]
+  moses-project set <id> <field> <value>
+  moses-project milestone <id> "<title>"
+  moses-project idea <id> "<title>" [--note "..."]   a candidate, NOT counted as progress
+  moses-project item <code>                          what V14 is, wherever it sits
+  moses-project promote [<id>] <code|n>              that candidate becomes a milestone
+  moses-project unidea [<id>] <code|n>               decided against
+  moses-project done [<id>] <code|n> [--undo]
+  moses-project rm <id>
+
+Every milestone, idea and proposal has a code: the project's letters plus a number that is never
+reused (V14). Given a code, the project can be left out. A plain position number still works with one.
+
+THE REAL FRONT DOOR IS MOSES, NOT THIS. Brad files ideas by telling Moses in the Claude app, VS Code
+or Slack; he does not open a terminal to do it. This exists for when someone is already at a prompt.
+
+Every command is a call into moses-mcp/projects.py — the same module the MCP tools use. Deliberately
+a wrapper with no logic of its own: this codebase has already been bitten by the same logic living in
+two files and quietly drifting apart.
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "mcp"))
+import projects  # noqa: E402
+
+
+def _target(rest: list[str]) -> tuple[str, str]:
+    """`V14` alone (the code names the project) or `<id> <code|n>`."""
+    return ("", rest[0]) if len(rest) == 1 else (rest[0], rest[1])
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    cmd, rest = (argv[0] if argv else "dashboard"), argv[1:]
+    try:
+        if cmd in ("dashboard", "show-all"):
+            print(projects.dashboard())
+        elif cmd == "list":
+            print(projects.brief())
+        elif cmd == "show" and rest:
+            print(projects.show(rest[0]))
+        elif cmd == "add" and rest:
+            rank, scope = None, ""
+            if "--rank" in rest:
+                i = rest.index("--rank"); rank = int(rest[i + 1]); rest = rest[:i] + rest[i + 2:]
+            if "--scope" in rest:
+                i = rest.index("--scope"); scope = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
+            print(projects.add(" ".join(rest).strip(), rank=rank, scope=scope))
+        elif cmd == "set" and len(rest) >= 2:
+            print(projects.update(rest[0], rest[1], " ".join(rest[2:])))
+        elif cmd == "milestone" and len(rest) >= 2:
+            print(projects.add_milestone(rest[0], " ".join(rest[1:])))
+        elif cmd == "idea" and len(rest) >= 2:
+            note = ""
+            if "--note" in rest:
+                i = rest.index("--note"); note = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
+            print(projects.add_idea(rest[0], " ".join(rest[1:]), note=note))
+        elif cmd == "item" and rest:
+            print(projects.item(rest[0]))
+        elif cmd == "promote" and rest:
+            print(projects.promote_idea(*_target(rest)))
+        elif cmd == "unidea" and rest:
+            print(projects.remove_idea(*_target(rest)))
+        elif cmd == "done" and rest:
+            undo = "--undo" in rest
+            rest = [r for r in rest if r != "--undo"]
+            print(projects.complete_milestone(*_target(rest), undo=undo))
+        elif cmd == "rm" and rest:
+            p = projects.find(projects.load(), rest[0])
+            if input(f"remove '{p['name']}'? [y/N] ").strip().lower() != "y":
+                print("left alone"); return 0
+            print(projects.remove(rest[0]))
+        else:
+            print("unknown command — try: moses-project help", file=sys.stderr)
+            return 2
+    except (projects.ProjectError, ValueError) as e:
+        print(f"moses-project: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

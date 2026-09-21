@@ -1,0 +1,12 @@
+[Unit]
+Description=Collect Reserve and Labs resource usage every 5 minutes
+
+[Timer]
+# FIVE MINUTES, matched to what the page promises. The page auto-refreshes every 60s and shows the
+# reading's age, so a slower collector would mean a page that looks live and is not. Reserve costs
+# microseconds; the cost here is one SSH to a Pi, measured at ~2s.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

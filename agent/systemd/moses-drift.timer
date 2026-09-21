@@ -1,0 +1,11 @@
+[Unit]
+Description=Check for drift daily, before the 08:00 standup reads it
+
+[Timer]
+# 07:50 — early enough that the standup can carry the result, late enough that the nightly work
+# (02:30 backup, inventory refresh) has finished and is included in what gets compared.
+OnCalendar=*-*-* 07:50:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

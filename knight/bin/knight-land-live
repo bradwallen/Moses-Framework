@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# knight-land-live — make a merged change live, then say in Slack whether it worked.
+#
+#   knight-land-live <job-id>      (started detached by knight-land; not meant to be run by hand)
+#
+# WHY IT IS A SEPARATE, DETACHED SCRIPT. Every unit that runs Moses is started from this same source
+# tree: the Slack listener, and the two MCP servers. So whichever one is asked to "merge and make it
+# live" is a process the restart is about to kill. Restarting in-line means the answer never lands —
+# the same lesson `agent/deploy-and-report.sh` was written for, where a Slack-triggered deploy killed
+# its own caller mid-sentence.
+#
+# So the merge happens in `knight-land` and returns immediately, and this runs on its own afterwards.
+# It follows from that that the RESULT has to find its own way back, which is this file's real job:
+# the change is not finished when git says merged, it is finished when the service is back up and
+# Brad has been told either way.
+#
+# It reports FAILURE at least as loudly as success. A restart that fails leaves the merge in place
+# and the old code running — a state that looks fine from every direction except the one that
+# matters, and the single most important thing for this to say out loud.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+KNIGHT=${KNIGHT_HOME:-$(cd "$HERE/.." && pwd)}
+JOBS=${KNIGHT_JOBS:-$KNIGHT/jobs}
+TARGETS=${KNIGHT_TARGETS:-$KNIGHT/targets}
+LOG=${KNIGHT_LAND_LOG:-$KNIGHT/lands.jsonl}
+OPTENV=${KNIGHT_SLACK_ENV:-$MOSES_CONFIG_DIR/knight.env}
+
+JOB_ID=${1:-}
+[ -n "$JOB_ID" ] || { echo "usage: knight-land-live <job-id>" >&2; exit 64; }
+DIR="$JOBS/$JOB_ID"
+[ -d "$DIR" ] || { echo "no such job: $JOB_ID" >&2; exit 2; }
+
+BRANCH=$(cat "$DIR/branch" 2>/dev/null || echo "")
+TARGET=$(cat "$DIR/target" 2>/dev/null || echo "")
+SHA=${2:-}
+
+record() {
+    # Wrapped as a block — a redirection failure is the SHELL's error, not the command's, so
+    # `printf … >> "$LOG" 2>/dev/null` would still print it. See knight-land's copy.
+    {
+        mkdir -p "$(dirname "$LOG")" || true
+        printf '{"at":"%s","job":"%s","branch":"%s","target":"%s","outcome":"%s","detail":"%s"}\n' \
+            "$(date -Is)" "$JOB_ID" "$BRANCH" "$TARGET" "$1" \
+            "$(printf '%s' "${2:-}" | tr -d '"\n' | head -c 300)" >> "$LOG"
+    } 2>/dev/null || true
+}
+
+# Posts to the conversation that asked (notify.json, written by the listener) and, failing that, to
+# Knight's own channel. Same two destinations knight-run uses, for the same reason: the person who
+# said "merge it" should not have to go and look somewhere else for the answer.
+slack_say() {
+    local text=$1 tok chan thread
+    [ -r "$OPTENV" ] || return 0
+    # TRACE-SAFE: `bash -x` prints every expansion, so sourcing a credential file under tracing is
+    # how a token reaches a log. Disabled around the read and restored after.
+    local _xt=0; case $- in *x*) _xt=1; set +x ;; esac
+    # shellcheck disable=SC1090
+    tok=$(. "$OPTENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
+    if [ -n "${KNIGHT_SLACK_CHANNEL+x}" ]; then chan=$KNIGHT_SLACK_CHANNEL; else
+        chan=$(. "$OPTENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
+    [ "$_xt" = 1 ] && set -x
+    thread=""
+    if [ -r "$DIR/notify.json" ]; then
+        local nchan nthread
+        nchan=$(jq -r '.channel // ""' "$DIR/notify.json" 2>/dev/null)
+        nthread=$(jq -r '.thread_ts // ""' "$DIR/notify.json" 2>/dev/null)
+        [ -n "$nchan" ] && chan=$nchan && thread=$nthread
+    fi
+    [ -n "$tok" ] && [ -n "$chan" ] || return 0
+    curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+        -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+        --data "$(jq -nc --arg c "$chan" --arg t "$text" --arg th "$thread" \
+            '{channel:$c,text:$t,username:"Knight",icon_emoji:":crossed_swords:"}
+             + (if $th == "" then {} else {thread_ts:$th} end)')" \
+        > "$DIR/land-slack.json" 2>&1
+}
+
+# shellcheck disable=SC1090
+KT_LIVE_CMD=""; KT_LIVE_CHECK=""; KT_BRANCH=""
+[ -r "$TARGETS/$TARGET.env" ] && . "$TARGETS/$TARGET.env"
+
+# A user unit needs its session bus; without this, systemctl --user fails with "Failed to connect to
+# bus" from a detached process that has no session of its own.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+
+# Let the caller finish answering before its own service goes down under it.
+sleep 3
+
+if [ -z "$KT_LIVE_CMD" ]; then
+    record "landed" "merged only"
+    exit 0
+fi
+
+if ! out=$(eval "$KT_LIVE_CMD" 2>&1); then
+    record "merged-not-live" "$out"
+    slack_say ":warning: *Merged, but NOT live* · \`$BRANCH\`
+The merge is in \`${KT_BRANCH:-main}\`, but making it live failed, so the running copy is still the old code.
+\`\`\`
+$(printf '%s' "$out" | head -5)
+\`\`\`"
+    exit 3
+fi
+
+# VERIFY, don't declare. A restart command exiting 0 says it was accepted, not that the service came
+# back — and a service that dies on the new code is the exact case worth catching here.
+if [ -n "$KT_LIVE_CHECK" ]; then
+    sleep 3
+    if ! out=$(eval "$KT_LIVE_CHECK" 2>&1); then
+        record "restarted-not-up" "$out"
+        slack_say ":rotating_light: *Restarted, and it did not come back* · \`$BRANCH\`
+Merged into \`${KT_BRANCH:-main}\`${SHA:+ (\`$SHA\`)} and restarted, but the service is not up. This needs a person.
+\`\`\`
+$(printf '%s' "$out" | head -5)
+\`\`\`"
+        exit 3
+    fi
+fi
+
+record "landed" "live ${SHA}"
+slack_say ":white_check_mark: *Landed and live* · \`$BRANCH\`
+Merged into \`${KT_BRANCH:-main}\`${SHA:+ · \`$SHA\`}, restarted, and confirmed up."
+exit 0

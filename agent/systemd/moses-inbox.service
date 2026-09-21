@@ -1,0 +1,9 @@
+[Unit]
+Description=Moses — what was captured but never filed against a project?
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=%h/Projects/moses/agent/moses-inbox
+# An undrained inbox is a FINDING, not a fault.
+SuccessExitStatus=0 1

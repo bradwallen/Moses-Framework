@@ -1,0 +1,17 @@
+[Unit]
+Description=Moses — project-of-projects agent (Slack Socket Mode), running as the operator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The operator's settings, then the Slack tokens (the later file wins on a shared key).
+EnvironmentFile=-%h/.config/moses/moses.env
+EnvironmentFile=%h/.config/moses/slack.env
+# Runs the SOURCE directly. No copy, so no deploy manifest to forget a file from.
+ExecStart=%h/moses-venv/bin/python %h/Projects/moses/agent/listener.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

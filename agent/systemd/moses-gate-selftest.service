@@ -1,0 +1,9 @@
+[Unit]
+Description=Prove the handoff gate and the relevant-notes hook still discriminate
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/hooks/gate-handoff-selftest.sh --quiet
+# Added 2026-09-13. A oneshot runs each ExecStart in order and stops at the first failure, so a red
+# gate still fails the unit before this runs — and a red notes hook fails it on its own.
+ExecStart=%h/.claude/hooks/relevant-notes-selftest.sh --quiet

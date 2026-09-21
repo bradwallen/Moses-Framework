@@ -1,0 +1,14 @@
+[Unit]
+Description=Moses project dashboard (user service, no root required to deploy)
+After=network-online.target
+
+[Service]
+# Bound to localhost: cloudflared runs on this same machine and connects locally, so nothing else on
+# the network — not even the tailnet — can reach it. Public access is Cloudflare Access's job.
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/dashboard_server.py
+Restart=always
+RestartSec=3
+WorkingDirectory=%h/Projects/moses/mcp
+
+[Install]
+WantedBy=default.target

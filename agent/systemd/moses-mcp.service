@@ -1,0 +1,21 @@
+[Unit]
+Description=moses-mcp (Moses MCP — user service, no root required to deploy)
+After=network-online.target
+
+[Service]
+EnvironmentFile=-%h/.config/moses/customs.env
+Type=simple
+# Loopback unless the operator says otherwise: MOSES_MCP_HOST (this machine's tailnet address, say) in
+# ~/.config/moses/mcp.env, which systemd lets override the Environment= lines here.
+Environment=MOSES_MCP_HOST=127.0.0.1
+EnvironmentFile=-%h/.config/moses/mcp.env
+Environment=MOSES_MCP_PORT=8765
+Environment=MOSES_MCP_PROFILE=full
+Environment=MOSES_MCP_ALLOWED_HOSTS=
+Environment=MOSES_MEMORY_DIR=%h/.claude/memory
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/mcp_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

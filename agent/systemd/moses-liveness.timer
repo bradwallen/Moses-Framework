@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Moses can answer, every 30 minutes
+
+[Timer]
+# EVERY 30 MINUTES, and the number is the whole design. On 2026-08-31 he was mute for 100 minutes and
+# the only thing that noticed was Brad reading a strange reply to Atlas. Thirty minutes bounds that
+# at a known cost: the probe measured 2.8 seconds against the live CLI, so this is ~2.3 minutes of
+# model time a month on a subscription that is already paid for.
+OnBootSec=5min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target

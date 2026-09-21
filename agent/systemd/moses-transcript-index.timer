@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly transcript indexing (Moses)
+
+[Timer]
+# Hourly, because the session in progress keeps growing and a stale index is the thing that makes
+# search quietly miss today's work. Persistent so a powered-off stretch catches up on boot.
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

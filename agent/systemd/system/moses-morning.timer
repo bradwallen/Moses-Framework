@@ -1,0 +1,11 @@
+[Unit]
+Description=Fire the Moses morning briefing at 08:00 Central
+
+[Timer]
+# Timezone pinned so 08:00 stays 08:00 across DST. Reserve itself runs UTC.
+OnCalendar=*-*-* 08:00:00 America/Chicago
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

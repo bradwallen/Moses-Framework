@@ -1,0 +1,318 @@
+#!/usr/bin/env bash
+# ops-jobs — hand off a long-running task on Reserve; get told in Slack when it finishes.
+#
+# Exists because an agent working on this box has no way to reach Brad. Anything slow (a backup, a
+# restore, a big copy) either gets babysat by polling or silently stalls, which is exactly what
+# happened to the first iDrive restore: it died in 5 seconds and looked like it was running for
+# two hours. Hand the job to ops-jobs instead and the outcome shows up in Slack.
+#
+#   ops-jobs run  --name "iDrive backup" -- /opt/IDriveForLinux/bin/idrive --backup
+#   ops-jobs run  --name "big copy" --progress '/var/log/mycopy-*.log' -- /usr/local/bin/mycopy
+#   ops-jobs watch 12345 --name "already-running thing"
+#   ops-jobs say  "arbitrary message"
+#   ops-jobs list                # recent jobs, with live state and elapsed time
+#   ops-jobs show <job-id>       # one job in detail, including live progress
+#   ops-jobs log  <job-id>       # full captured output
+#   ops-jobs test                # verify Slack wiring
+#
+# --progress takes a path or glob to the logfile a job writes itself. Without it a job that logs to
+# its own file shows an empty output.log and there is no way to see progress while it runs.
+#
+# Credentials live in /etc/moses/ops.env (root-only, mode 600) and are never passed on the
+# command line, so they can't leak into shell history, ps output, or a transcript.
+
+set -uo pipefail
+
+CONF=/etc/moses/ops.env
+STATE=/var/lib/moses/ops/jobs
+MAX_TAIL_LINES=15
+MAX_TAIL_CHARS=1800
+
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+: "${SLACK_BOT_TOKEN:=}"
+: "${SLACK_OPS_CHANNEL:=}"
+: "${BIRDEYE_NAME:=Birdeye}"
+: "${BIRDEYE_EMOJI:=:eagle:}"
+: "${OPS_HOST:=$(hostname)}"
+
+die() { echo "ops-jobs: $*" >&2; exit 1; }
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+# Degrades loudly rather than silently: with no credentials the message still goes to stderr and the
+# job result is still recorded on disk. A missing token must never make a finished job invisible.
+post() {
+  local text="$1"
+  if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_OPS_CHANNEL" ]; then
+    echo "ops-jobs: no Slack credentials in $CONF — message NOT sent:" >&2
+    echo "--- $text" >&2
+    return 1
+  fi
+  local payload resp
+  payload=$(jq -n \
+    --arg c "$SLACK_OPS_CHANNEL" --arg t "$text" \
+    --arg u "$BIRDEYE_NAME" --arg e "$BIRDEYE_EMOJI" \
+    '{channel:$c, text:$t, username:$u, icon_emoji:$e}')
+  resp=$(curl -sS --max-time 20 -X POST https://slack.com/api/chat.postMessage \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-type: application/json; charset=utf-8" \
+    --data "$payload" 2>&1)
+  if echo "$resp" | jq -e '.ok' >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "ops-jobs: Slack rejected the message: $(echo "$resp" | jq -r '.error // .' 2>/dev/null || echo "$resp")" >&2
+  return 1
+}
+
+human_dur() {
+  local s=$1
+  if   [ "$s" -lt 60 ]    ; then printf '%ds' "$s"
+  elif [ "$s" -lt 3600 ]  ; then printf '%dm %ds' $((s/60)) $((s%60))
+  else                          printf '%dh %dm' $((s/3600)) $(((s%3600)/60))
+  fi
+}
+
+# ── Job state ─────────────────────────────────────────────────────────────────
+# A job with no exit file is only "running" if its runner is genuinely alive. Without this check a
+# job killed by a reboot, an OOM, or a stray kill reads as "running" forever — a dead thing that
+# looks alive is precisely the failure ops-jobs was built to stop, so it must not reappear here.
+job_alive() {
+  local dir="$1"
+  if [ -s "$dir/pid" ]; then
+    kill -0 "$(cat "$dir/pid")" 2>/dev/null
+    return $?
+  fi
+  # Jobs started before pids were recorded: match the runner's own command line instead. The
+  # bracket on the first character keeps this pattern from ever matching the process running it.
+  pgrep -f "[_]_runner $dir" >/dev/null 2>&1
+}
+
+job_state() {
+  local dir="$1" rc
+  if [ -f "$dir/exit" ]; then
+    rc=$(cat "$dir/exit")
+    case "$rc" in
+      0)       echo "ok" ;;
+      watched) echo "watched" ;;
+      *)       echo "exit $rc" ;;
+    esac
+  elif job_alive "$dir"; then
+    echo "running"
+  else
+    echo "ORPHANED"
+  fi
+}
+
+# Elapsed so far for a running job, total duration for a finished one.
+job_elapsed() {
+  local dir="$1" s e
+  [ -s "$dir/start" ] || { echo "-"; return; }
+  s=$(cat "$dir/start")
+  if [ -s "$dir/end" ]; then e=$(cat "$dir/end"); else e=$(date +%s); fi
+  human_dur $((e - s))
+}
+
+# Where live progress actually lives: the --progress pointer if the job declared one, else captured
+# stdout. Jobs that write their own timestamped logfile leave output.log empty, which is the whole
+# reason the pointer exists.
+job_progress_file() {
+  local dir="$1" pat
+  if [ -s "$dir/progress" ]; then
+    pat=$(cat "$dir/progress")
+    # Deliberately unquoted — the pointer may be a glob, for scripts that stamp their own filename.
+    # shellcheck disable=SC2086
+    ls -t -- $pat 2>/dev/null | head -1
+    return
+  fi
+  [ -s "$dir/output.log" ] && echo "$dir/output.log"
+  return 0
+}
+
+# ── Internal: the wrapper that actually supervises a handed-off command ────────
+__runner() {
+  local dir="$1"; shift
+  local name; name=$(cat "$dir/name")
+  local start; start=$(date +%s)
+  echo "$start" > "$dir/start"
+  echo "$$" > "$dir/pid"
+
+  "$@" > "$dir/output.log" 2>&1
+  local rc=$?
+
+  local end; end=$(date +%s)
+  echo "$rc" > "$dir/exit"
+  echo "$end" > "$dir/end"
+  local dur; dur=$(human_dur $((end - start)))
+
+  # Prefer the job's own logfile when it declared one — otherwise this tail is empty for exactly
+  # the jobs whose output matters most.
+  local pf tail_txt
+  pf=$(job_progress_file "$dir")
+  tail_txt=$(tail -n "$MAX_TAIL_LINES" "$pf" 2>/dev/null | cut -c1-400 | tail -c "$MAX_TAIL_CHARS")
+  [ -z "$tail_txt" ] && tail_txt="(no output)"
+
+  local icon status
+  if [ "$rc" -eq 0 ]; then icon="✅"; status="finished"; else icon="🔴"; status="FAILED (exit $rc)"; fi
+
+  post "$(printf '%s *%s* — %s\n_on %s · took %s · job %s_\n```%s```' \
+    "$icon" "$name" "$status" "$OPS_HOST" "$dur" "$(basename "$dir")" "$tail_txt")"
+}
+
+__pidwatcher() {
+  local dir="$1" pid="$2"
+  local name; name=$(cat "$dir/name")
+  local start; start=$(cat "$dir/start")
+  echo "$$" > "$dir/pid"
+  while kill -0 "$pid" 2>/dev/null; do sleep 5; done
+  local end; end=$(date +%s)
+  echo "$end" > "$dir/end"; echo "watched" > "$dir/exit"
+  # A watched PID we don't own gives no exit status — say so rather than imply success.
+  post "$(printf '👁️ *%s* — process %s exited\n_on %s · watched for %s · exit status unknown (not our child)_' \
+    "$name" "$pid" "$OPS_HOST" "$(human_dur $((end - start)))")"
+}
+
+new_job_dir() {
+  local id; id="$(date +%Y%m%d-%H%M%S)-$RANDOM"
+  local dir="$STATE/$id"
+  mkdir -p "$dir" || die "cannot create $dir (need sudo?)"
+  echo "$dir"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+cmd_run() {
+  local name="" progress=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name)     name="${2:-}"; shift 2 ;;
+      --progress) progress="${2:-}"; shift 2 ;;
+      --)         shift; break ;;
+      *)          die "unexpected argument '$1' (usage: ops-jobs run --name NAME [--progress GLOB] -- COMMAND...)" ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "no command given (usage: ops-jobs run --name NAME [--progress GLOB] -- COMMAND...)"
+  [ -n "$name" ] || name="$1"
+
+  local dir; dir=$(new_job_dir)
+  printf '%s\n' "$name" > "$dir/name"
+  printf '%q ' "$@" > "$dir/cmd"
+  [ -n "$progress" ] && printf '%s\n' "$progress" > "$dir/progress"
+
+  # setsid detaches from this shell's session, so the job survives the SSH connection dropping —
+  # the failure mode that made the first restore attempt unobservable.
+  setsid "$0" __runner "$dir" "$@" </dev/null >/dev/null 2>&1 &
+  echo "ops-jobs: job $(basename "$dir") started — '$name'"
+  echo "ops-jobs: output → $dir/output.log"
+}
+
+cmd_watch() {
+  local pid="${1:-}"; shift || true
+  [ -n "$pid" ] || die "usage: ops-jobs watch PID --name NAME"
+  kill -0 "$pid" 2>/dev/null || die "no such running process: $pid"
+  local name="pid $pid"
+  [ "${1:-}" = "--name" ] && name="${2:-$name}"
+  local dir; dir=$(new_job_dir)
+  printf '%s\n' "$name" > "$dir/name"
+  date +%s > "$dir/start"
+  setsid "$0" __pidwatcher "$dir" "$pid" </dev/null >/dev/null 2>&1 &
+  echo "ops-jobs: watching pid $pid as '$name' (job $(basename "$dir"))"
+}
+
+cmd_list() {
+  [ -d "$STATE" ] || { echo "no jobs yet"; return 0; }
+  local any=0 d dir
+  for d in $(ls -1 "$STATE" 2>/dev/null | sort -r | head -20); do
+    [ "$any" -eq 0 ] && printf '%-22s %-9s %-10s %s\n' "JOB" "STATE" "ELAPSED" "NAME"
+    any=1
+    dir="$STATE/$d"
+    printf '%-22s %-9s %-10s %s\n' \
+      "$d" "$(job_state "$dir")" "$(job_elapsed "$dir")" "$(cat "$dir/name" 2>/dev/null)"
+  done
+  [ "$any" -eq 1 ] || echo "no jobs yet"
+}
+
+cmd_show() {
+  local id="${1:-}"; [ -n "$id" ] || die "usage: ops-jobs show JOB-ID"
+  local dir="$STATE/$id"
+  [ -d "$dir" ] || die "no such job: $id  (try: ops-jobs list)"
+
+  local st; st=$(job_state "$dir")
+  printf 'job      %s\n' "$id"
+  printf 'name     %s\n' "$(cat "$dir/name" 2>/dev/null)"
+  printf 'command  %s\n' "$(cat "$dir/cmd" 2>/dev/null)"
+  printf 'state    %s\n' "$st"
+  printf 'elapsed  %s\n' "$(job_elapsed "$dir")"
+  [ -s "$dir/start" ] && printf 'started  %s\n' "$(date -d "@$(cat "$dir/start")" '+%a %b %-d, %-I:%M %p' 2>/dev/null)"
+  [ -s "$dir/end" ]   && printf 'ended    %s\n' "$(date -d "@$(cat "$dir/end")" '+%a %b %-d, %-I:%M %p' 2>/dev/null)"
+
+  local pf; pf=$(job_progress_file "$dir")
+  echo
+  if [ -n "$pf" ]; then
+    echo "--- $pf (last $MAX_TAIL_LINES lines) ---"
+    tail -n "$MAX_TAIL_LINES" "$pf" 2>/dev/null | cut -c1-200
+  else
+    echo "(nothing to show — this job writes no stdout and declared no --progress file)"
+  fi
+
+  if [ "$st" = "ORPHANED" ]; then
+    echo
+    echo "WARNING: no live process and no exit status. The runner died without recording a result —"
+    echo "the work may be incomplete. Check the progress log above before assuming anything finished."
+  fi
+  return 0
+}
+
+# Machine-readable, for ops-report. Tab-separated: id, elapsed, name, last progress line.
+cmd_inflight() {
+  [ -d "$STATE" ] || return 0
+  local d dir pf last
+  for d in $(ls -1 "$STATE" 2>/dev/null | sort); do
+    dir="$STATE/$d"
+    [ -f "$dir/exit" ] && continue
+    job_alive "$dir" || continue
+    pf=$(job_progress_file "$dir"); last=""
+    [ -n "$pf" ] && last=$(tail -n 1 "$pf" 2>/dev/null | cut -c1-110 | tr -d '\r\t')
+    printf '%s\t%s\t%s\t%s\n' "$d" "$(job_elapsed "$dir")" "$(cat "$dir/name" 2>/dev/null)" "$last"
+  done
+  return 0
+}
+
+# Jobs that never recorded a result and have no live process. Tab-separated: id, elapsed, name.
+cmd_orphans() {
+  [ -d "$STATE" ] || return 0
+  local d dir
+  for d in $(ls -1 "$STATE" 2>/dev/null | sort); do
+    dir="$STATE/$d"
+    [ -f "$dir/exit" ] && continue
+    job_alive "$dir" && continue
+    printf '%s\t%s\t%s\n' "$d" "$(job_elapsed "$dir")" "$(cat "$dir/name" 2>/dev/null)"
+  done
+  return 0
+}
+
+cmd_log() {
+  local id="${1:-}"; [ -n "$id" ] || die "usage: ops-jobs log JOB-ID"
+  local dir="$STATE/$id"
+  [ -d "$dir" ] || die "no such job: $id"
+  # Same precedence as everywhere else: the job's own logfile wins over captured stdout.
+  local pf; pf=$(job_progress_file "$dir")
+  [ -n "$pf" ] || die "no output for job $id"
+  cat "$pf"
+}
+
+case "${1:-}" in
+  run)          shift; cmd_run "$@" ;;
+  watch)        shift; cmd_watch "$@" ;;
+  say)          shift; [ $# -gt 0 ] || die "usage: ops-jobs say TEXT"; post "$*" && echo "ops-jobs: sent" ;;
+  list|status)  shift; cmd_list ;;
+  show|job)     shift; cmd_show "$@" ;;
+  inflight)     shift; cmd_inflight ;;
+  orphans)      shift; cmd_orphans ;;
+  log)          shift; cmd_log "$@" ;;
+  test)         post "🦅 *Birdeye* reporting in from *$OPS_HOST* — wiring works." && echo "ops-jobs: OK, check Slack" ;;
+  __runner)     shift; __runner "$@" ;;
+  __pidwatcher) shift; __pidwatcher "$@" ;;
+  ""|-h|--help|help)
+    sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command '${1}' (try: ops-jobs help)" ;;
+esac

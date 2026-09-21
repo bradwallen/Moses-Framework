@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""moses-post-file — upload a file into a Slack channel as Moses.
+
+    moses-post-file <path> --channel <#name|C0123ABC> [--title "..."] [--comment "..."]
+    moses-post-file --list-channels          show every channel Moses is in, with ids
+
+WHY A FILE AND NOT A MESSAGE: the thing that prompted this is an 11 KB markdown document. Pasted as
+a message it would be truncated and unreadable; as a file it renders with a preview, downloads
+intact, and can be forwarded by whoever it was written for.
+
+WHY THIS API: files.upload was retired. The current path is three steps — ask for an upload URL,
+POST the bytes to it, then complete the upload and share it into a channel. `files:write` covers all
+three. (docs.slack.dev/reference/methods/files.getUploadURLExternal, fetched 2026-08-13.)
+
+VERIFIES, DOESN'T ASSUME: an `ok: true` from completeUpload means Slack accepted the call, not that
+the file landed where it was aimed. This reads the result back and prints the channel it was
+actually shared into, because "the API said yes" is the exact shape of claim that has cost time
+before.
+"""
+
+from pathlib import Path
+import argparse
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+ENV_FILES = [str(Path.home() / ".config" / "moses" / "knight.env"),
+             "/etc/moses/ops.env"]
+API = "https://slack.com/api/"
+
+
+def load_token() -> str:
+    if os.environ.get("SLACK_BOT_TOKEN"):
+        return os.environ["SLACK_BOT_TOKEN"]
+    for path in ENV_FILES:
+        try:
+            with open(path) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("SLACK_BOT_TOKEN="):
+                        return line.split("=", 1)[1].strip().strip("'\"")
+        except OSError:
+            continue
+    die("no SLACK_BOT_TOKEN found (looked in %s)" % ", ".join(ENV_FILES))
+
+
+def die(msg: str, code: int = 1):
+    print(f"moses-post-file: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def call(token: str, method: str, params: dict, as_json: bool = False) -> dict:
+    url = API + method
+    if as_json:
+        body = json.dumps(params).encode()
+        headers = {"Authorization": f"Bearer {token}",
+                   "Content-Type": "application/json; charset=utf-8"}
+        req = urllib.request.Request(url, data=body, headers=headers)
+    else:
+        body = urllib.parse.urlencode(params).encode()
+        headers = {"Authorization": f"Bearer {token}",
+                   "Content-Type": "application/x-www-form-urlencoded"}
+        req = urllib.request.Request(url, data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        out = json.loads(resp.read().decode())
+    if not out.get("ok"):
+        err = out.get("error", "unknown")
+        if err == "missing_scope":
+            die(f"{method} needs a scope this token does not have: {out.get('needed')} "
+                f"(token has: {out.get('provided')})")
+        die(f"{method} failed: {err}")
+    return out
+
+
+def channels(token: str) -> list:
+    """Every conversation Moses is a member of. Paginated — a workspace can outgrow one page, and a
+    silently truncated list would look exactly like 'the channel isn't there'."""
+    found, cursor = [], ""
+    while True:
+        out = call(token, "users.conversations", {
+            "types": "public_channel,private_channel", "limit": "200", "cursor": cursor,
+            "exclude_archived": "true"})
+        found.extend(out.get("channels", []))
+        cursor = (out.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            return found
+
+
+def resolve(token: str, want: str) -> str:
+    if want.startswith(("C", "G", "D")) and " " not in want and want.upper() == want:
+        return want
+    name = want.lstrip("#").strip().lower()
+    found = channels(token)
+    for c in found:
+        if (c.get("name") or "").lower() == name:
+            return c["id"]
+    listing = "\n".join(f"    #{c.get('name')}  {c['id']}" for c in sorted(
+        found, key=lambda c: c.get("name") or ""))
+    die(f"no channel named #{name} that Moses is a member of.\n"
+        f"  Moses is in:\n{listing or '    (none)'}\n"
+        f"  If the channel is there but not listed, he has not been added to it.")
+
+
+def upload(token: str, path: str, channel: str, title: str, comment: str) -> dict:
+    data = open(path, "rb").read()
+    if not data:
+        die(f"{path} is empty — refusing to upload nothing")
+    name = os.path.basename(path)
+
+    got = call(token, "files.getUploadURLExternal", {"filename": name, "length": str(len(data))})
+    url, file_id = got["upload_url"], got["file_id"]
+
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/octet-stream"})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        if resp.status != 200:
+            die(f"upload URL returned HTTP {resp.status}")
+
+    params = {"files": [{"id": file_id, "title": title or name}], "channel_id": channel}
+    if comment:
+        params["initial_comment"] = comment
+    return call(token, "files.completeUploadExternal", params, as_json=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path", nargs="?")
+    ap.add_argument("--channel", "-c")
+    ap.add_argument("--title", "-t", default="")
+    ap.add_argument("--comment", "-m", default="")
+    ap.add_argument("--list-channels", action="store_true")
+    args = ap.parse_args()
+
+    token = load_token()
+
+    if args.list_channels:
+        for c in sorted(channels(token), key=lambda c: c.get("name") or ""):
+            kind = "private" if c.get("is_private") else "public "
+            print(f"  {kind}  {c['id']}  #{c.get('name')}")
+        return 0
+
+    if not args.path or not args.channel:
+        die("usage: moses-post-file <path> --channel <#name|ID> [--title T] [--comment M]", 2)
+    if not os.path.isfile(args.path):
+        die(f"{args.path} does not exist")
+
+    cid = resolve(token, args.channel)
+    out = upload(token, args.path, cid, args.title, args.comment)
+
+    files = out.get("files") or []
+    for f in files:
+        print(f"posted  {f.get('title') or f.get('name')}  id={f.get('id')}")
+
+    # Confirm by READING THE CHANNEL, not by reading the upload response.
+    #
+    # The first version checked the `channels` field that completeUploadExternal returns. It comes
+    # back empty even on a completely successful share, so a correct post reported a scary warning
+    # — a false red, which is the failure mode that teaches people to ignore the check. The channel
+    # transcript is the thing actually being asked about, so ask it.
+    #
+    # Needs channels:history / groups:history. If those are absent the upload still happened; say so
+    # honestly rather than claiming either success or failure.
+    ids = {f.get("id") for f in files}
+    try:
+        hist = call(token, "conversations.history", {"channel": cid, "limit": "10"})
+    except SystemExit:
+        print("        (cannot read the channel back — upload was accepted, but unverified)")
+        return 0
+    for m in hist.get("messages", []):
+        for f in m.get("files") or []:
+            if f.get("id") in ids:
+                print(f"        confirmed in {cid}: visible in the channel, {f.get('size')} bytes")
+                return 0
+    print(f"        NOT FOUND in {cid}'s last 10 messages — do not tell anyone it is there",
+          file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

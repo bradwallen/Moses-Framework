@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# zryachiy — hand a Viatica feature to Zryachiy to explore in the sandbox, and hear back when he is done.
+#
+#   zryachiy explore --feature "Group trips" --criteria "one per line…" [--minutes 30]
+#   zryachiy status [<job-id>]        one exploration, or the recent list
+#
+# THE WORK HAPPENS IN VIATICA'S RUNNER (`npm run explore`), which owns the sandbox, the walls and
+# the boundary check. This only launches it detached and reports the outcome: to #viatica-dev as
+# Zryachiy, and back to the conversation that asked (notify.json, written by the listener; see
+# agent/knight_notify.py). Same shape as Knight. Deliberately separate records: his runs spend the
+# same Pro allowance, but they are not builds and must not count against Knight's daily ceiling.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+ZHOME=$MOSES_ROOT/knight
+JOBS="${ZRYACHIY_JOBS:-$MOSES_ROOT/zryachiy/jobs}"
+VIATICA="${ZRYACHIY_VIATICA:-}"   # the product checkout Zryachiy explores, from the operator's settings
+# About half an hour of Brad's Pro allowance each, shared with Knight and his own sessions.
+MAX_PER_DAY="${ZRYACHIY_MAX_PER_DAY:-4}"
+mkdir -p "$JOBS"
+
+die() { echo "zryachiy: $*" >&2; exit 1; }
+now() { date +%Y-%m-%dT%H:%M:%S%z; }
+
+# A record saying "running" is a claim; the process table is the observation. (Knight learned this
+# from a phantom job that held his only slot for 66 minutes.)
+alive() { local d=$1 pid; [ -f "$d/pid" ] || return 1; pid=$(cat "$d/pid" 2>/dev/null); [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+reconcile() {
+    local j
+    for j in "$JOBS"/*/; do
+        [ "$(cat "$j/status" 2>/dev/null)" = running ] || continue
+        alive "$j" || { echo orphaned > "$j/status"; [ -s "$j/summary" ] || echo "orphaned: the record said running but no worker was alive" > "$j/summary"; }
+    done
+}
+running() { reconcile; local n=0 j; for j in "$JOBS"/*/; do [ "$(cat "$j/status" 2>/dev/null)" = running ] && n=$((n+1)); done; echo "$n"; }
+today() { local n=0 j; for j in "$JOBS/$(date +%Y%m%d)"-*; do [ -d "$j" ] && n=$((n+1)); done; echo "$n"; }
+
+cmd_explore() {
+    local feature="" minutes=30 criteria=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --feature)  feature="${2:-}"; shift 2 ;;
+            --criteria) criteria="${criteria:+$criteria
+}${2:-}"; shift 2 ;;
+            --minutes)  minutes="${2:-}"; shift 2 ;;
+            *)          die "unknown option $1" ;;
+        esac
+    done
+    [ -n "$feature" ] || die 'usage: zryachiy explore --feature "…" --criteria "…" [--minutes 30]'
+    # REFUSED HERE, like Knight's acceptance criteria. Without them he can say what looks broken and
+    # never whether the feature is what was asked for.
+    [ -n "$(printf '%s' "$criteria" | tr -d '[:space:]')" ] || die 'every exploration needs --criteria: what must be TRUE when the feature works, one per line, checkable on screen.
+  weak:   "group trips work"
+  usable: "the roster never appears on the public link, whatever the privacy setting"'
+    [[ "$minutes" =~ ^[0-9]+$ ]] && [ "$minutes" -ge 5 ] && [ "$minutes" -le 60 ] || die "--minutes must be a whole number from 5 to 60"
+    [ -d "$VIATICA/e2e" ] || die "no Viatica checkout at $VIATICA"
+    [ -n "${ZRYACHIY_FAKE_EXPLORE:-}" ] || [ -x "$MOSES_CLAUDE_CLI" ] || die "claude CLI not found at $MOSES_CLAUDE_CLI"
+    # One sandbox at a time: it owns fixed ports, and a second run would only fail on them later.
+    [ "$(running)" -ge 1 ] && die "an exploration is already running (one sandbox at a time). See: zryachiy status"
+    local c; c=$(today)
+    [ "$c" -ge "$MAX_PER_DAY" ] && die "$c explorations already today (max $MAX_PER_DAY). Each spends about half an hour of Brad's Pro allowance."
+
+    local id dir
+    id="$(date +%Y%m%d-%H%M%S)-$$"; dir="$JOBS/$id"; mkdir -p "$dir"
+    printf '%s\n' "$feature" > "$dir/feature.txt"
+    printf '%s\n' "$criteria" > "$dir/criteria.txt"
+    printf '%s\n' "$minutes" > "$dir/minutes"
+    now > "$dir/started"
+    echo starting > "$dir/status"
+    setsid nohup "$ZHOME/bin/zryachiy-run" "$dir" > "$dir/nohup.log" 2>&1 &
+    # "running" is only true once the worker says so, from its own pid.
+    local i
+    for i in $(seq 1 40); do [ "$(cat "$dir/status" 2>/dev/null)" != starting ] && break; sleep 0.25; done
+    if [ "$(cat "$dir/status" 2>/dev/null)" = starting ]; then
+        echo failed > "$dir/status"; echo "the worker never started; see $dir/nohup.log" > "$dir/summary"
+        die "the worker never started (job $id); see $dir/nohup.log"
+    fi
+    echo "Zryachiy started $id, exploring \"$feature\" for up to $minutes minutes, plus a few minutes to build the sandbox."
+    echo "He posts his findings to #viatica-dev when he is done, and back to the conversation that asked."
+}
+
+cmd_status() {
+    reconcile
+    if [ -n "${1:-}" ]; then
+        [[ "$1" =~ ^[0-9]{8}-[0-9]{6}-[0-9]+$ ]] || die "$1 is not an exploration id"
+        local d="$JOBS/$1"; [ -d "$d" ] || die "no exploration $1"
+        echo "exploration $1"
+        echo "status   $(cat "$d/status" 2>/dev/null)"
+        echo "feature  $(cat "$d/feature.txt" 2>/dev/null)"
+        echo "started  $(cat "$d/started" 2>/dev/null)"
+        [ -f "$d/ended" ] && echo "ended    $(cat "$d/ended")"
+        [ -s "$d/summary" ] && { echo; cat "$d/summary"; }
+        [ -f "$d/report.md" ] && { echo; sed -n '1,80p' "$d/report.md"; }
+    else
+        echo "explorations today: $(today) / $MAX_PER_DAY · running: $(running)"
+        local j
+        for j in $(ls -1dr "$JOBS"/*/ 2>/dev/null | head -10); do
+            printf '  %-24s %-17s %s\n' "$(basename "$j")" "$(cat "$j/status" 2>/dev/null)" "$(head -c 70 "$j/feature.txt" 2>/dev/null)"
+        done
+    fi
+}
+
+case "${1:-}" in
+    explore) shift; cmd_explore "$@" ;;
+    status)  shift; cmd_status "$@" ;;
+    *)       die "usage: zryachiy explore --feature … --criteria … [--minutes N] | zryachiy status [id]" ;;
+esac

@@ -1,0 +1,63 @@
+# ── Secrets. Never, under any circumstances. ────────────────────────────────
+# Commandment 2: secrets never live in the repo — not in code, not in commits, not in a checked-in
+# config. This list is the first layer; `tools/scan-secrets.sh` run as a pre-commit hook is the one
+# that actually holds, because a .gitignore only protects files nobody force-adds.
+*.env
+!*.env.example
+*.credentials.json
+.credentials.json
+secrets/
+*.pem
+*.key
+id_ed25519*
+id_rsa*
+
+# ── The operator's own data. Portable framework, private content. ───────────
+# The memory corpus is where Moses keeps what he knows about ONE person's projects: decisions,
+# money, infrastructure, people. The framework ships the SHAPE of a corpus, never its contents.
+memory/
+entities/
+state/
+*.jsonl
+diagnoses.jsonl
+chat-failures.jsonl
+proposals.json
+pacing.json
+silence
+
+# ── Backups the installers leave behind ─────────────────────────────────────
+*.bak
+*.bak-*
+*.bak.*
+*.tmp
+*.orig
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ── Editors / OS ────────────────────────────────────────────────────────────
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ── The running layout's runtime (the framework is the author's tree, filtered) ─
+# Knight's per-target clones and job records, Zryachiy's exploration records, the transcript index.
+knight/repo/
+knight/jobs/
+knight/DISABLED
+knight/.budget-epoch
+zryachiy/
+mcp/transcripts.db
+mcp/*.db-wal
+mcp/*.db-shm
+venv/
+.venv/
+*.pyc
+# Knight's permission lists are configuration, not a secret, and Knight cannot run without them. The one
+# exception to the *.env rule above; a target's own .env stays private on the author's side.
+!knight/guards.env

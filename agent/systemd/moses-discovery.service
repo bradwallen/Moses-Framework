@@ -1,0 +1,10 @@
+[Unit]
+# The unprompted half. Retrieval waits to be asked; the whole premise of Brad's requirement is
+# that he will NOT know to ask — "there'll be no way to catch something like that unless I build
+# that system now." So this goes looking on a schedule and writes what it found into the corpus,
+# where Moses reads it back and the nightly backup carries it off-site.
+Description=Moses — look for connections nobody asked about
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/discovery.py sweep

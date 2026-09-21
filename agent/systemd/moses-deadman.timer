@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for the liveness probe going quiet, every 45 minutes
+
+[Timer]
+# OFFSET FROM THE PROBE ON PURPOSE. Same cadence would mean both fire together and a single hiccup
+# looks like two failures; 45 against 30 keeps them interleaved. The staleness limit is 90 minutes —
+# three missed probe cycles — so this always gets at least two looks before it declares anything.
+OnBootSec=12min
+OnUnitActiveSec=45min
+
+[Install]
+WantedBy=timers.target

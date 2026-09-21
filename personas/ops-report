@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+# ops-report — Reserve's ops status, posted to Slack as Birdeye.
+#
+#   ops-report morning    scheduled 08:00 briefing — EXCEPTION-ONLY (see below)
+#   ops-report full       everything, healthy or not (what /ops-jobs status calls)
+#   ops-report backup     last backup result only
+#
+# The morning report deliberately says almost nothing when everything is fine. A successful backup and
+# a 55%-full disk are not information — reporting them daily trains you to skim, and then you miss the
+# one morning it matters.
+#
+# It is NOT fully silent when healthy, though: it posts a single all-clear line. Silence would be
+# ambiguous — a dead timer, a broken token and a healthy morning would all look identical. One line
+# keeps the heartbeat while carrying no noise.
+#
+# Reads iDrive's own job summary rather than inferring from process state — the reason this exists is
+# that a stalled job once looked exactly like a running one.
+
+set -uo pipefail
+
+# The IDrive profile is named after the ACCOUNT that registered the machine, so it cannot be
+# guessed — discovered at runtime, with the operator able to pin it when there is more than one.
+PROFILE=${IDRIVE_PROFILE:-$(ls -d /opt/IDriveForLinux/idriveIt/user_profile/root/* 2>/dev/null | head -1)}
+BSET="$PROFILE/Backup/DefaultBackupSet"
+OPS_JOBS="${OPS_JOBS:-/usr/local/bin/ops-jobs}"   # overridable so a new build can be dry-run before install
+PRINT=0
+for _a in "$@"; do [ "$_a" = "--print" ] && PRINT=1; done
+MODE="${1:-morning}"
+[ "$MODE" = "--print" ] && MODE=morning
+
+QUOTA_WARN_PCT=90
+DISK_WARN_PCT=90
+BACKUP_STALE_HOURS=30   # a "successful" backup from three days ago is not a healthy backup
+
+human_bytes() {
+  awk -v b="${1:-0}" 'BEGIN{
+    split("B KB MB GB TB PB", u, " "); i=1
+    while (b >= 1024 && i < 6) { b /= 1024; i++ }
+    printf "%.1f %s", b, u[i]
+  }'
+}
+
+BACKUP_TEXT=""; BACKUP_ISSUE=0; BACKUP_ONELINE=""
+QUOTA_TEXT="";  QUOTA_ISSUE=0;  QUOTA_ONELINE=""
+DISK_TEXT="";   DISK_ISSUE=0
+SIGNUP_TEXT=""; SIGNUP_ONELINE=""
+JOBS_TEXT="";   JOBS_ISSUE=0
+FLIGHT_TEXT=""; FLIGHT_N=0
+
+# ── Last backup ───────────────────────────────────────────────────────────────
+# ORDER IS LOAD-BEARING: liveness is established BEFORE the summary is read. iDrive writes
+# jobSummary.json when a run FINISHES, so a from-scratch run — exactly what the 2026-08-04 drive
+# rebuild forced — has no summary for as long as the upload takes. Reading the summary first and
+# returning early made a healthy 6-hour backup report "no job summary found": a live backup
+# rendered indistinguishable from a broken one. That is this report's founding failure inverted,
+# and the reason "running" here must mean *observed to be moving*, never *a pid exists*.
+STALL_MINUTES=60   # a run whose own working files haven't changed in an hour is not running
+
+human_dur() {
+  local s="${1:-0}"
+  if [ "$s" -lt 3600 ]; then printf '%dm' $(( s / 60 ))
+  else printf '%dh %dm' $(( s / 3600 )) $(( (s % 3600) / 60 )); fi
+}
+
+build_backup() {
+  local js="$BSET/jobSummary.json"
+  local secs=0 workers=0 age_min=-1 fresh="" run_line="" run_issue=0
+
+  # Bracket glob so the pattern cannot match this script's own command line. -o takes the OLDEST
+  # match, which is the parent `--backup` process, so elapsed time is the run's and not a worker's.
+  local running; running=$(pgrep -o -f "bin/idrive [-][-]backup" 2>/dev/null)
+
+  if [ -n "$running" ]; then
+    secs=$(ps -o etimes= -p "$running" 2>/dev/null | tr -d ' '); secs="${secs:-0}"
+    # -x on the process NAME, not -f on the command line: each worker is wrapped in an `sh -c` whose
+    # arguments also contain the string, so -f counted every upload twice plus one.
+    workers=$(pgrep -c -x 'idevsutil_dedup' 2>/dev/null); workers="${workers:-0}"
+
+    # Prove it is MOVING rather than inferring it from the process existing — a stalled job holding
+    # a pid is the original reason Birdeye was built. iDrive rewrites its working files in the set
+    # directory continuously, so their mtime is the run's own pulse.
+    if [ -r "$BSET" ]; then
+      local newest_ts
+      newest_ts=$(find "$BSET" -maxdepth 1 -type f -printf '%T@\n' 2>/dev/null \
+                  | sort -rn | head -1 | cut -d. -f1)
+      if [ -n "$newest_ts" ]; then
+        age_min=$(( ( $(date +%s) - newest_ts ) / 60 ))
+        fresh="last wrote ${age_min}m ago"
+      else
+        fresh="no working files to time it by"
+      fi
+    else
+      # Say so rather than defaulting either way. Unreadable is not the same as stalled, and
+      # guessing in either direction is how a monitor starts lying.
+      fresh="write activity not readable by $(id -un)"
+    fi
+
+    if [ "$age_min" -ge 0 ] && [ "$age_min" -gt "$STALL_MINUTES" ]; then
+      run_line="🔴 *Backup* — running $(human_dur "$secs") but STALLED: ${fresh}"
+      run_issue=1
+    else
+      run_line=$(printf '⏳ *Backup* — IN PROGRESS, %s elapsed · %s upload worker(s) · %s' \
+        "$(human_dur "$secs")" "$workers" "$fresh")
+    fi
+  fi
+
+  if [ ! -r "$js" ]; then
+    if [ -n "$running" ]; then
+      # In flight with no summary is a FIRST run: normal, not an alarm — the same call build_inflight
+      # already makes about long handed-off jobs. It is still stated out loud, so a multi-day upload
+      # never reads as silence.
+      BACKUP_TEXT="$run_line
+   First full run since the drive rebuild — no previous summary, so figures land when it finishes."
+      BACKUP_ISSUE=$run_issue
+      BACKUP_ONELINE="backup in progress $(human_dur "$secs")"
+      [ "$run_issue" -eq 1 ] && BACKUP_ONELINE="backup: STALLED at $(human_dur "$secs")"
+    else
+      BACKUP_TEXT="⚠️ *Backup* — no job summary found at \`$js\`, and no backup is running"
+      BACKUP_ISSUE=1; BACKUP_ONELINE="backup: unknown"
+    fi
+    return
+  fi
+
+  local status start end backedup total failed size
+  status=$(jq -r '.status // "unknown"' "$js")
+  start=$(jq -r '.start_time // 0' "$js")
+  end=$(jq -r '.end_time // 0' "$js")
+  backedup=$(jq -r '.backedup_count // 0' "$js")
+  total=$(jq -r '.total_count // 0' "$js")
+  failed=$(jq -r '.failed_count // 0' "$js")
+  size=$(jq -r '.trans_size // 0' "$js")
+
+  local dur=$(( end - start ))
+  local when; when=$(date -d "@$end" "+%a %b %-d, %-I:%M %p" 2>/dev/null || echo "unknown")
+  local age_h=$(( ( $(date +%s) - end ) / 3600 ))
+
+  local icon="✅" why=""
+  if [ "$status" != "Success" ]; then
+    icon="🔴"; why="status $status"; BACKUP_ISSUE=1
+  elif [ "$failed" -gt 0 ]; then
+    icon="⚠️"; why="$failed file(s) failed"; BACKUP_ISSUE=1
+  elif [ -z "$running" ] && [ "$age_h" -gt "$BACKUP_STALE_HOURS" ]; then
+    # Only stale when nothing is running. A long run in flight is the opposite of neglect, and
+    # flagging it would nag every morning of a multi-day upload until the warning meant nothing.
+    icon="⚠️"; why="stale — ${age_h}h since last run"; BACKUP_ISSUE=1
+  fi
+
+  # A live run is reported but is not itself an issue — only a STALLED one is.
+  if [ -n "$running" ]; then
+    [ "$run_issue" -eq 1 ] && BACKUP_ISSUE=1
+  fi
+
+  BACKUP_ONELINE="backup ok ${when}"
+  [ "$BACKUP_ISSUE" -eq 1 ] && BACKUP_ONELINE="backup: $why"
+  if [ -n "$running" ]; then
+    BACKUP_ONELINE="backup in progress $(human_dur "$secs")"
+    [ "$run_issue" -eq 1 ] && BACKUP_ONELINE="backup: STALLED at $(human_dur "$secs")"
+  fi
+
+  local body
+  body=$(printf '%s *Backup* — %s, finished %s\n   %s of %s files · %s transferred · %s failed · took %dm' \
+    "$icon" "$status" "$when" "$backedup" "$total" "$(human_bytes "$size")" "$failed" $(( dur / 60 )))
+  [ -n "$running" ] && body="$run_line
+   Figures below are the PREVIOUS run.
+$body"
+
+  # Whether the junk excludes are in force, read from the run's own log.
+  local newest
+  newest=$(ls -t "$BSET/LOGS/" 2>/dev/null | head -1)
+  if [ -n "$newest" ]; then
+    local nex
+    nex=$(awk '/\[User excluded items:\]/{f=1;next} /^\[/{f=0} f&&NF&&!/No item/{c++} END{print c+0}' "$BSET/LOGS/$newest")
+    body="$body
+   $nex exclude rule(s) applied"
+  fi
+  BACKUP_TEXT="$body"
+}
+
+# ── Cloud quota ───────────────────────────────────────────────────────────────
+build_signups() {
+  # Viatica signups, from the read-only agent endpoint on Customs. This endpoint POSTS NOTHING —
+  # it is the same door Moses's finance/support tools use, deliberately not /api/cron/*.
+  local conf=/etc/moses/ops.env base secret json n total
+  [ -r "$conf" ] || { SIGNUP_ONELINE="signups: unavailable (no config)"; return; }
+  # shellcheck disable=SC1090
+  base=$(. "$conf" 2>/dev/null; printf '%s' "${VIATICA_APP_URL:-}")
+  secret=$(. "$conf" 2>/dev/null; printf '%s' "${CRON_SECRET:-}")
+  if [ -z "$base" ] || [ -z "$secret" ]; then
+    SIGNUP_ONELINE="signups: unavailable (no config)"; return
+  fi
+  base="${base%/}"
+  case "$base" in http://*|https://*) ;; *) base="https://$base" ;; esac
+
+  # Short timeouts: the backup summary is the important part of this report and must not wait on
+  # a product API. Failure here is informational, never fatal.
+  json=$(curl -sS --max-time 10 --connect-timeout 5 \
+           -H "Authorization: Bearer $secret" \
+           "$base/api/agents/report?persona=ops&hours=24" 2>/dev/null)
+  if [ -z "$json" ] || ! printf '%s' "$json" | jq -e . >/dev/null 2>&1; then
+    SIGNUP_ONELINE="signups: unavailable (Customs unreachable)"
+    SIGNUP_TEXT="*Signups* — could not reach Customs. Not a Reserve problem; the app may be redeploying."
+    return
+  fi
+  n=$(printf '%s' "$json" | jq -r '.newUsers // empty')
+  total=$(printf '%s' "$json" | jq -r '.totalUsers // empty')
+  if [ -z "$n" ]; then
+    SIGNUP_ONELINE="signups: unavailable"
+    SIGNUP_TEXT="*Signups* — Customs answered without a count: $(printf '%s' "$json" | head -c 120)"
+    return
+  fi
+
+  if [ "$n" -eq 0 ]; then
+    SIGNUP_ONELINE="no new signups"
+    SIGNUP_TEXT="*Signups* — nobody new in the last 24h (${total} total)"
+  elif [ "$n" -eq 1 ]; then
+    SIGNUP_ONELINE="1 new signup"
+    SIGNUP_TEXT="🎉 *Signups* — 1 new user in the last 24h (${total} total)"
+  else
+    SIGNUP_ONELINE="${n} new signups"
+    SIGNUP_TEXT="🎉 *Signups* — ${n} new users in the last 24h (${total} total)"
+  fi
+}
+
+build_quota() {
+  local q="$PROFILE/.quota.txt"
+  # Returning silently would mean quota monitoring could stop dead and read as healthy — the same
+  # drift that took three drives off the disk alarm. Not an alarm, but never invisible either.
+  if [ ! -r "$q" ]; then QUOTA_ONELINE="iDrive quota unknown"; return; fi
+  local total used
+  total=$(grep -oP 'totalQuota=\K[0-9]+' "$q" 2>/dev/null || echo 0)
+  used=$(grep -oP 'usedQuota=\K[0-9]+' "$q" 2>/dev/null || echo 0)
+  [ "$total" -gt 0 ] || return
+  local pct=$(( used * 100 / total ))
+  local icon="☁️"
+  if [ "$pct" -ge "$QUOTA_WARN_PCT" ]; then icon="⚠️"; QUOTA_ISSUE=1; fi
+  QUOTA_ONELINE="iDrive ${pct}%"
+  QUOTA_TEXT=$(printf '%s *iDrive* — %s of %s (%s%%)' "$icon" "$(human_bytes "$used")" "$(human_bytes "$total")" "$pct")
+}
+
+# ── Local disks ───────────────────────────────────────────────────────────────
+build_disk() {
+  local body="💽 *Disks*" line mnt pcent avail n
+
+  # Mount points are DISCOVERED, never hardcoded. The old hardcoded list named /mnt/bcm-archive
+  # and /mnt/bcm-media, which stopped existing in the 2026-08-04 drive consolidation. df wrote its
+  # "No such file or directory" to stderr and the report simply printed fewer lines — so three
+  # drives (4.7 TB) fell out of the disk-full alarm and nothing said so. Same class of failure as
+  # a dead job reading as running: the check looked healthy because it had quietly stopped checking.
+  local targets=()
+  mapfile -t targets < <(findmnt -rno TARGET --real 2>/dev/null | grep -E '^(/mnt/|/$)' | sort -u)
+  if [ "${#targets[@]}" -eq 0 ]; then
+    DISK_TEXT="⚠️ *Disks* — could not enumerate mount points (findmnt returned nothing)"
+    DISK_ISSUE=1; return
+  fi
+
+  # No subshell (process substitution), or the issue flag would not survive the loop.
+  while read -r mnt pcent avail; do
+    local icon="  "
+    n="${pcent%\%}"
+    if [ "$n" -ge "$DISK_WARN_PCT" ] 2>/dev/null; then icon="⚠️"; DISK_ISSUE=1; fi
+    line=$(printf '   %s %-20s %4s used · %s free' "$icon" "$mnt" "$pcent" "$avail")
+    body="$body
+$line"
+  done < <(df -h --output=target,pcent,avail "${targets[@]}" 2>/dev/null | tail -n +2)
+
+  # A drive that fails to mount vanishes from findmnt entirely, and every /mnt entry in fstab
+  # carries `nofail`, so it also fails silently at boot. Absence has to alarm on its own, or the
+  # blind spot comes straight back wearing a different hat. fstab is the declared intent.
+  local want
+  while read -r want; do
+    case " ${targets[*]} " in
+      *" $want "*) ;;
+      *) DISK_ISSUE=1; body="$body
+   ⚠️ $(printf '%-20s' "$want") declared in fstab but NOT MOUNTED" ;;
+    esac
+  done < <(awk '$1 !~ /^#/ && $2 ~ /^\/mnt\//{print $2}' /etc/fstab 2>/dev/null)
+
+  DISK_TEXT="$body"
+}
+
+# ── Jobs currently in flight ──────────────────────────────────────────────────
+# Not an "issue" — a long job is normal. But its absence was: a status report that lists disks and
+# quota while saying nothing about the two jobs actively rewriting those disks is answering the
+# wrong question. Liveness comes from `ops-jobs inflight`, so there is one definition of "running".
+build_inflight() {
+  local id el name last body=""
+  while IFS=$'\t' read -r id el name last; do
+    [ -z "$id" ] && continue
+    FLIGHT_N=$((FLIGHT_N + 1))
+    body="$body
+   • *${name}* — running ${el}"
+    [ -n "$last" ] && body="$body
+     \`${last}\`"
+  done < <("$OPS_JOBS" inflight 2>/dev/null)
+  [ "$FLIGHT_N" -eq 0 ] && return
+  FLIGHT_TEXT="⏳ *In flight* (${FLIGHT_N})$body
+_Detail: \`/ops-jobs job <id>\` · ids from \`/ops-jobs jobs\`_"
+}
+
+# ── Handed-off jobs that failed or died in the last day ───────────────────────
+build_jobs() {
+  local dir=/var/lib/moses/ops/jobs bad=0 out="" rc id el name
+  [ -d "$dir" ] || return
+
+  while read -r d; do
+    [ -f "$d/exit" ] || continue
+    rc=$(cat "$d/exit")
+    case "$rc" in 0|watched) ;; *) bad=$((bad+1)); out="$out
+   • $(cat "$d/name" 2>/dev/null) — exit $rc" ;; esac
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -mtime -1 2>/dev/null | sort)
+
+  # A job with no result and no live process died without reporting. That is strictly worse than a
+  # clean failure — nothing was posted to Slack, so without this it is invisible forever.
+  while IFS=$'\t' read -r id el name; do
+    [ -z "$id" ] && continue
+    bad=$((bad+1)); out="$out
+   • $name — ORPHANED (no exit status, no live process, last seen after $el)"
+  done < <("$OPS_JOBS" orphans 2>/dev/null)
+
+  [ "$bad" -eq 0 ] && return
+  JOBS_ISSUE=1
+  JOBS_TEXT="🔴 *${bad} handed-off job(s) failed or died in the last 24h*$out"
+}
+
+
+# ── Customs (Viatica in production) ───────────────────────────────────────────
+# Everything that can EXPIRE or RUN OUT and take the product down for a paying customer. Reported
+# FIRST, above Reserve: a full disk is Brad's problem, a dead Viatica is his customers' problem.
+# The work lives in health-expiry so it can be run and tested on its own.
+CUSTOMS_ISSUE=0; CUSTOMS_TEXT=""; CUSTOMS_ONELINE=""
+build_customs() {
+  local out
+  if ! command -v /usr/local/bin/health-expiry >/dev/null 2>&1; then
+    CUSTOMS_ISSUE=1
+    CUSTOMS_TEXT="⚠️ *Customs* — health-expiry is not installed, so nothing about Viatica was checked"
+    return
+  fi
+  if out=$(/usr/local/bin/health-expiry 2>&1); then
+    CUSTOMS_TEXT="$out"
+    CUSTOMS_ONELINE=$(/usr/local/bin/health-expiry --oneline 2>/dev/null | head -1)
+  else
+    CUSTOMS_ISSUE=1
+    CUSTOMS_TEXT="$out"
+  fi
+}
+
+build_all() { build_signups; build_backup; build_quota; build_disk; build_inflight; build_jobs; }
+
+case "$MODE" in
+  backup)
+    build_backup
+    MSG="$BACKUP_TEXT"
+    ;;
+
+  full)
+    build_all
+    MSG=""
+    [ -n "$SIGNUP_TEXT" ] && MSG=$(printf '🛬 *Viatica*\n\n%s' "$SIGNUP_TEXT")
+    MSG=$(printf '%s\n\n🏠 *Reserve — ops*\n\n%s\n%s\n%s' "$MSG" "$BACKUP_TEXT" "$QUOTA_TEXT" "$DISK_TEXT")
+    [ -n "$FLIGHT_TEXT" ] && MSG="$MSG
+
+$FLIGHT_TEXT"
+    [ -n "$JOBS_TEXT" ] && MSG="$MSG
+$JOBS_TEXT"
+    ;;
+
+  morning)
+    build_all
+    issues=$(( BACKUP_ISSUE + QUOTA_ISSUE + DISK_ISSUE + JOBS_ISSUE ))
+    if [ "$issues" -eq 0 ]; then
+      # Healthy: one line. Enough to prove Birdeye ran, small enough to ignore. Work in flight is
+      # appended rather than promoted to an issue — worth knowing, not worth an alarm.
+      # Two lines when healthy, one per environment. Still small enough to skim and ignore, but it
+      # proves BOTH halves were actually checked — a single "all clear" could not distinguish a
+      # healthy Customs from a Customs nobody looked at.
+      MSG="✅ *Reserve* — all clear (${BACKUP_ONELINE}, ${QUOTA_ONELINE}, disks ok)"
+      [ "$FLIGHT_N" -gt 0 ] && MSG="$MSG · ${FLIGHT_N} job(s) still running"
+    else
+      MSG="⚠️ *Needs a look*"
+      [ -n "$SIGNUP_ONELINE" ] && MSG="$MSG  _(${SIGNUP_ONELINE})_"
+      # Customs first, always — a Viatica problem outranks anything on Reserve.
+      { [ "$BACKUP_ISSUE" -eq 1 ] || [ "$QUOTA_ISSUE" -eq 1 ] || [ "$DISK_ISSUE" -eq 1 ] || [ "$JOBS_ISSUE" -eq 1 ]; } && MSG="$MSG
+
+🏠 *Reserve*"
+      [ "$BACKUP_ISSUE" -eq 1 ] && MSG="$MSG
+
+$BACKUP_TEXT"
+      [ "$QUOTA_ISSUE"  -eq 1 ] && MSG="$MSG
+
+$QUOTA_TEXT"
+      [ "$DISK_ISSUE"   -eq 1 ] && MSG="$MSG
+
+$DISK_TEXT"
+      [ "$JOBS_ISSUE"   -eq 1 ] && MSG="$MSG
+
+$JOBS_TEXT"
+      [ -n "$FLIGHT_TEXT" ] && MSG="$MSG
+
+$FLIGHT_TEXT"
+      MSG="$MSG
+
+_Full detail: \`/ops-jobs status\`_"
+    fi
+    ;;
+
+  *) echo "usage: ops-report [morning|full|backup]" >&2; exit 2 ;;
+esac
+
+mkdir -p /var/lib/moses/ops
+_tmp=$(mktemp /var/lib/moses/ops/.last-report.XXXXXX) && {
+  printf '%s\n' "$MSG" > "$_tmp"
+  chmod 644 "$_tmp"
+  mv -f "$_tmp" /var/lib/moses/ops/last-report.txt
+}
+
+if [ "${PRINT:-0}" -eq 1 ]; then
+  printf '%s\n' "$MSG"
+else
+  ops-jobs say "$MSG"
+fi

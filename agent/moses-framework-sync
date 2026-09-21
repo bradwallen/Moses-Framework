@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""moses-framework-sync — make the public framework checkout match this tree, filtered by framework.map.
+
+    agent/moses-framework-sync --check      say how far behind the framework is; change nothing
+    agent/moses-framework-sync              copy what ships, remove what no longer does
+    agent/moses-framework-sync --framework PATH    (default: $MOSES_FRAMEWORK, else ../moses-framework)
+
+WHY (2026-09-21). The framework was a hand-kept copy in a different layout. Every sync was a per-file
+translation plus a three-way merge against scrubbing done on the framework side, so it was skipped,
+and the framework fell 57 commits behind in 18 days with nothing saying so. Now the framework IS this
+tree, filtered: a shipped file is copied byte for byte, so it can be COMPARED, and `--check` is a
+number instead of a feeling.
+
+THREE REFUSALS, all before anything is written:
+  * a tracked file framework.map does not classify — a new file is a decision, not a default;
+  * a framework checkout with uncommitted changes — they would be overwritten without a trace;
+  * a shipped file the framework's own secret scanner rejects. The scanner is the framework's, not a
+    copy of it here, so the two can never disagree about what a secret looks like.
+
+It does not commit. What changed is left in the framework's working tree to be read, and the
+framework's pre-commit hook scans it again on the way in.
+
+Exit codes: 0 in step (or synced), 1 drift found by --check, 2 could not run. 2 must never read as 0:
+a check that could not look is not a clean result.
+"""
+from __future__ import annotations
+
+import argparse
+import fnmatch
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+MAP = REPO / "framework.map"
+# Directories the framework takes from this tree. Anything in them that this tree does not ship is
+# removed by a sync; everything outside them (README, LICENSE, docs, config examples, tools, hooks,
+# installers, the role-named personas) is the framework's own and never touched.
+OWNED_DIRS = ("agent/", "knight/", "mcp/")
+# Fewer tracked files than this means the checkout or git is wrong, not that there is little to ship.
+MIN_FILES = 50
+
+
+def die(msg: str) -> None:
+    print(f"moses-framework-sync: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
+def tracked(root: Path) -> list[str]:
+    r = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, text=True)
+    if r.returncode != 0:
+        die(f"git ls-files failed in {root}: {r.stderr.strip()}")
+    return sorted(p for p in r.stdout.split("\0") if p)
+
+
+def load_map() -> list[tuple[str, str, str]]:
+    if not MAP.is_file():
+        die(f"{MAP} is missing — without it nothing can be classified, so nothing is synced")
+    rules = []
+    for n, line in enumerate(MAP.read_text().splitlines(), 1):
+        line = line.split(" #", 1)[0].rstrip() if not line.lstrip().startswith("#") else ""
+        if not line.strip():
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2 or parts[1] not in ("ship", "private"):
+            die(f"framework.map line {n}: expected '<pattern> ship [dest]' or '<pattern> private <reason>'")
+        pattern, verdict, rest = parts[0], parts[1], (parts[2] if len(parts) > 2 else "")
+        if verdict == "private" and not rest.strip():
+            die(f"framework.map line {n}: '{pattern}' is private with no reason — the reason is the point")
+        if verdict == "ship" and rest.strip() and (" " in rest.strip() or rest.strip().startswith("/")):
+            # A ship line takes a destination PATH, not a reason. Found the hard way: a reason written
+            # after `ship` would have been read as where to copy the file.
+            die(f"framework.map line {n}: '{rest.strip()}' is not a destination path — a ship line takes "
+                f"only a relative path; put reasons in a comment")
+        rules.append((pattern, verdict, rest.strip()))
+    return rules
+
+
+def classify(files: list[str], rules) -> tuple[dict[str, str], list[str], list[str]]:
+    """{source: dest} for what ships, the private list, and anything no rule matched."""
+    ships, private, unmatched = {}, [], []
+    for f in files:
+        for pattern, verdict, rest in rules:
+            if fnmatch.fnmatchcase(f, pattern):
+                if verdict == "ship":
+                    ships[f] = rest or f
+                else:
+                    private.append(f)
+                break
+        else:
+            unmatched.append(f)
+    return ships, private, unmatched
+
+
+def same(a: Path, b: Path) -> bool:
+    return b.is_file() and a.read_bytes() == b.read_bytes() and (os.access(a, os.X_OK) == os.access(b, os.X_OK))
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    ap.add_argument("--framework", default=os.environ.get("MOSES_FRAMEWORK", str(REPO.parent / "moses-framework")))
+    ap.add_argument("--quiet", action="store_true")
+    a = ap.parse_args()
+    fw = Path(a.framework).resolve()
+    if not (fw / ".git").exists():
+        die(f"{fw} is not a git checkout of the framework")
+    if fw == REPO:
+        die("the framework path is this tree — refusing to sync a tree onto itself")
+
+    files = tracked(REPO)
+    if len(files) < MIN_FILES:
+        die(f"only {len(files)} tracked files in {REPO} — the checkout looks wrong, refusing to judge it")
+    ships, private, unmatched = classify(files, load_map())
+    if unmatched:
+        print("moses-framework-sync: these files are in no line of framework.map — ship them, or say why not:",
+              file=sys.stderr)
+        for f in unmatched:
+            print(f"  {f}", file=sys.stderr)
+        sys.exit(2)
+
+    dests = {d: s for s, d in ships.items()}
+    fw_files = tracked(fw)
+    changed = [d for s, d in ships.items() if not same(REPO / s, fw / d)]
+    stale = [f for f in fw_files if f.startswith(OWNED_DIRS) and f not in dests]
+
+    if a.check:
+        if changed or stale:
+            print(f"framework is behind: {len(changed)} file(s) to copy, {len(stale)} to remove "
+                  f"({len(ships)} ship, {len(private)} private)")
+            if not a.quiet:
+                for d in changed:
+                    print(f"  copy    {d}")
+                for d in stale:
+                    print(f"  remove  {d}")
+            sys.exit(1)
+        print(f"framework is in step: {len(ships)} files ship, {len(private)} stay private")
+        sys.exit(0)
+
+    dirty = subprocess.run(["git", "-C", str(fw), "status", "--porcelain"], capture_output=True, text=True)
+    if dirty.returncode != 0:
+        die("could not read the framework's status")
+    if dirty.stdout.strip():
+        die(f"{fw} has uncommitted changes — commit or discard them first; a sync would bury them")
+
+    scanner = fw / "tools" / "scan-secrets.sh"
+    if not os.access(scanner, os.X_OK):
+        die(f"{scanner} is missing — refusing to copy anything the framework cannot scan")
+
+    for d in changed:
+        src, dst = REPO / dests[d], fw / d
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    for d in stale:
+        (fw / d).unlink()
+    # Stage exactly what this run wrote, so the framework's scanner reads it the way the hook will.
+    touched = changed + stale
+    if touched:
+        def undo() -> None:
+            subprocess.run(["git", "-C", str(fw), "reset", "-q", "--", *touched])
+            subprocess.run(["git", "-C", str(fw), "checkout", "-q", "--", "."])
+            subprocess.run(["git", "-C", str(fw), "clean", "-fdq", "--", *OWNED_DIRS])
+            for d in changed:   # an IGNORED copy is invisible to `git clean` — remove it by name
+                if not (fw / d).exists():
+                    continue
+                if subprocess.run(["git", "-C", str(fw), "ls-files", "--error-unmatch", d],
+                                  capture_output=True).returncode != 0:
+                    (fw / d).unlink()
+
+        # Not check=True: git refuses an explicitly named ignored path with an error on some versions and
+        # skips it silently on others. Either way the index is what gets checked, just below.
+        subprocess.run(["git", "-C", str(fw), "add", "-A", "--ignore-errors", "--", *touched], capture_output=True)
+        # A shipped file the framework's .gitignore excludes is NOT staged by `git add`, silently — so it
+        # would be neither committed nor scanned. Found when knight/guards.env was left untracked on the
+        # first real sync. Every copied file must be in the index, or nothing is kept.
+        staged = set(subprocess.run(["git", "-C", str(fw), "ls-files", "--cached", "--", *changed],
+                                    capture_output=True, text=True).stdout.split("\n"))
+        missing = [d for d in changed if d not in staged]
+        if missing:
+            undo()
+            die("the framework's .gitignore excludes shipped file(s): " + ", ".join(missing) +
+                " — add an exception there, or mark them private here; nothing was kept")
+        scan = subprocess.run([str(scanner)], cwd=fw, capture_output=True, text=True)
+        if scan.returncode != 0:
+            undo()
+            print(scan.stdout + scan.stderr, file=sys.stderr)
+            die("the framework's secret scanner refused what would have been copied — nothing was kept")
+    print(f"synced: {len(changed)} copied, {len(stale)} removed ({len(ships)} ship, {len(private)} private). "
+          f"Staged in {fw}, not committed.")
+
+
+if __name__ == "__main__":
+    main()

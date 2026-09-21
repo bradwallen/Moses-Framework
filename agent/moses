@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# moses — the manager. Knows who every persona is, what each is accountable for, and who has gone quiet.
+#
+#   moses standup        run every persona's check, record the outcome, report exceptions  (the 08:00 job)
+#   moses status         accountability only — who is overdue — without calling anyone
+#   moses roster         who is accountable for what, and when each last reported
+#   moses check <id>     run one persona's check, on demand
+#   moses projects       every project in focus order — idea through shipped, with progress
+#   moses projects full  the same, with the cross-check against git, transcripts and todos
+#
+# WHY THIS EXISTS
+# moses-morning was a launcher: it held a hardcoded list of two URLs and judged them by HTTP status.
+# That cannot express accountability, only reachability. Three things follow from the difference:
+#
+#   1. The ROSTER decides who owes a report, not the caller. A persona dropped from a script's list
+#      used to stop being asked, and nothing noticed — the same silent drift that took three drives off
+#      Birdeye's disk alarm. Now the duty is declared in /etc/moses/personas.json and measured against.
+#   2. SILENCE IS A FAILURE, not an absence of one. A persona that is never called produces no error.
+#      Overdue is computed from its declared cadence and its own last success, so it surfaces whether
+#      the call failed, was never made, or the whole standup never ran.
+#   3. Moses is accountable too. The standup stamps a heartbeat and checks the previous one, so a
+#      missed morning — box down, timer masked — is reported by the next run instead of vanishing.
+#
+# Exception-only, per Brad's standing rule: Moses speaks up when something is wrong. He does NOT post
+# an all-clear, because the personas' own daily posts already carry the heartbeat — a fourth "all fine"
+# message every morning is exactly the noise that trains you to skim.
+
+set -uo pipefail
+
+# roster.json is the current name; personas.json is read as a fallback so an older install keeps
+# working through the rename rather than failing closed on a missing file.
+# THE OPERATOR'S HOME. Keyed off PRIVILEGE, not SUDO_USER — that variable names whoever invoked
+# sudo, so when root runs `sudo -u brad moses`, SUDO_USER is *root* and a naive lookup resolves to
+# /root. That is exactly what happened on 2026-09-02: the migration verified itself through
+# `sudo -u brad` and reported two failures against a system that was working correctly. A guard that
+# fires on correct work gets switched off, and this one nearly did on its first run.
+#
+# Unprivileged: $HOME is right, and sudo sets it for the target user (verified, not assumed).
+# Privileged: this is the standup timer, where there is no invoking user to ask — so it is a
+# declared operator, defaulting to brad, and root is never treated as the operator.
+if [ "$(id -u)" -ne 0 ]; then
+  OP_HOME=${MOSES_OP_HOME:-$HOME}
+  _op=$(id -un)
+else
+  # No sudo caller on the standup timer, so the operator is declared: /etc/moses/operator, written by
+  # install-root-hardening.sh, else account 1000, said aloud. Never sourced — this runs as root.
+  _op=${MOSES_OPERATOR_USER:-}
+  [ -z "$_op" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && _op=$SUDO_USER
+  [ -z "$_op" ] && [ -r /etc/moses/operator ] && _op=$(head -1 /etc/moses/operator | tr -d '[:space:]')
+  # Last resort, declared and said aloud: account 1000 — what this hard-coded before (/run/user/1000).
+  if [ -z "$_op" ]; then
+    _op=$(getent passwd 1000 | cut -d: -f1)
+    [ -n "$_op" ] || { echo "moses: no operator — set MOSES_OPERATOR_USER or write /etc/moses/operator" >&2; exit 2; }
+    echo "moses: no operator declared — using account 1000 ($_op); write it to /etc/moses/operator" >&2
+  fi
+  OP_HOME=${MOSES_OP_HOME:-$(getent passwd "$_op" | cut -d: -f6)}
+fi
+MOSES_ROOT=${MOSES_ROOT:-$OP_HOME/Projects/moses}; export MOSES_ROOT
+
+# ROOT NEVER RUNS THE OPERATOR'S FILES (2026-09-21). This runs as root from the 08:00 timer, and the
+# Moses checkout and ~/.config/moses are writable by the operator — and so by every agent that runs as
+# the operator. Anything here that executes one of them, or `source`s one, hands those agents root.
+# That is what this did: it sourced slack.env and ran moses-drift, project_status.py and moses-project
+# straight from the checkout. Now:
+#   * the operator's code runs AS the operator (as_op) — the privilege its author already has;
+#   * the operator's settings are read as DATA (op_value), one key at a time, never executed.
+# Root-owned files (/etc/…) are still sourced: nobody but root can change them.
+as_op() {
+  if [ "$(id -u)" = 0 ]; then runuser -u "$_op" -- env HOME="$OP_HOME" "$@"; else "$@"; fi
+}
+op_value() {   # op_value FILE KEY — the last KEY=value line, quotes removed; nothing is evaluated
+  sed -n "s/^[[:space:]]*\(export[[:space:]]\+\)\{0,1\}$2=//p" "$1" 2>/dev/null | tail -1 \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
+GUARD=${MOSES_EXEC_GUARD:-/usr/local/lib/moses/roster-exec-guard.sh}
+# A MISSING GUARD MUST NOT MEAN "RUN IT ANYWAY". If the file is gone, every roster-declared command
+# is refused rather than executed unchecked — the roster is operator-writable now, so an absent
+# check is the one failure that turns this back into arbitrary root execution.
+if [ -r "$GUARD" ]; then . "$GUARD"; else
+  roster_argv_ok() { echo "roster: exec guard missing at $GUARD — refusing to run anything it named" >&2; return 1; }
+fi
+REG=${MOSES_REGISTRY:-$OP_HOME/.config/moses/roster.json}
+[ -r "$REG" ] || [ ! -r /etc/moses/personas.json ] || REG=/etc/moses/personas.json
+STATE=${MOSES_STATE:-/var/lib/moses}
+PSTATE="$STATE/personas"
+HEARTBEAT="$STATE/last-standup"
+
+# LATER FILES WIN. The operator's own config is last on purpose: Moses runs as the operator now, so
+# ~/.config/moses is where his credentials live, and /etc/moses/moses.env is the retired root-only
+# file this replaced. Both are still sourced if present so the order can change without a flag day.
+for c in /etc/birdeye/birdeye.env /etc/moses/moses.env; do
+  # shellcheck disable=SC1090
+  [ -r "$c" ] && . "$c"     # root-owned: safe to source
+done
+# The operator's own file LAST, as before, but read as data: only the keys the standup uses.
+_openv="$OP_HOME/.config/moses/slack.env"
+if [ -r "$_openv" ]; then
+  for _k in SLACK_BOT_TOKEN MOSES_NAME MOSES_EMOJI; do
+    _v=$(op_value "$_openv" "$_k"); [ -n "$_v" ] && printf -v "$_k" '%s' "$_v"
+  done
+fi
+unset _openv _k _v
+: "${SLACK_BOT_TOKEN:=}"
+: "${SLACK_OPS_CHANNEL:=}"
+: "${VIATICA_APP_URL:=}"
+: "${CRON_SECRET:=}"
+: "${MOSES_NAME:=Moses}"
+: "${MOSES_EMOJI:=:scroll:}"
+
+die() { echo "moses: $*" >&2; exit 1; }
+command -v jq >/dev/null || die "jq is required"
+[ -r "$REG" ] || die "no roster at $REG"
+jq -e . "$REG" >/dev/null 2>&1 || die "$REG is not valid JSON"
+
+NOW=$(date +%s)
+GRACE=$(jq -r '.grace_factor // 1.5' "$REG")
+
+# ── Slack ─────────────────────────────────────────────────────────────────────
+# Degrades loudly, like birdeye: with no credentials the message still reaches stderr. A manager whose
+# alert silently doesn't send is the precise failure this layer exists to catch.
+post() {
+  local text="$1"
+  if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_OPS_CHANNEL" ]; then
+    echo "moses: no Slack credentials — message NOT sent:" >&2
+    echo "--- $text" >&2
+    return 1
+  fi
+  local payload resp
+  payload=$(jq -n --arg c "$SLACK_OPS_CHANNEL" --arg t "$text" \
+    --arg u "$MOSES_NAME" --arg e "$MOSES_EMOJI" \
+    '{channel:$c, text:$t, username:$u, icon_emoji:$e, unfurl_links:false}')
+  resp=$(curl -sS --max-time 20 -X POST https://slack.com/api/chat.postMessage \
+    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+    -H "Content-type: application/json; charset=utf-8" --data "$payload" 2>&1)
+  jq -e '.ok' <<<"$resp" >/dev/null 2>&1 && return 0
+  echo "moses: Slack rejected the message: $(jq -r '.error // .' <<<"$resp" 2>/dev/null)" >&2
+  return 1
+}
+
+human_ago() {
+  local s=$1
+  if   [ "$s" -lt 3600 ]  ; then printf '%dm ago' $(( s / 60 ))
+  elif [ "$s" -lt 172800 ]; then printf '%dh ago' $(( s / 3600 ))
+  else printf '%dd ago' $(( s / 86400 )); fi
+}
+
+pfield() { jq -r --arg id "$1" ".personas[]|select(.id==\$id)|$2 // empty" "$REG"; }
+ids()    { jq -r '.personas[].id' "$REG"; }
+
+# ── State ─────────────────────────────────────────────────────────────────────
+record() {
+  local id=$1 ok=$2 detail=$3 prev last_success
+  mkdir -p "$PSTATE"
+  prev="$PSTATE/$id.json"
+  last_success=0
+  [ -r "$prev" ] && last_success=$(jq -r '.last_success // 0' "$prev" 2>/dev/null)
+  [ "$ok" = "1" ] && last_success=$NOW
+  jq -n --argjson a "$NOW" --argjson s "${last_success:-0}" --argjson ok "$ok" --arg d "$detail" \
+    '{last_attempt:$a, last_success:$s, last_ok:($ok==1), last_detail:$d}' > "$prev.tmp" \
+    && mv "$prev.tmp" "$prev"
+}
+
+last_success_of() {
+  local f="$PSTATE/$1.json"
+  [ -r "$f" ] && jq -r '.last_success // 0' "$f" 2>/dev/null || echo 0
+}
+last_detail_of() {
+  local f="$PSTATE/$1.json"
+  [ -r "$f" ] && jq -r '.last_detail // ""' "$f" 2>/dev/null || echo ""
+}
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+# Returns 0 and prints a detail line, or returns 1 and prints why.
+run_check() {
+  local id=$1 type
+  type=$(pfield "$id" '.check.type')
+  case "$type" in
+    self) echo "manager"; return 0 ;;
+
+    command)
+      local argv out rc
+      mapfile -t argv < <(jq -r --arg id "$id" '.personas[]|select(.id==$id)|.check.argv[]' "$REG")
+      roster_argv_ok "${argv[0]:-}" || { echo "refused ${argv[0]:-(none)}"; return 1; }
+      [ "${#argv[@]}" -gt 0 ] || { echo "no argv in roster"; return 1; }
+      out=$("${argv[@]}" 2>&1); rc=$?
+      [ $rc -eq 0 ] && { echo "ran ${argv[0]##*/}"; return 0; }
+      echo "$(basename "${argv[0]}") exited $rc: $(tail -1 <<<"$out" | cut -c1-160)"
+      return 1 ;;
+
+    http)
+      local path base code body why
+      path=$(pfield "$id" '.check.path')
+      if [ -z "$VIATICA_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+        echo "VIATICA_APP_URL / CRON_SECRET not set"; return 1
+      fi
+      base="${VIATICA_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
+      body=$(mktemp)
+      code=$(curl -sSL -o "$body" -w '%{http_code}' --max-time 90 \
+        -H "Authorization: Bearer $CRON_SECRET" "$base$path" 2>/dev/null)
+      if [ "$code" = "200" ]; then rm -f "$body"; echo "HTTP 200"; return 0; fi
+      # The endpoints answer 502 with an `error` field when their Slack post failed, so the reason
+      # travels with the failure instead of leaving an HTTP code to guess at.
+      why=$(jq -r '.error // empty' "$body" 2>/dev/null); rm -f "$body"
+      echo "HTTP ${code:-000}${why:+ — $why}"; return 1 ;;
+
+    *) echo "unknown check type '${type:-none}'"; return 1 ;;
+  esac
+}
+
+# ── Accountability ────────────────────────────────────────────────────────────
+# Overdue is measured against the DECLARED cadence, so it fires whether the check failed, was never
+# attempted, or the standup itself never ran. This is the part a persona cannot do for itself.
+overdue_line() {
+  local id=$1 name cadence deadline ls
+  name=$(pfield "$id" '.name')
+  cadence=$(pfield "$id" '.cadence_hours'); cadence=${cadence:-24}
+  # cadence 0 means this one owes no scheduled report — an agent that acts on request (Knight) or
+  # is not built yet. Silence from it is not a failure, so it must not read as overdue. Only a
+  # DECLARED duty can be missed; that is the whole basis of the overdue check.
+  [ "$cadence" -eq 0 ] 2>/dev/null && return 1
+  ls=$(last_success_of "$id")
+  deadline=$(awk -v c="$cadence" -v g="$GRACE" 'BEGIN{printf "%d", c*g*3600}')
+  if [ "${ls:-0}" -eq 0 ]; then
+    echo "   • *$name* — has never reported successfully"
+    return 0
+  fi
+  if [ $(( NOW - ls )) -gt "$deadline" ]; then
+    echo "   • *$name* — last reported $(human_ago $(( NOW - ls ))), owes one every ${cadence}h"
+    return 0
+  fi
+  return 1
+}
+
+# ── Commands ──────────────────────────────────────────────────────────────────
+# ── Periodic reports ──────────────────────────────────────────────────────────
+# Some personas owe more than a daily. The CADENCE IS DECLARED IN THE ROSTER (`periodic[]`), not
+# here, for the same reason the daily list moved out of moses-morning: whatever holds the list
+# becomes the real definition of the duty, and a script is not somewhere anyone thinks to look.
+#
+# These used to run from GitHub Actions, whose scheduler is best-effort — the weekly landed at 09:48
+# on 2026-08-10 instead of 08:00, and GitHub reserves the right to drop a run entirely. Firing from
+# the 08:00 America/Chicago timer makes the time real and survives DST, which a UTC cron cannot.
+period_due() {
+  case "$1" in
+    monday)           [ "$(date +%u)" = "1" ] ;;
+    first_of_month)   [ "$(date +%d)" = "01" ] ;;
+    first_of_quarter) [ "$(date +%d)" = "01" ] && case "$(date +%m)" in 01|04|07|10) true ;; *) false ;; esac ;;
+    daily)            true ;;
+    *)                false ;;   # an unknown rule must never fire, and never silently pass either
+  esac
+}
+
+# Fires every periodic report that is due today. Echoes one "label: detail" per FAILURE; silence
+# means everything due was delivered. A period that is not due today is not a failure.
+run_periodic() {
+  local id=$1 count i path when label base code body why
+  count=$(jq -r --arg i "$id" '.personas[] | select(.id==$i) | (.periodic // []) | length' "$REG" 2>/dev/null)
+  [ -n "$count" ] && [ "$count" != "null" ] && [ "$count" -gt 0 ] || return 0
+
+  if [ -z "$VIATICA_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+    echo "periodic: VIATICA_APP_URL / CRON_SECRET not set"
+    return 0
+  fi
+  base="${VIATICA_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
+
+  i=0
+  while [ "$i" -lt "$count" ]; do
+    path=$(jq -r --arg i "$id" --argjson n "$i" '.personas[] | select(.id==$i) | .periodic[$n].path'  "$REG")
+    when=$(jq -r --arg i "$id" --argjson n "$i" '.personas[] | select(.id==$i) | .periodic[$n].when'  "$REG")
+    label=$(jq -r --arg i "$id" --argjson n "$i" '.personas[] | select(.id==$i) | .periodic[$n].label' "$REG")
+    i=$(( i + 1 ))
+    period_due "$when" || continue
+
+    body=$(mktemp)
+    code=$(curl -sSL -o "$body" -w '%{http_code}' --max-time 90       -H "Authorization: Bearer $CRON_SECRET" "$base$path" 2>/dev/null)
+    if [ "$code" = "200" ]; then rm -f "$body"; continue; fi
+    # A 502 here carries the reason in `error` — the endpoints answer that way on purpose so a failed
+    # Slack post travels with its cause instead of leaving an HTTP code to guess at.
+    why=$(jq -r '.error // empty' "$body" 2>/dev/null); rm -f "$body"
+    echo "$label: HTTP ${code:-000}${why:+ — $why}"
+  done
+}
+
+# ── Deferred decisions ────────────────────────────────────────────────────────
+# Things consciously NOT done, with the condition that should bring them back. Declared in
+# ~/.claude/memory/deferred.md — data in the corpus, evaluation here, the same split the roster uses.
+#
+# The vocabulary is two keys, `every: <N>d` and `after: <YYYY-MM-DD>`, and that is deliberate: a
+# richer trigger language would be a second scheduler to debug, and a scheduler nobody debugs fails
+# silently — which is the exact failure this is meant to prevent.
+DEFERRED_FILE=$OP_HOME/.claude/memory/deferred.md
+DEFERRED_STATE=/var/lib/moses/deferred-surfaced
+
+# Emits one "id<TAB>title<TAB>why" line per item that is due now. Silence means nothing is due.
+deferred_due() {
+  [ -r "$DEFERRED_FILE" ] || return 0
+  python3 - "$DEFERRED_FILE" "$DEFERRED_STATE" <<'PYEOF'
+import re, sys, time, datetime
+
+items, cur = [], None
+for line in open(sys.argv[1]):
+    m = re.match(r"^##\s+(.*)", line)
+    if m:
+        title = m.group(1).strip()
+        # A title marked [closed] stays in the file as a record of the decision, but stops nagging.
+        cur = None if "[closed]" in title.lower() else {"title": title}
+        if cur is not None:
+            items.append(cur)
+        continue
+    if cur is None:
+        continue
+    m = re.match(r"^-\s*(id|every|after|since|why|topic):\s*(.*)", line)
+    if m:
+        cur[m.group(1)] = m.group(2).strip()
+    elif cur.get("why") and line.startswith("  "):
+        cur["why"] += " " + line.strip()
+
+try:
+    seen = dict(l.split(None, 1) for l in open(sys.argv[2]) if l.strip())
+except Exception:
+    seen = {}
+
+now = time.time()
+today = datetime.date.today()
+for it in items:
+    iid = it.get("id")
+    if not iid:
+        continue
+    due = False
+    if "after" in it:
+        try:
+            # A one-shot date item keeps surfacing until it is closed — the point is that Brad acts
+            # on it, and a reminder that fires once into a busy morning has not achieved that.
+            due = datetime.date.fromisoformat(it["after"]) <= today
+        except ValueError:
+            due = False
+    # `every` ALONGSIDE `after` fires immediately, and silently. The interval is measured from the
+    # last time the item was surfaced, which for a brand-new item is never — i.e. the epoch — so the
+    # interval has always already elapsed and `after` is overruled the first morning. Someone wrote
+    # both keys on 2026-08-21 expecting "not before this date, then every N days" and got "right
+    # now" instead. A trigger that fires when it should not is how a briefing section stops being
+    # read, so this is refused loudly rather than guessed at.
+    if "every" in it and "after" in it:
+        print(f"CONFIG\t{it['title']}\tHas BOTH `after` and `every` — pick one. "
+              f"`every` measures from the last mention, so it overrules `after` and fires immediately.")
+        continue
+    if "every" in it:
+        m = re.match(r"(\d+)\s*d", it["every"])
+        if m:
+            last = float(seen.get(iid, 0) or 0)
+            due = due or (now - last) >= int(m.group(1)) * 86400
+    if due:
+        why = re.sub(r"\s+", " ", it.get("why", "")).strip()
+        print(f"{iid}\t{it['title']}\t{why}")
+PYEOF
+}
+
+# Records that an item was surfaced, so `every: Nd` measures from the last MENTION rather than from
+# the deferral date — otherwise every item nags every single morning forever after its first due day.
+deferred_mark() {
+  local id=$1 tmp
+  mkdir -p "$(dirname "$DEFERRED_STATE")"
+  tmp=$(mktemp)
+  { grep -v "^$id " "$DEFERRED_STATE" 2>/dev/null || true; echo "$id $NOW"; } > "$tmp"
+  mv -f "$tmp" "$DEFERRED_STATE"
+  chmod 644 "$DEFERRED_STATE" 2>/dev/null || true
+}
+
+cmd_deferred() {
+  local out
+  out=$(deferred_due)
+  if [ -z "$out" ]; then
+    echo "moses: nothing deferred is due"
+    return 0
+  fi
+  while IFS=$'\t' read -r id title why; do
+    [ -n "$id" ] || continue
+    printf '  • %s\n    %s\n' "$title" "$why"
+  done <<< "$out"
+}
+
+cmd_standup() {
+  local failures="" overdue="" id name detail
+
+  for id in $(ids); do
+    case "$(pfield "$id" '.check.type')" in
+      self|none|"") continue ;;   # self = the manager; none = acts on request, nothing to poll
+    esac
+    name=$(pfield "$id" '.name')
+    if detail=$(run_check "$id"); then
+      record "$id" 1 "$detail"
+    else
+      record "$id" 0 "$detail"
+      failures="$failures
+   • *$name* — $detail"
+    fi
+
+    # Anything else this persona owes today (weekly/monthly/quarterly), fired at the same 08:00.
+    while IFS= read -r pfail; do
+      [ -n "$pfail" ] || continue
+      failures="$failures
+   • *$name* ($pfail)"
+    done < <(run_periodic "$id")
+  done
+
+  # Moses's own heartbeat. A standup that never ran is invisible to every check above, because none of
+  # them would have run either — so it is checked against the clock, not against anything we did today.
+  local gap=""
+  if [ -r "$HEARTBEAT" ]; then
+    local prev; prev=$(cat "$HEARTBEAT" 2>/dev/null); prev=${prev:-0}
+    if [ "$prev" -gt 0 ] && [ $(( NOW - prev )) -gt 129600 ]; then   # 36h — a full day missed
+      gap="   • *Moses* — last standup was $(human_ago $(( NOW - prev ))). Something stopped the timer."
+    fi
+  fi
+  mkdir -p "$STATE" && echo "$NOW" > "$HEARTBEAT"
+  record "moses" 1 "standup"
+
+  # Deferred decisions that have come due. Collected here so they are part of the same briefing
+  # rather than a second message Brad has to correlate.
+  local deferred="" dline
+  while IFS=$'\t' read -r did dtitle dwhy; do
+    [ -n "$did" ] || continue
+    deferred="$deferred
+   • *$dtitle*
+     $dwhy"
+    deferred_mark "$did"
+  done < <(deferred_due)
+
+  for id in $(ids); do
+    line=$(overdue_line "$id") && overdue="$overdue
+$line"
+  done
+
+  # DRIFT — what Moses declares about himself versus what is running. Read from the daily check
+  # rather than run here, so a slow probe can never delay the briefing. Its absence is itself worth
+  # saying: "the drift check has not run" and "there is no drift" are different facts, and the whole
+  # reason this section exists is that a stale declaration reads exactly like a checked one.
+  local drift=""
+  if [ -x "$MOSES_ROOT/agent/moses-drift" ]; then
+    local dout
+    dout=$(XDG_RUNTIME_DIR=/run/user/$(stat -c %u "$OP_HOME") as_op "$MOSES_ROOT/agent/moses-drift" 2>&1)
+    if printf '%s' "$dout" | grep -q "^DRIFT"; then
+      drift=$(printf '%s' "$dout" | sed -n '/^DRIFT/,/^$/p' | tail -n +2)
+    fi
+  fi
+
+  if [ -z "$failures" ] && [ -z "$overdue" ] && [ -z "$gap" ] && [ -z "$drift" ]; then
+    # A clean standup normally says nothing, and that restraint is correct. A deferred decision is
+    # not an exception though — it is a reminder — and a quiet morning is exactly when one would
+    # otherwise stay buried. So it is worth breaking the silence for, and only for.
+    if [ -n "$deferred" ]; then
+      say_msg "🗓️ *Worth revisiting*$deferred"
+      return 0
+    fi
+    echo "moses: standup clean — nothing to report (by design)"
+    return 0
+  fi
+
+  local msg="📋 *Standup — someone's behind*"
+  [ -n "$drift" ] && msg="📋 *Standup*"
+  DEFERRED_TAIL="$deferred"
+  [ -n "$failures" ] && msg="$msg
+
+*Didn't report:*$failures"
+  [ -n "$overdue" ] && msg="$msg
+
+*Overdue against their cadence:*$overdue"
+  [ -n "$drift" ] && msg="$msg
+
+*Declared, but not what is running:*
+$drift"
+  [ -n "$gap" ] && msg="$msg
+
+*The manager itself:*
+$gap"
+    # WHAT SHIPPED BUT IS NOT DONE. A deploy that landed is not a request that is delivered, and the
+    # rows only Brad can see would otherwise sit in a file nobody opens. Brad, 2026-09-04: "a request
+    # isn't marked as closed until everything is verified, even if I'm one of the holdups." It nags
+    # here every morning until it closes — which is the point of it being in the standup rather than
+    # in a report he would have to go looking for.
+    unverified=$(as_op python3 -c "
+import sys
+import os
+sys.path.insert(0, os.environ['MOSES_ROOT'] + '/mcp')
+try:
+    import verification as V
+    r = V.report()
+    print('' if r.startswith('Nothing is waiting') else r)
+except Exception:
+    pass" 2>/dev/null)
+    [ -n "$unverified" ] && msg="$msg
+
+*Shipped, but not verified — the request is still open:*
+$unverified"
+  msg="$msg
+
+_Who owns what: \`moses roster\` · ask @Moses in Slack._"
+  [ -n "${DEFERRED_TAIL:-}" ] && msg="$msg
+
+🗓️ *Worth revisiting*$DEFERRED_TAIL"
+
+  post "$msg"
+}
+
+cmd_status() {
+  local any=0 line
+  for id in $(ids); do
+    if line=$(overdue_line "$id"); then any=1; echo "$line"; fi
+  done
+  [ "$any" -eq 0 ] && echo "Everyone is inside their cadence."
+  return 0
+}
+
+cmd_roster() {
+  local id name title charter cadence ls detail
+  echo "*The roster* — who is accountable for what"
+  for id in $(ids); do
+    name=$(pfield "$id" '.name'); title=$(pfield "$id" '.title')
+    charter=$(pfield "$id" '.charter'); cadence=$(pfield "$id" '.cadence_hours')
+    ls=$(last_success_of "$id"); detail=$(last_detail_of "$id")
+    echo
+    echo "*$name* — $title  _(on $(pfield "$id" '.runs_on'))_"
+    echo "   $charter"
+    echo "   Owns:"
+    jq -r --arg id "$id" '.personas[]|select(.id==$id)|.aoe.owns[]' "$REG" | sed 's/^/     • /'
+    echo "   Does NOT own:"
+    jq -r --arg id "$id" '.personas[]|select(.id==$id)|.aoe.does_not_own[]' "$REG" | sed 's/^/     • /'
+    if [ "${ls:-0}" -gt 0 ]; then
+      echo "   Reports every ${cadence}h · last $(human_ago $(( NOW - ls )))${detail:+ ($detail)}"
+    else
+      echo "   Reports every ${cadence}h · no successful report on record"
+    fi
+  done
+}
+
+cmd_check() {
+  local id=${1:-}
+  [ -n "$id" ] || die "usage: moses check <id>  (ids: $(ids | tr '\n' ' '))"
+  jq -e --arg id "$id" '.personas[]|select(.id==$id)' "$REG" >/dev/null 2>&1 \
+    || die "no persona '$id' in the roster (ids: $(ids | tr '\n' ' '))"
+  local detail
+  if detail=$(run_check "$id"); then
+    record "$id" 1 "$detail"; echo "$(pfield "$id" '.name'): OK — $detail"
+  else
+    record "$id" 0 "$detail"; echo "$(pfield "$id" '.name'): FAILED — $detail" >&2; return 1
+  fi
+}
+
+cmd_agents() {
+  local id
+  # No spend column: nothing on Reserve calls the Claude API (Brad, 2026-08-05). The roster still
+  # carries a per-agent cap for the day that changes, but showing a budget for something that
+  # cannot spend would imply a meter is running when none is.
+  printf '%-9s %-8s %-32s %s\n' ID KIND STATUS CHARTER
+  for id in $(ids); do
+    printf '%-9s %-8s %-32s %s\n' \
+      "$id" \
+      "$(pfield "$id" '.kind' || echo '?')" \
+      "$(s=$(pfield "$id" '.status'); s=${s:-active}; echo "${s:0:32}")" \
+      "$(c=$(pfield "$id" '.charter'); echo "${c:0:56}")"
+  done
+}
+
+
+# ── Projects ──────────────────────────────────────────────────────────────────
+# Personas are WHO reports; projects are WHAT is being built. Separate registries on purpose, but one
+# front door — nobody should have to remember which script owns which question.
+cmd_projects() {
+  if [ "${1:-}" = "full" ]; then
+    as_op python3 "$MOSES_ROOT/agent/project_status.py"
+  else
+    as_op python3 "$MOSES_ROOT/agent/moses-project" list
+  fi
+}
+
+case "${1:-standup}" in
+  standup)        cmd_standup ;;
+  deferred)       cmd_deferred ;;
+  status)         cmd_status ;;
+  roster)         cmd_roster ;;
+  agents)         cmd_agents ;;
+  check)          shift; cmd_check "$@" ;;
+  projects)       shift; cmd_projects "$@" ;;
+  -h|--help|help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)              die "unknown command '${1}' (try: moses help)" ;;
+esac

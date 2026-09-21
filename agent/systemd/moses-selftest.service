@@ -1,0 +1,11 @@
+[Unit]
+Description=Moses — run every Moses test and record the result for Therapist's 08:00 report
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/moses/agent/moses-selftest
+# A failing test is a FINDING, reported by Therapist at 08:00, not a unit fault. Exit 1 means "ran,
+# something failed"; exit 2 means the sweep itself could not run, which does fail the unit.
+SuccessExitStatus=0 1
+TimeoutStartSec=45min
+Nice=10

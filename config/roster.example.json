@@ -1,0 +1,218 @@
+{
+  "_comment": [
+    "NAMES ARE YOURS. `id` is the ROLE and code keys off it; `name` and `emoji` are what your personas are called in chat and exist only here. Rename a persona by editing one line of this file — nothing else needs to know, and nothing in the engine should ever contain a display name as a literal.",
+    "",
+    "THE ROSTER — the single source of truth for who is accountable for what.",
+    "",
+    "This file, not any script, defines who owes a report. moses-morning used to carry a hardcoded",
+    "list of two URLs, so a persona dropped from that list stopped being asked and nothing noticed.",
+    "Accountability has to be measured against a DECLARED duty, held outside the thing being measured.",
+    "",
+    "kind — what this entry actually IS. Terminology fix 2026-08-05, then corrected the same day when",
+    "Brad ruled out API spend on Reserve:",
+    "  service — deterministic. Commands and files, no model, no cost. (Moses today.)",
+    "  job     — scheduled reporter. Runs and posts.",
+    "  agent   — model-backed worker that can ACT. NONE ARE LIVE: an agent needs a model, and a model",
+    "            on Reserve means pay-per-token API billing, which Brad ruled out until Viatica earns.",
+    "            Entries kept as design intent so the roadmap is written down, not lost.",
+    "",
+    "'Persona' is now only the Slack face (name + emoji) any of these wears.",
+    "",
+    "aoe = area of effect: what it owns and explicitly what it does NOT, so a duty cannot fall between",
+    "two of them with each assuming the other has it."
+  ],
+  "version": 1,
+  "grace_factor": 1.5,
+  "personas": [
+    {
+      "id": "moses",
+      "name": "Moses",
+      "emoji": ":scroll:",
+      "runs_on": "Reserve",
+      "title": "Manager — the project of projects",
+      "charter": "Holds the commandments and this roster. Runs standup, and names anyone who has gone quiet.",
+      "aoe": {
+        "owns": [
+          "the commandments (the standards every project follows)",
+          "project state: what shipped, what is open, what was learned",
+          "this roster — who is accountable for what",
+          "the daily standup and the overdue check",
+          "dispatch: taking a request in plain language and routing it to whoever owns that ground",
+          "capture: the todo list, the idea log, and research findings in the memory corpus"
+        ],
+        "does_not_own": [
+          "any persona's actual job — Moses checks that the work was reported, never does it",
+          "customer-facing output of any kind"
+        ]
+      },
+      "check": {
+        "type": "self"
+      },
+      "cadence_hours": 24,
+      "kind": "service",
+      "status": "deterministic - no model calls"
+    },
+    {
+      "id": "ops",
+      "name": "Ops",
+      "emoji": ":eagle:",
+      "runs_on": "Reserve",
+      "title": "Ops",
+      "charter": "Reserve's hardware and backups: the nightly off-site run, disk headroom, cloud quota, and any long job handed off to him.",
+      "aoe": {
+        "owns": [
+          "nightly iDrive backup — result, staleness, failed files",
+          "disk headroom on every mounted drive (discovered, never a hardcoded list)",
+          "iDrive cloud quota",
+          "handed-off long jobs: failed, or died without reporting (orphaned)"
+        ],
+        "does_not_own": [
+          "the Viatica app — that is Finance's and Support's ground",
+          "anything off Reserve"
+        ]
+      },
+      "check": {
+        "type": "command",
+        "argv": [
+          "/usr/local/bin/ops-report",
+          "morning"
+        ]
+      },
+      "cadence_hours": 24,
+      "kind": "job",
+      "status": "reporter; sysadmin agent parked"
+    },
+    {
+      "id": "finance",
+      "name": "Finance",
+      "emoji": ":moneybag:",
+      "runs_on": "Viatica (Customs)",
+      "title": "Finance",
+      "charter": "The books: money in, money out, and what to set aside for the IRS.",
+      "aoe": {
+        "owns": [
+          "daily/weekly/monthly/quarterly P&L to #finance",
+          "YTD Schedule C draft at /admin/cfo",
+          "quarterly tax set-aside (~30% of YTD net) — and refusing to state one he cannot stand behind",
+          "income live from Stripe; expenses from the RecurringCost entries Brad maintains"
+        ],
+        "does_not_own": [
+          "paying anything, or filing anything — he does books, not the IRS",
+          "scraping provider billing pages. Every expense is entered by hand, on purpose"
+        ]
+      },
+      "check": {
+        "type": "http",
+        "path": "/api/cron/cfo?period=daily"
+      },
+      "cadence_hours": 24,
+      "kind": "job",
+      "status": "active",
+      "periodic": [
+        {
+          "path": "/api/cron/cfo?period=weekly",
+          "when": "monday",
+          "label": "weekly"
+        },
+        {
+          "path": "/api/cron/cfo?period=monthly",
+          "when": "first_of_month",
+          "label": "monthly"
+        },
+        {
+          "path": "/api/cron/cfo?period=quarterly",
+          "when": "first_of_quarter",
+          "label": "quarterly"
+        },
+        {
+          "path": "/api/cron/referrals",
+          "when": "daily",
+          "label": "referral vesting"
+        }
+      ]
+    },
+    {
+      "id": "support",
+      "name": "Support",
+      "emoji": ":hammer:",
+      "runs_on": "Viatica (Customs)",
+      "title": "Support",
+      "charter": "The support queue: what came in, what he answered, and what is still sitting on Brad.",
+      "aoe": {
+        "owns": [
+          "daily support digest to #support — including 'nothing came in', so silence is never ambiguous",
+          "the backlog still waiting on a human, oldest first",
+          "AI triage outcomes: answered vs routed, and low-confidence calls"
+        ],
+        "does_not_own": [
+          "talking to customers. Every customer-facing reply is 'The Viatica team' — Support is internal only",
+          "inbound email. The support thread lives in Postgres, by design"
+        ]
+      },
+      "check": {
+        "type": "http",
+        "path": "/api/cron/support"
+      },
+      "cadence_hours": 24,
+      "kind": "job",
+      "status": "active"
+    },
+    {
+      "id": "health",
+      "name": "Health",
+      "emoji": ":adhesive_bandage:",
+      "runs_on": "Reserve",
+      "title": "Health — what could stop working",
+      "charter": "Everything that can expire, run out, or quietly stop answering: Customs reachability, TLS certificates, the domain registration, and the dependency canary (database, Stripe, Anthropic key and credit, email sending domain, Maps). Also reports Builder's readiness, so there is one door to 'is everything OK'.",
+      "aoe": {
+        "owns": [
+          "Customs reachable, TLS certs, domain registration expiry",
+          "the dependency canary — real calls to every credential Viatica needs",
+          "prepaid credit exhaustion and grant expiry surfacing",
+          "Builder readiness, reported (not owned — Builder owns his own preflight)"
+        ],
+        "does_not_own": [
+          "backups, iDrive quota, disks, handed-off jobs — Ops's ground",
+          "the money itself — Finance reports what it costs; she reports whether it still works",
+          "fixing anything: she reports, she does not remediate"
+        ]
+      },
+      "check": {
+        "type": "command",
+        "argv": [
+          "/usr/local/bin/health-report",
+          "morning"
+        ]
+      },
+      "cadence_hours": 24,
+      "kind": "job",
+      "status": "deterministic - no model calls"
+    },
+    {
+      "id": "builder",
+      "name": "Builder",
+      "emoji": ":crossed_swords:",
+      "kind": "agent",
+      "runs_on": "Reserve",
+      "title": "Software development",
+      "charter": "Builds and reviews code, and stands new projects up from the Viatica template.",
+      "aoe": {
+        "owns": [
+          "code review and build support on the Viatica repo",
+          "scaffolding a new project from the Viatica template (once that template exists)",
+          "keeping docs/ARCHITECTURE.md true to the code (commandment #11)"
+        ],
+        "does_not_own": [
+          "deploying — that is Brad's call, and the delivery workflow is commandment #15",
+          "Reserve's hardware and backups; that is Ops's ground"
+        ]
+      },
+      "check": {
+        "type": "none"
+      },
+      "cadence_hours": 0,
+      "status": "parked - needs a model",
+      "note": "Third of Tarkov's Goons, with Finance and Ops. Their leader."
+    }
+  ]
+}

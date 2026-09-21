@@ -1,0 +1,12 @@
+[Unit]
+Description=Moses — does what he declares match what is running?
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+# --all so the log records what AGREED too. A log that only ever contains findings cannot tell you
+# whether the checker ran and found nothing, or never ran at all.
+ExecStart=%h/Projects/moses/agent/moses-drift --all
+# Drift found is exit 1, and that is a FINDING, not a fault. A unit that goes `failed` on a
+# successful detection is one that gets disabled within a week.
+SuccessExitStatus=0 1

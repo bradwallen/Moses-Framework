@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the infrastructure inventory daily
+
+[Timer]
+# 07:45 — before the 08:00 standup, so the briefing reasons about a current picture rather than
+# yesterday's. Timezone pinned so it stays 07:45 across DST.
+OnCalendar=*-*-* 07:45:00 America/Chicago
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

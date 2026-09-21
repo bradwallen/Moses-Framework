@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# health-report — health and expiry. The one door to "is everything OK?"
+#
+#   health-report              exception-only: speak when something needs attention  (the 08:00 job)
+#   health-report full         everything, healthy or not                            (/health-report status)
+#   health-report --print      print instead of posting to Slack
+#
+# WHO SHE IS: Tarkov's healer, and the persona for what used to be spread across three places —
+# Birdeye's Customs section, `health-expiry`, and the in-app dependency canary.
+#
+# THE SPLIT (Brad, 2026-08-13): **Therapist is what could stop working; Birdeye is the hardware and
+# the backups.** She owns Customs reachability, TLS certificates, domain registration, and the
+# dependency canary. Birdeye keeps backups, iDrive quota, disks and handed-off jobs. That boundary is
+# why his report was feeling crowded: "the nightly backup failed" and "Stripe is refusing our key"
+# are different emergencies and were sharing a heading.
+#
+# SHE ALSO CALLS `knight doctor`. Readiness ("is Knight safe to run right now") is a different
+# question from health ("is anything broken"), but Brad should not have to know that to ask — so she
+# answers both and labels which is which. One door, two questions, no duplication: the checks
+# themselves stay where they live.
+#
+# COMPOSES, NEVER REIMPLEMENTS. Every figure here comes from the tool that already owns it. A second
+# implementation of a check is a second thing to drift.
+
+set -uo pipefail
+
+
+# THE OPERATOR'S HOME, resolved rather than named — and correct under sudo, where $HOME is root's.
+OP_HOME=${MOSES_OP_HOME:-$(getent passwd "${SUDO_USER:-$(id -un)}" | cut -d: -f6)}
+[ -n "$OP_HOME" ] || { echo "cannot resolve the operator's home; set MOSES_OP_HOME" >&2; exit 1; }
+MOSES_ROOT=${MOSES_ROOT:-$OP_HOME/Projects/moses}
+
+OPS_JOBS="${OPS_JOBS:-/usr/local/bin/ops-jobs}"
+CUSTOMS="${CUSTOMS:-/usr/local/bin/health-expiry}"
+KNIGHT="${KNIGHT:-$MOSES_ROOT/knight/bin/knight}"
+
+# Display name and emoji come from the ROSTER, not from literals below. Rename this persona by
+# editing one line of the roster; nothing in this script needs to know. Falls back to "Therapist"
+# so behavior is identical if the roster is missing or unreadable.
+# shellcheck source=../lib/persona.sh
+. "$(dirname "$(readlink -f "$0")")/../lib/persona.sh" 2>/dev/null || true
+if type persona_name >/dev/null 2>&1; then
+  SELF_NAME=$(persona_name health); SELF_EMOJI=$(persona_emoji health)
+else
+  SELF_NAME="Therapist"; SELF_EMOJI=":adhesive_bandage:"
+fi
+
+MODE="${1:-morning}"
+PRINT=0
+for a in "$@"; do [ "$a" = "--print" ] && PRINT=1; done
+[ "$MODE" = "--print" ] && MODE=morning
+
+ISSUES=0
+CUSTOMS_TEXT=""; CUSTOMS_ONELINE=""; KNIGHT_TEXT=""; KNIGHT_ONELINE=""
+
+# ── Health: is Viatica able to serve? ───────────────────────────────────────
+build_health() {
+  if [ ! -x "$CUSTOMS" ]; then
+    ISSUES=$((ISSUES+1))
+    CUSTOMS_TEXT="⚠️ *Health* — \`health-expiry\` is not installed, so NOTHING about Viatica was checked"
+    return
+  fi
+  local out
+  if out=$("$CUSTOMS" 2>&1); then
+    # Say what was actually looked at, and as whom. A verdict without its coverage is
+    # unfalsifiable: "nothing wrong" and "I never looked" read identically.
+    CUSTOMS_TEXT="$out
+_checked as $(id -un) · scope: Customs reachability, deps, certs, domain_"
+    CUSTOMS_ONELINE=$("$CUSTOMS" --oneline 2>/dev/null | head -1)
+  else
+    ISSUES=$((ISSUES+1))
+    CUSTOMS_TEXT="$out"
+  fi
+}
+
+# ── Readiness: is Knight safe to run right now? ─────────────────────────────
+# A DIFFERENT question from health, and labeled as such. `knight doctor` reconciles orphaned job
+# records as a side effect — that is the point of the check, not an accident, but it means this is
+# not a pure read and belongs in a named section rather than buried in a health summary.
+build_readiness() {
+  if [ ! -x "$KNIGHT" ]; then
+    KNIGHT_ONELINE="knight not installed"
+    return
+  fi
+  local out
+  # AS BRAD. Knight is his: his clone, his HOME, his SSH identity, and his push. Therapist runs from
+  # moses-morning, a root unit, so checking "can we reach the remote" as root asked about a user who
+  # will never do the pushing. On 2026-08-14 that reported the remote unreachable minutes before a
+  # hand-run doctor printed "reachable ✓". Run it as the user who does the work, or do not run it.
+  if [ "$(id -u)" = 0 ]; then
+    out=$(runuser -u brad -- "$KNIGHT" doctor 2>&1) || true
+  else
+    out=$("$KNIGHT" doctor 2>&1) || true
+  fi
+  KNIGHT_TEXT="$out"
+
+  # Only the lines that mean "something would fail if you tasked him now".
+  local trouble=""
+  printf '%s\n' "$out" | grep -qE 'kill switch +ENGAGED' && trouble="$trouble
+   • kill switch is ENGAGED — Knight will refuse new work"
+  if printf '%s\n' "$out" | grep -qE 'CANNOT REACH THE REMOTE'; then
+    local why; why=$(printf '%s\n' "$out" | grep -A2 'CANNOT REACH THE REMOTE' | tail -1 | sed 's/^ *//')
+    trouble="$trouble
+   • cannot reach the push remote — a green build would build, then fail to land
+     _${why:-no detail from git}_"
+  fi
+  printf '%s\n' "$out" | grep -qE 'clone remotes .*must be none.* +[a-z]' \
+    && ! printf '%s\n' "$out" | grep -qE 'clone remotes .*none' \
+    && trouble="$trouble
+   • the clone has a git remote — the agent could push directly"
+  printf '%s\n' "$out" | grep -qE 'Slack report +NOT configured' && trouble="$trouble
+   • Slack is not configured — Knight would finish silently"
+
+  if [ -n "$trouble" ]; then
+    ISSUES=$((ISSUES+1))
+    KNIGHT_TEXT="⚠️ *Knight is not ready*$trouble"
+  fi
+  KNIGHT_TEXT="$KNIGHT_TEXT
+_checked as brad (the user who owns the clone and does the pushing) · scope: Knight preflight_"
+  KNIGHT_ONELINE=$(printf '%s\n' "$out" | grep -E 'jobs today' | sed 's/[[:space:]]\+/ /g' | sed 's/^ *//')
+}
+
+build_health
+build_readiness
+
+case "$MODE" in
+  full)
+    MSG=$(printf '%s *%s — health check*\n\n%s' "$SELF_EMOJI" "$SELF_NAME" "$CUSTOMS_TEXT")
+    [ -n "$KNIGHT_TEXT" ] && MSG="$MSG
+
+⚔️ *Knight readiness*
+\`\`\`
+$(printf '%s\n' "$KNIGHT_TEXT" | head -16)
+\`\`\`"
+    ;;
+
+  morning)
+    # Exception-only, matching Birdeye's discipline: a healthy morning is one line, because a daily
+    # wall of green trains you to skim and then you miss the one that matters.
+    if [ "$ISSUES" -eq 0 ]; then
+      MSG="✅ *$SELF_NAME* — healthy (${CUSTOMS_ONELINE:-checked})"
+      [ -n "$KNIGHT_ONELINE" ] && MSG="$MSG · Knight ready, ${KNIGHT_ONELINE}"
+    else
+      MSG="$SELF_EMOJI *$SELF_NAME — something needs attention*
+
+$CUSTOMS_TEXT"
+      [ -n "$KNIGHT_TEXT" ] && case "$KNIGHT_TEXT" in
+        *"not ready"*) MSG="$MSG
+
+$KNIGHT_TEXT" ;;
+      esac
+      MSG="$MSG
+
+_Full detail: \`/health-report status\`_"
+    fi
+    ;;
+
+  *) echo "usage: health-report [morning|full] [--print]" >&2; exit 2 ;;
+esac
+
+# Posts under HER OWN identity via chat:write.customize — the same mechanism Knight uses, on the
+# same shared bot token. No new Slack app and no reinstall: a reinstall would rotate the token Big
+# Pipe and Tagilla depend on. Verified 2026-08-13 that the token carries chat:write.customize.
+#
+# NOT via `ops-jobs say`: that hardcodes Birdeye's name and emoji, so her reports would arrive wearing
+# his face and be indistinguishable from his. The first version of this script did exactly that while
+# its comment claimed otherwise.
+post_as_health() {
+  local text="$1" tok="" chan="" f
+  for f in /etc/moses/ops.env $OP_HOME/.config/moses/knight.env; do
+    [ -r "$f" ] || continue
+    # shellcheck disable=SC1090
+    [ -z "$tok" ]  && tok=$(. "$f" 2>/dev/null; printf '%s' "${SLACK_BOT_TOKEN:-}")
+    [ -z "$chan" ] && chan=$(. "$f" 2>/dev/null; printf '%s' "${SLACK_HEALTH_CHANNEL:-${SLACK_OPS_CHANNEL:-}}")
+  done
+  if [ -z "$tok" ] || [ -z "$chan" ]; then
+    # Degrade LOUDLY, matching ops-jobs's pattern: a health report that silently fails to send is the
+    # worst possible outcome for a persona whose entire job is noticing things.
+    echo "health-report: no Slack credentials — message NOT sent:" >&2
+    printf '%s\n' "$text" >&2
+    return 1
+  fi
+  local resp
+  resp=$(curl -sS --max-time 20 -X POST https://slack.com/api/chat.postMessage \
+    -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+    --data "$(jq -nc --arg c "$chan" --arg t "$text" --arg n "$SELF_NAME" --arg e "$SELF_EMOJI" \
+              '{channel:$c, text:$t, username:$n, icon_emoji:$e}')" 2>&1)
+  if printf '%s' "$resp" | jq -e '.ok' >/dev/null 2>&1; then return 0; fi
+  echo "health-report: Slack rejected the message: $(printf '%s' "$resp" | jq -r '.error // .' 2>/dev/null)" >&2
+  return 1
+}
+
+if [ "$PRINT" -eq 1 ]; then
+  printf '%s\n' "$MSG"
+else
+  post_as_health "$MSG" || { printf '%s\n' "$MSG"; exit 1; }
+fi

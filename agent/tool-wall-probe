@@ -1,0 +1,158 @@
+#!/home/brad/moses-venv/bin/python
+"""tool-wall-probe — which built-in tools does each runner profile ACTUALLY hand the model?
+
+    agent/tool-wall-probe                      every profile's observed built-ins; exit 1 if any is off
+    TOOL_WALL_SABOTAGE=1 agent/tool-wall-probe strips --tools first, to prove this goes red (it must)
+
+Jon's finding, 2026-09-12: --allowedTools and --disallowedTools are PERMISSION lists. A tool named in
+neither is still in the turn, and a deny list on his side lost to Monitor. The fix is --tools, the
+inventory. This checks the inventory the CLI reports in its own opening event, so it tests the wall as
+observed rather than as the command declares it. Each launch is killed at that event, before any model
+request, so a run costs nothing and spends none of the Pro allowance.
+
+SINCE M20 (2026-09-14) IT WALKS EVERY PROFILE IN claude_runner.py, so a profile is probed the day it is
+declared, and it fails one whose live tool list differs from its declaration IN EITHER DIRECTION: an
+extra tool is a hole, and a missing one is a turn that cannot do its job. It then checks that every
+launcher still goes through the runner, because a profile nobody launches through proves nothing.
+
+What this cannot see: a tool that is offered but not APPROVED is silently refused at use (Atlas,
+2026-09-14). claude_runner builds both lists from one declaration so they cannot disagree, and its
+test proves that; this proves what the CLI hands over.
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+AGENT = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(AGENT)
+sys.path.insert(0, os.path.join(AGENT, "lib"))
+import moses_env as _env  # noqa: E402
+# A launcher in another project that must go through the runner — the operator's own, from settings.
+EXPLORE_TS = _env.setting("MOSES_TOOL_WALL_EXPLORE_TS")
+sys.path.insert(0, AGENT)
+os.environ.setdefault("MOSES_STATE", tempfile.mkdtemp(prefix="tool-wall-"))
+import claude_runner as R  # noqa: E402
+
+SABOTAGE = os.environ.get("TOOL_WALL_SABOTAGE") == "1"
+ENV = {k: os.environ[k] for k in ("PATH", "HOME", "LANG", "USER") if k in os.environ}
+
+
+def observed(argv: list[str]) -> tuple[set[str], str] | None:
+    """The built-ins the CLI reports in its opening event and which account pays, or None if no event."""
+    argv = list(argv)
+    if SABOTAGE and "--tools" in argv:
+        i = argv.index("--tools")
+        del argv[i:i + 2]
+    p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, env=ENV, text=True)
+    try:
+        for line in p.stdout:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "system" and ev.get("subtype") == "init":
+                return ({str(t) for t in (ev.get("tools") or []) if not str(t).startswith("mcp__")},
+                        str(ev.get("apiKeySource") or "unknown"))
+    finally:
+        p.kill()
+    return None
+
+
+rows: list[tuple[bool, str]] = []
+
+
+def check(label: str, argv: list[str], declared: set[str]) -> None:
+    seen = observed(argv)
+    if seen is None:
+        rows.append((False, f"{label}: COULD NOT CHECK — the CLI sent no opening event"))
+        return
+    got, auth = seen
+    extra, missing = sorted(got - declared), sorted(declared - got)
+    # `none` means the Pro subscription. Anything else is a key, and Reserve must not spend API money.
+    paid = auth != "none"
+    text = f"{label}: {len(got)} built-in(s) handed over ({', '.join(sorted(got)) or 'none'})"
+    if extra:
+        text += f"; NOT DECLARED: {', '.join(extra)}"
+    if missing:
+        text += f"; DECLARED BUT MISSING: {', '.join(missing)}"
+    if not (extra or missing):
+        text += ", exactly as declared"
+    text += f"; BILLED TO {auth}, NOT THE SUBSCRIPTION" if paid else "; on the subscription"
+    rows.append((not extra and not missing and not paid, text))
+
+
+for app, p in R.profiles().items():
+    kw = {}
+    if p.mcp_config == "":
+        kw["mcp_config"] = R.NO_MCP
+    if p.takes_system_prompt:
+        kw["system_prompt"] = "Reply with ok."
+    argv = R.build_argv(app, "say ok", **kw)
+    # The opening event only arrives on a stream; neither flag changes which tools exist.
+    if "--output-format" in argv:
+        argv[argv.index("--output-format") + 1] = "stream-json"
+    if "--verbose" not in argv:
+        argv.append("--verbose")
+    check(app, argv, set(p.offered()))
+
+
+def uses_runner(label: str, path: str, needles: list[str]) -> None:
+    try:
+        src = open(path, encoding="utf-8").read()
+    except OSError:
+        rows.append((False, f"{label}: COULD NOT CHECK — {path} is not readable"))
+        return
+    gone = [n for n in needles if n not in src]
+    rows.append((not gone, f"{label} launches through the runner" if not gone
+                 else f"{label} NO LONGER launches through the runner (missing: {', '.join(gone)})"))
+
+
+uses_runner("Moses chat", f"{AGENT}/conversation.py", ["claude_runner.build_argv("])
+uses_runner("the alarm diagnosis", f"{AGENT}/diagnose.py", ['claude_runner.build_argv("moses-diagnosis"'])
+uses_runner("Knight's builder and reviewer", f"{REPO}/knight/bin/knight-run",
+            ['"$RUNNER" --app knight-builder', '"$RUNNER" --app zryachiy-reviewer'])
+if EXPLORE_TS:   # only where the operator has a product whose explorer launches Zryachiy
+    uses_runner("Zryachiy's explorer", EXPLORE_TS, ["claude-run", '"zryachiy-explorer"'])
+uses_runner("the liveness probe", f"{AGENT}/moses-liveness", ['"$RUNNER" --app moses-liveness'])
+
+# ── NOTHING ELSE ON THIS BOX STARTS THE CLI (2026-09-15) ─────────────────────────────────────────
+# claude_runner_test.py guards the Moses repo. The launcher M20 missed (moses-liveness) was inside the
+# repo, but the inventory that missed it never looked anywhere else either, so this looks at the
+# other places a launch could live on Reserve. Each exception carries its reason, and one that stops
+# launching fails as stale, so the list only shrinks.
+# The system's places, plus the operator's own (MOSES_TOOL_WALL_DIRS, colon-separated).
+OUTSIDE = [str(_env.HOME / "scripts"), "/usr/local/bin", "/usr/local/lib/moses-installers"]
+OUTSIDE += [d for d in _env.setting("MOSES_TOOL_WALL_DIRS").split(":") if d]
+# The way to watch this go red: TOOL_WALL_EXTRA_DIRS=<dir holding a stray launcher> agent/tool-wall-probe
+OUTSIDE += [d for d in os.environ.get("TOOL_WALL_EXTRA_DIRS", "").split(":") if d]
+# Empty since 2026-09-15. The three hand-run scripts that started the CLI here (the /opt installer and
+# two one-offs from 2026-08-25) were retired to /home/brad/retired/2026-09-15-launchers, unexecutable
+# and outside anything that runs. A new entry needs its path and the reason it cannot use the runner.
+KNOWN_OUTSIDE: dict[str, str] = {}
+found_outside, scanned_outside = set(), 0
+for root in OUTSIDE:
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__", "venv", ".venv")]
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            if ".bak" in name or not os.path.isfile(path):
+                continue
+            scanned_outside += 1
+            if R.launches_cli(path):
+                found_outside.add(path)
+rows.append((scanned_outside > 20, f"looked outside the repo: {scanned_outside} files in {len(OUTSIDE)} places"))
+for path in sorted(found_outside - set(KNOWN_OUTSIDE)):
+    rows.append((False, f"{path} starts the CLI outside the runner — route it through agent/claude-run"))
+for path in sorted(set(KNOWN_OUTSIDE) - found_outside):
+    rows.append((False, f"{path} no longer starts the CLI — drop it from KNOWN_OUTSIDE"))
+if found_outside <= set(KNOWN_OUTSIDE):
+    rows.append((True, "outside the repo, nothing starts the CLI" if not found_outside
+                 else f"outside the repo, only the {len(found_outside)} named hand-run scripts start the CLI"))
+
+print(f"TOOL WALL{' (SABOTAGED: --tools stripped)' if SABOTAGE else ''}")
+for ok, what in rows:
+    print(f"  {'PASS' if ok else 'FAIL'}  {what}")
+sys.exit(0 if rows and all(ok for ok, _ in rows) else 1)

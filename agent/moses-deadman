@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# moses-deadman — alarms when the liveness probe goes QUIET, not when it reports bad news.
+#
+#   moses-deadman            check heartbeat age; alarm on a state change
+#   moses-deadman --print    print the verdict, post nothing
+#   moses-deadman --force    post the verdict even if nothing changed
+#
+# WHY THIS EXISTS. moses-liveness alarms when it detects a failure. It says NOTHING when it cannot
+# run at all — and that was proven, not assumed: breaking the script leaves the unit in `exit-code`
+# with nothing on this box watching for failed user units, and stopping the timer is completely
+# silent. So the fix for "silence read as health" had the same hole as the thing it fixed.
+#
+# Atlas named the general form of it on 2026-08-31, and it is worth keeping: an honest probe has to
+# spend a real model call, which means it shares a failure mode with the thing it probes —
+# "cheap-and-fake or real-and-self-dependent". The way out is to INVERT THE REPORTING DIRECTION.
+# The probe reports SUCCESS by writing a heartbeat; this watches for the ABSENCE of one. A shared
+# failure then PRODUCES the alarm instead of suppressing it.
+#
+# Same shape as Birdeye's backup check, which does not ask whether the job ran — it asks how old the
+# newest artifact is.
+#
+# DELIBERATELY DUMB. No model call, no MCP, no network except one Slack post. It must not be able to
+# fail the way the thing it watches fails. If this ever needs the CLI to do its job, it has stopped
+# being a dead-man's switch.
+#
+# WHAT IT STILL DOES NOT COVER, stated rather than glossed: it runs as the same user on the same box
+# as the probe, so a lost user session or a dead machine silences both. Closing that needs a watcher
+# off Reserve entirely. This covers the failures actually observed today; it is not a claim of total
+# coverage.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+STAMP="$STATE/liveness.json"
+OWN="$STATE/deadman.json"
+CHANNEL=${MOSES_LIVENESS_CHANNEL:-}          # the ops channel, from the operator's settings
+# Three missed 30-minute cycles. Long enough that one slow probe or a reboot is not an alarm, short
+# enough that the 100-minute outage of 2026-08-31 would have been caught inside it.
+MAX_AGE_S=${MOSES_DEADMAN_MAX_AGE_S:-5400}
+MODE=${1:-}
+mkdir -p "$STATE" 2>/dev/null
+
+# ── Is the heartbeat fresh? ───────────────────────────────────────────────────
+read -r VERDICT REASON < <(python3 - "$STAMP" "$MAX_AGE_S" <<'PY'
+import json, os, sys, time
+stamp, max_age = sys.argv[1], int(sys.argv[2])
+if not os.path.exists(stamp):
+    # NEVER seen a heartbeat. Different from a stale one: the probe may never have been installed.
+    print("missing the probe has never written a heartbeat"); raise SystemExit
+try:
+    rec = json.load(open(stamp))
+    age = int(time.time() - os.path.getmtime(stamp))
+except Exception as e:
+    print(f"unreadable the heartbeat file could not be read ({type(e).__name__})"); raise SystemExit
+if age > max_age:
+    print(f"stale no heartbeat for {age // 60} minutes (limit {max_age // 60}); "
+          f"last verdict was {rec.get('verdict','?')} at {rec.get('at','?')}")
+else:
+    print(f"fresh last heartbeat {age // 60}m ago, verdict {rec.get('verdict','?')}")
+PY
+)
+[ "${_xt:-0}" = 1 ] && set -x   # :-0 — this restore had NO initializer at this scope, so
+                                 # `set -u` killed the script on every single run,
+                                 # and the unit still reported success (2026-09-05).
+
+# ── Is the probe even scheduled? ──────────────────────────────────────────────
+# Catches the stopped timer BEFORE the heartbeat has had time to go stale, and distinguishes "the
+# probe is failing" from "nobody is running the probe" — which are different problems with different
+# fixes, and rendering them identically is the mistake this whole family keeps making.
+# systemd needs XDG_RUNTIME_DIR to answer about a USER unit. Without it every query returns nothing,
+# which the first version of this reported as "unscheduled" — a false alarm saying nobody was probing
+# Moses while the timer was running perfectly. A guard that fires on correct work gets switched off,
+# so "the timer is stopped" and "I could not ask systemd" are now different answers.
+export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+if ! systemctl --user show moses-liveness.timer -p LoadState --no-pager >/dev/null 2>&1; then
+  TIMER_STATE=unqueryable; TIMER_ENABLED=unqueryable
+else
+  TIMER_STATE=$(systemctl --user is-active moses-liveness.timer 2>/dev/null || echo inactive)
+  TIMER_ENABLED=$(systemctl --user is-enabled moses-liveness.timer 2>/dev/null || echo disabled)
+fi
+
+if [ "$TIMER_STATE" = unqueryable ]; then
+  # NOT an alarm about Moses. Say plainly that this check could not look, rather than reporting a
+  # failure it never observed — the heartbeat age below is still a real signal on its own.
+  echo "moses-deadman: could not query systemd for the liveness timer (no user session?)" >&2
+elif [ "$TIMER_STATE" != "active" ] || [ "$TIMER_ENABLED" != "enabled" ]; then
+  VERDICT=unscheduled
+  REASON="the liveness timer is ${TIMER_STATE}/${TIMER_ENABLED} — nothing is probing Moses at all"
+fi
+
+slack_say() {
+  local text=$1 resp
+  [ -r "$MOSES_CONFIG_DIR/slack.env" ] || { echo "moses-deadman: no slack.env" >&2; return 1; }
+  # TRACE-SAFE. `bash -x` echoes every expansion, so sourcing a credential file — or testing the
+  # variable it sets — prints the secret. That is exactly how the Slack bot token reached a
+  # transcript on 2026-09-03, while someone was tracing this very script to find out why it hung.
+  # xtrace is disabled around the credential handling and restored afterwards, so debugging a script
+  # can never be the thing that leaks from it.
+  local _xt=0; case $- in *x*) _xt=1; set +x ;; esac
+  set -a; . "$MOSES_CONFIG_DIR/slack.env"; set +a
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || { echo "moses-deadman: SLACK_BOT_TOKEN unset" >&2; return 1; }
+  resp=$(python3 - "$CHANNEL" "$text" <<'PY'
+import json, os, sys, urllib.request
+chan, text = sys.argv[1], sys.argv[2]
+req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+    data=json.dumps({"channel": chan, "text": text, "username": "Moses",
+                     "icon_emoji": ":scroll:", "unfurl_links": False}).encode(),
+    headers={"Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}",
+             "Content-Type": "application/json; charset=utf-8"})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=20))
+    print("ok" if r.get("ok") else f"error:{r.get('error')}")
+except Exception as e:
+    print(f"error:{type(e).__name__}")
+PY
+)
+  [ "$resp" = "ok" ] || { echo "moses-deadman: Slack rejected the alarm ($resp)" >&2; return 1; }
+}
+
+PREV=$(python3 -c "import json;print(json.load(open('$OWN'))['verdict'])" 2>/dev/null || echo unknown)
+python3 - "$OWN" "$VERDICT" "$REASON" <<'PY'
+import json, sys, time
+own, verdict, reason = sys.argv[1:4]
+json.dump({"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "verdict": verdict, "reason": reason}, open(own, "w"))
+PY
+
+if [ "$MODE" = "--print" ]; then
+  echo "moses-deadman: $VERDICT — $REASON"
+  echo "  previous: $PREV"
+  [ "$VERDICT" = fresh ] && exit 0 || exit 1
+fi
+
+if [ "$VERDICT" != fresh ] && [ "$PREV" = fresh ] || [ "$MODE" = "--force" ]; then
+  slack_say ":skull: *Nothing is checking whether Moses can answer* — $REASON
+
+This is the watchdog on the watchdog: the liveness probe reports when it finds a problem, and this reports when the probe itself goes quiet. Silence from a checker is not the same as good news."
+elif [ "$VERDICT" = fresh ] && [ "$PREV" != fresh ] && [ "$PREV" != unknown ]; then
+  slack_say ":white_check_mark: *The liveness probe is reporting again* — recovered from \`$PREV\`."
+fi
+
+[ "$VERDICT" = fresh ] && exit 0 || exit 1

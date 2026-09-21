@@ -1,0 +1,13 @@
+[Unit]
+# Commandment #5 with teeth. A stale architecture diagram is confidently wrong, which is worse than
+# no diagram — the next person plans against it. This runs the check and logs the result; the same
+# check is exposed as the MCP tool `check_architecture`, so Moses can answer "are the docs current?"
+# on demand from Brad's phone.
+Description=Moses — architecture drift check
+
+[Service]
+# A finding is not a fault. This unit sat `failed` for five days on a CORRECT detection
+# (2026-08-17: therapist missing from the doc) and nobody saw it, because a failed unit is silent.
+SuccessExitStatus=0 1
+Type=oneshot
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/arch_check.py

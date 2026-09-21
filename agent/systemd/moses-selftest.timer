@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Moses's tests daily, before Therapist reports at the 08:00 standup
+
+[Timer]
+# 07:30: the sweep takes a few minutes, and Therapist reads its result at 08:00. She says "not checked"
+# rather than "healthy" if this has not run within 26 hours.
+OnCalendar=*-*-* 07:30:00 America/Chicago
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

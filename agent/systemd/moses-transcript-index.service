@@ -1,0 +1,10 @@
+[Unit]
+# Moses's flagship goal: every transcript captured AND indexed. The nightly tar does capture;
+# this does the index. Incremental — only files whose mtime moved are re-parsed, so the live
+# session (which grows all day) is cheap to keep current.
+Description=Moses — index Claude transcripts
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/transcript_index.py
+ExecStart=%h/Projects/moses/mcp/venv/bin/python %h/Projects/moses/mcp/semantic_index.py build

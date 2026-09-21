@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly architecture drift check (Moses)
+
+[Timer]
+# Monday 08:30 Central — after the 08:00 standup, so a drift report lands next to the ops picture
+# rather than competing with it. Persistent so a powered-off Monday still gets checked.
+OnCalendar=Mon *-*-* 08:30:00 America/Chicago
+Persistent=true
+
+[Install]
+WantedBy=timers.target

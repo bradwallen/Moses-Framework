@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly fault injection against the handoff gate
+
+[Timer]
+# Monday 07:40 — just before the inventory and the standup, so a broken gate is known before the
+# week's work starts rather than discovered by it.
+OnCalendar=Mon *-*-* 07:40:00 America/Chicago
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

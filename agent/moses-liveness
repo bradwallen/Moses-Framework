@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# moses-liveness — can Moses actually answer right now?
+#
+#   moses-liveness            check; alarm to Slack on a state CHANGE
+#   moses-liveness --print    check and print the verdict, post nothing
+#   moses-liveness --force    check and post the verdict even if nothing changed
+#
+# WHY THIS EXISTS (2026-08-31). Atlas said good morning at 11:02. Moses's OAuth session had expired,
+# so the run never reached the model, and he answered "I couldn't finish that thought." He then made
+# no further attempt all morning. He came back at 12:46 only because Brad opened Claude Code, which
+# refreshed the shared credentials BY ACCIDENT. He was mute for an hour and forty minutes and the
+# only thing that noticed was a human reading a strange reply.
+#
+# THE POINT IS THAT THE CAUSE DOES NOT MATTER. An expired login, a crashed process, a wedged socket,
+# a revoked token — every one of them presents identically as silence, and silence is exactly what
+# nothing was watching for. Tagilla already files "nothing came in" so her silence is a failure with
+# a name on it; Moses had no such contract for himself. This is that contract.
+#
+# WHAT IT ACTUALLY TESTS: the same `claude` CLI, as the same user, reading the same credential store
+# the service reads. Not a ping, not a token expiry calculation — the real path, because the real
+# path is what broke. A credential file that looks valid and a CLI that refuses are different facts.
+#
+# NO PRIVILEGE REQUIRED. Runs as brad under a systemd USER timer, like moses-inventory and
+# moses-drift. Nothing here needs root, so nothing here asks for it.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+STAMP="$STATE/liveness.json"
+LOG="$STATE/liveness.jsonl"
+CHANNEL=${MOSES_LIVENESS_CHANNEL:-}          # the ops channel, from the operator's settings
+TIMEOUT=${MOSES_LIVENESS_TIMEOUT_S:-120}
+MODE=${1:-}
+
+mkdir -p "$STATE" 2>/dev/null
+
+# The credential store the SERVICE uses. Kept as a variable because Moses may later be given his own
+# store (CLAUDE_CONFIG_DIR is real and does fully redirect the lookup — verified 2026-08-31). If that
+# happens, this must follow it, or the check proves the health of a login nobody uses.
+CFG=${CLAUDE_CONFIG_DIR:-}
+
+now() { date +%Y-%m-%dT%H:%M:%S; }
+
+# ── The probe ─────────────────────────────────────────────────────────────────
+# A trivial prompt with no tools. The cheapest thing that still exercises auth, the binary and the
+# model round trip. `--print` so it answers and exits rather than opening a session.
+probe() {
+  local out rc
+  # THE AGENTS' OWN CLI, by absolute path, for BOTH branches below. The service PATH has no
+  # ~/.local/bin, so a bare `claude` found only the root-owned /usr/bin/claude; when that was
+  # removed on 2026-09-13 this probe reported Moses down while he was answering fine. The first fix
+  # set this inside the CLAUDE_CONFIG_DIR branch only, and the branch that actually runs got nothing.
+  #
+  # THROUGH THE ONE RUNNER (M20; moved 2026-09-15). This probe used to start the CLI itself with a bare
+  # print flag: no --restricted, every built-in tool, Brad's own settings and hooks, and a new session
+  # file every 30 minutes. It was the launcher M20's inventory missed. The "moses-liveness" profile asks
+  # the same question with nothing granted; the runner resolves the CLI by the same absolute path.
+  local RUNNER="${MOSES_CLAUDE_RUN:-$MOSES_ROOT/agent/claude-run}"
+  if [ -n "$CFG" ]; then
+    out=$(cd /tmp && timeout "$TIMEOUT" env CLAUDE_CONFIG_DIR="$CFG" "$RUNNER" --app moses-liveness --prompt "reply with the single word: alive" 2>&1); rc=$?
+  else
+    out=$(cd /tmp && timeout "$TIMEOUT" "$RUNNER" --app moses-liveness --prompt "reply with the single word: alive" 2>&1); rc=$?
+  fi
+  PROBE_RC=$rc
+  PROBE_OUT=$out
+}
+
+# ── CAN HE HEAR? — asked before "can he think" ──────────────────────────────────────────────────
+# This probe ran `claude --print "reply alive"` and stopped there. That answers whether the model is
+# reachable and the login valid; it says NOTHING about whether the Slack listener is receiving. On
+# 2026-09-05 Moses processed nothing for 26 hours — Atlas messaged him twice, Brad noticed before any
+# watcher did — while this reported "healthy" every 30 minutes, because the CLI was fine throughout.
+#
+# The unit is literally named "can he actually answer right now?", so the scope was the lie, not the
+# code. The listener now stamps MOSES_STATE/listener.json every 60s with the socket's own view of
+# itself; a wedged process simply stops writing it, which is the case that actually happened.
+MAILBOX_MAX_AGE_S=${MOSES_MAILBOX_MAX_AGE_S:-300}
+check_mailbox() {
+  MAILBOX=ok; MAILBOX_WHY=""
+  local f="$STATE/listener.json" out
+  if [ ! -s "$f" ]; then
+    MAILBOX=unknown; MAILBOX_WHY="no listener heartbeat yet"; return
+  fi
+  out=$(python3 - "$f" "$MAILBOX_MAX_AGE_S" <<'PY'
+import json, sys, datetime
+f, limit = sys.argv[1], int(sys.argv[2])
+try:
+    d = json.load(open(f))
+    age = (datetime.datetime.now() - datetime.datetime.fromisoformat(d["at"])).total_seconds()
+except Exception as e:
+    print(f"down|the heartbeat is unreadable ({type(e).__name__})"); raise SystemExit
+if age > limit:
+    print(f"down|the listener has not beaten for {int(age)//60}m — wedged, not idle; a silent "
+          f"channel still beats every 60s")
+elif d.get("connected") is False:
+    print("down|the listener is running but its Slack socket is NOT connected")
+else:
+    print(f"ok|connected, last event {d.get('last_event') or 'none yet'}")
+PY
+)
+  MAILBOX=${out%%|*}; MAILBOX_WHY=${out#*|}
+}
+
+classify() {
+  # Distinguishes the three answers that matter. "Could not run" must never render as either
+  # healthy or as Moses being broken — that conflation is the whole reason the hooks were rewritten.
+  if [ "$PROBE_RC" -eq 124 ]; then
+    VERDICT=down; REASON="the probe timed out after ${TIMEOUT}s"
+  elif grep -qiE "failed to authenticate|oauth session expired|could not be refreshed|not logged in|please log ?in|invalid (api key|credentials)|authentication (failed|error)" <<<"$PROBE_OUT"; then
+    VERDICT=down; REASON="login expired — Moses cannot answer anyone until someone re-authenticates on Reserve"
+  elif grep -qiE "529|overloaded|at capacity|rate.?limit|503|502|temporarily unavailable" <<<"$PROBE_OUT"; then
+    VERDICT=degraded; REASON="the model API is refusing requests (capacity) — usually temporary"
+  elif [ "$PROBE_RC" -ne 0 ]; then
+    VERDICT=down; REASON="the CLI exited ${PROBE_RC}: $(head -c 160 <<<"$PROBE_OUT" | tr '\n' ' ')"
+  elif [ "${MAILBOX:-ok}" = down ]; then
+    # HEARING BEATS THINKING. A healthy CLI behind a dead socket is precisely the state that ran
+    # unnoticed for 26 hours; it must not read as healthy just because the model answered.
+    VERDICT=down; REASON="$MAILBOX_WHY"
+  elif [ "${MAILBOX:-ok}" = unknown ]; then
+    # AND A MISSING HEARTBEAT IS NOT A PASS. Caught while proving the change above: deleting the
+    # file entirely produced "healthy", because only `down` was treated as a problem and `unknown`
+    # fell through. That is could-not-look reading as looked-and-fine — the failure this whole probe
+    # exists to prevent, rebuilt inside the fix for it.
+    VERDICT=unclear; REASON="the CLI answered, but there is no listener heartbeat to say whether he can HEAR anyone — $MAILBOX_WHY"
+  elif grep -qi "alive" <<<"$PROBE_OUT"; then
+    VERDICT=healthy; REASON="answered normally, and the listener is connected"
+  else
+    # Ran, exited 0, said something unexpected. NOT healthy and NOT a known failure — say so rather
+    # than picking whichever is convenient.
+    VERDICT=unclear; REASON="the CLI exited 0 but did not answer as asked: $(head -c 160 <<<"$PROBE_OUT" | tr '\n' ' ')"
+  fi
+}
+
+# Credential TIMESTAMPS only, never token material — the same forensics the failure log now keeps.
+cred_facts() {
+  python3 - "$CFG" <<'PY' 2>/dev/null || echo '{}'
+import json, os, sys, time
+cfg = sys.argv[1] if len(sys.argv) > 1 and sys.argv[1] else os.path.expanduser("~/.claude")
+p = os.path.join(cfg, ".credentials.json")
+out = {}
+try:
+    out["cred_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(os.path.getmtime(p)))
+    o = (json.load(open(p)) or {}).get("claudeAiOauth") or {}
+    for k in ("expiresAt", "refreshTokenExpiresAt"):
+        v = o.get(k)
+        if isinstance(v, (int, float)):
+            out[k] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(v/1000 if v > 1e12 else v))
+    out["subscriptionType"] = o.get("subscriptionType")
+except Exception as e:
+    out["cred_error"] = f"{type(e).__name__}: {e}"
+print(json.dumps(out))
+PY
+}
+
+slack_say() {
+  local text=$1 resp
+  # Read the token at USE time from the file the service already uses; never printed, never stored.
+  [ -r "$MOSES_CONFIG_DIR/slack.env" ] || { echo "moses-liveness: no slack.env — cannot alarm" >&2; return 1; }
+  # TRACE-SAFE. `bash -x` echoes every expansion, so sourcing a credential file — or testing the
+  # variable it sets — prints the secret. That is exactly how the Slack bot token reached a
+  # transcript on 2026-09-03, while someone was tracing this very script to find out why it hung.
+  # xtrace is disabled around the credential handling and restored afterwards, so debugging a script
+  # can never be the thing that leaks from it.
+  local _xt=0; case $- in *x*) _xt=1; set +x ;; esac
+  set -a; . "$MOSES_CONFIG_DIR/slack.env"; set +a
+  [ -n "${SLACK_BOT_TOKEN:-}" ] || { echo "moses-liveness: SLACK_BOT_TOKEN unset — cannot alarm" >&2; return 1; }
+  resp=$(python3 - "$CHANNEL" "$text" <<'PY'
+import json, os, sys, urllib.request
+chan, text = sys.argv[1], sys.argv[2]
+req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+    data=json.dumps({"channel": chan, "text": text, "username": "Moses",
+                     "icon_emoji": ":scroll:", "unfurl_links": False}).encode(),
+    headers={"Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}",
+             "Content-Type": "application/json; charset=utf-8"})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=20))
+    print("ok" if r.get("ok") else f"error:{r.get('error')}")
+except Exception as e:
+    print(f"error:{type(e).__name__}")
+PY
+)
+  [ "$_xt" = 1 ] && set -x
+  [ "$resp" = "ok" ] || { echo "moses-liveness: Slack rejected the alarm ($resp)" >&2; return 1; }
+}
+
+# ── Run ───────────────────────────────────────────────────────────────────────
+check_mailbox
+probe
+classify
+FACTS=$(cred_facts)
+PREV=$(python3 -c "import json,sys; print((json.load(open('$STAMP')) or {}).get('verdict','unknown'))" 2>/dev/null || echo unknown)
+
+python3 - "$STAMP" "$LOG" "$VERDICT" "$REASON" "$FACTS" <<'PY'
+import json, sys, time
+stamp, log, verdict, reason, facts = sys.argv[1:6]
+rec = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "verdict": verdict, "reason": reason,
+       "credentials": json.loads(facts or "{}")}
+json.dump(rec, open(stamp, "w"))
+with open(log, "a") as fh: fh.write(json.dumps(rec) + "\n")
+PY
+
+if [ "$MODE" = "--print" ]; then
+  echo "moses-liveness: $VERDICT — $REASON"
+  echo "  previous: $PREV"
+  echo "  credentials: $FACTS"
+  [ "$VERDICT" = healthy ] && exit 0 || exit 1
+fi
+
+# ALARM ON A CHANGE, not on every tick. A message every 30 minutes is one people filter, and a
+# filtered alarm protects nothing. Recovery is announced too — an alarm that never says "better" is
+# one nobody trusts to have meant "worse".
+if [ "$VERDICT" != healthy ] && [ "$PREV" = healthy ] || [ "$MODE" = "--force" ]; then
+  slack_say ":rotating_light: *Moses is not answering* — $REASON
+
+Nobody has to notice this by accident any more: I check myself every 30 minutes and say so here. Last known good was $PREV. Credential timestamps (no secrets): $FACTS"
+elif [ "$VERDICT" = healthy ] && [ "$PREV" != healthy ] && [ "$PREV" != unknown ]; then
+  slack_say ":white_check_mark: *Moses is answering again* — recovered from \`$PREV\`."
+fi
+
+[ "$VERDICT" = healthy ] && exit 0 || exit 1

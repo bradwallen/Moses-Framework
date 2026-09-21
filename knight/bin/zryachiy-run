@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# zryachiy-run — the detached worker. Not called by hand; `zryachiy explore` launches it.
+#
+#   zryachiy-run <job-dir>
+#
+# Runs Viatica's `npm run explore` (sandbox, walls, boundary check, Zryachiy on the Pro
+# subscription), keeps its report, and posts the outcome. The verdict comes from the runner's EXIT
+# CODE: 0 nothing blocking, 1 findings, 2 could not finish. It is never re-judged here, and "could
+# not finish" is never presented as a pass.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+DIR="$1"
+VIATICA="${ZRYACHIY_VIATICA:-}"   # the product checkout Zryachiy explores, from the operator's settings
+OPTENV=$MOSES_CONFIG_DIR/knight.env
+now() { date +%Y-%m-%dT%H:%M:%S%z; }
+
+echo $$ > "$DIR/pid"
+echo running > "$DIR/status"
+feature=$(cat "$DIR/feature.txt"); minutes=$(cat "$DIR/minutes")
+
+# ── Back to whoever asked ────────────────────────────────────────────────────
+# The same rule as Knight's (bin/knight-run): the listener recorded the conversation that started
+# this job in notify.json, and the outcome goes back there. It is a FUNCTION so test-zryachiy.sh
+# drives the real payload, and it prints nothing when there is nobody to tell, including when the
+# conversation IS the report channel's top level.
+zry_notify_payload() {
+    local nfile=$1 text=$2 report_chan=$3
+    [ -r "$nfile" ] || return 0
+    jq -ce --arg t "$text" --arg rc "$report_chan" '
+        select((.channel // "") != "" and (.channel != $rc or (.thread_ts // "") != ""))
+        | {channel, username: "Zryachiy", icon_emoji: ":eye:", unfurl_links: false,
+           text: ((if (.user // "") != "" then "<@\(.user)> " else "" end) + $t
+                  + (if $rc != "" and $rc != .channel then "\n_Also posted in <#\($rc)>._" else "" end))}
+        + (if (.thread_ts // "") != "" then {thread_ts} else {} end)' "$nfile" 2>/dev/null || true
+}
+
+# ── Run it ───────────────────────────────────────────────────────────────────
+# The explorer spawns `claude` by name, and the Moses services' PATH finds the old root-owned
+# /usr/bin/claude (2.1.220). Put the agents' own per-user CLI first (2026-09-13).
+export PATH="$(dirname "$MOSES_CLAUDE_CLI"):$PATH"
+# ZRYACHIY_FAKE_EXPLORE is a TEST SEAM: an exit code and a canned report instead of a sandbox and a
+# model, so the launch, the verdict and the report path are proven in seconds and spend nothing.
+if [ -n "${ZRYACHIY_FAKE_EXPLORE:-}" ]; then
+    art="$DIR/fake-run"; mkdir -p "$art"
+    sleep "${ZRYACHIY_FAKE_SLEEP:-0}"
+    printf '%s\n' "${ZRYACHIY_FAKE_REPORT:-# Zryachiy explored: $feature}" > "$art/report.md"
+    printf 'artifacts: %s\n' "$art" > "$DIR/explore.log"
+    rc=$ZRYACHIY_FAKE_EXPLORE
+else
+    # The ceiling covers the sandbox build and the boundary check as well as his own minutes.
+    ( cd "$VIATICA" && timeout --signal=TERM --kill-after=60 $(( (minutes + 25) * 60 )) \
+        npm run explore -- --feature "$feature" --criteria-file "$DIR/criteria.txt" --minutes "$minutes" ) \
+        > "$DIR/explore.log" 2>&1
+    rc=$?
+    art=$(grep -o 'artifacts: .*' "$DIR/explore.log" | tail -1 | sed 's/^artifacts: //')
+fi
+[ -n "${art:-}" ] && [ -f "$art/report.md" ] && cp "$art/report.md" "$DIR/report.md"
+case "$rc" in
+    0)       status=clean ;;
+    1)       status=findings ;;
+    124|137) status=timeout ;;
+    *)       status=could-not-finish ;;
+esac
+echo "$status" > "$DIR/status"
+
+# ── What to say ──────────────────────────────────────────────────────────────
+text=$(python3 - "$status" "$feature" "$DIR/report.md" "$DIR/explore.log" "$DIR" <<'PY'
+import os, re, sys
+status, feature, report, log, jobdir = sys.argv[1:6]
+head = {
+    "clean": f":white_check_mark: *Zryachiy explored {feature}*: nothing blocking.",
+    "findings": f":no_entry: *Zryachiy explored {feature}*: he found problems.",
+    "timeout": f":warning: *Zryachiy ran out of time exploring {feature}*. Not a pass.",
+}.get(status, f":warning: *Zryachiy could not finish exploring {feature}*. Not a pass.")
+out = [head]
+try:
+    rep = open(report, encoding="utf-8").read()
+except OSError:
+    rep = ""
+if rep:
+    for key in ("- verdict:", "- tool wall:"):
+        out += [l[2:].strip() for l in rep.splitlines() if l.startswith(key)]
+    body = rep.split("```text", 1)[1].split("```", 1)[0] if "```text" in rep else ""
+    picks = [l.strip() for l in body.splitlines()
+             if re.match(r"\s*(CONFIRMED|PLAUSIBLE)\b|\s*CRITERION\s+\d+\s*:\s*NOT", l)]
+    # A line that reports nothing is not a finding (Knight's reviewer, 2026-09-11).
+    picks = [p for p in picks if not re.match(r"(CONFIRMED|PLAUSIBLE)\s*:?\s*(none|nothing|n/a)\s*([.,:;]|—|–|-|$)", p, re.I)]
+    out += ["• " + p[:300] for p in picks[:8]]
+    if len(picks) > 8:
+        out.append(f"…and {len(picks) - 8} more in the report")
+else:
+    tail = []
+    if os.path.exists(log):
+        tail = [l for l in open(log, encoding="utf-8", errors="replace").read().splitlines() if l.strip()][-4:]
+    out.append("No report was written. The last lines of the run:")
+    out += ["> " + t[:200] for t in tail]
+out.append(f"_Full report on Reserve: {jobdir}/report.md_")
+print("\n".join(out))
+PY
+)
+printf '%s\n' "$text" > "$DIR/slack-text.txt"
+printf '%s\n%s\n' "$status" "$(head -3 <<<"$text" | tail -2)" > "$DIR/summary"
+
+# ── Post it ──────────────────────────────────────────────────────────────────
+if [ -r "$OPTENV" ]; then
+    tok=$(. "$OPTENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
+    # Overridable so the suite posts nowhere: set to empty and the guard below skips both posts.
+    if [ -n "${ZRYACHIY_SLACK_CHANNEL+x}" ]; then chan=$ZRYACHIY_SLACK_CHANNEL; else
+        chan=$(. "$OPTENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
+    if [ -n "$tok" ] && [ -n "$chan" ]; then
+        curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+            -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+            --data "$(jq -nc --arg c "$chan" --arg t "$text" '{channel:$c,text:$t,username:"Zryachiy",icon_emoji:":eye:",unfurl_links:false}')" \
+            > "$DIR/slack.json" 2>&1
+        jq -e '.ok == true' "$DIR/slack.json" >/dev/null 2>&1 || echo "slack_post=FAILED" >> "$DIR/summary"
+        npay=$(zry_notify_payload "$DIR/notify.json" "$text" "$chan")
+        if [ -n "$npay" ]; then
+            curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+                -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+                --data "$npay" > "$DIR/notify-slack.json" 2>&1
+            jq -e '.ok == true' "$DIR/notify-slack.json" >/dev/null 2>&1 || echo "notify_post=FAILED" >> "$DIR/summary"
+        fi
+    fi
+fi
+now > "$DIR/ended"

@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# moses-remediate — the SHORT list of repairs Moses may perform himself. Root-owned, sudo-invoked.
+#
+# WHY A WRAPPER AND NOT A SHELL (Brad, 2026-08-22): he wants to be able to say "investigate and go
+# fix it" in the thread where an alarm landed. The obvious way to grant that is Bash, and Bash on
+# Reserve as brad reaches the memory corpus, Moses's own source, and the Viatica checkout — the
+# boundary would be the model's judgement. This is the railway-read shape instead: a named set of
+# operations, each one refusing anything outside its own list, and no way to express anything else.
+#
+# THE LIST IS DELIBERATELY SHORT and grows on evidence. Brad: "let's start that way and broaden when
+# necessary." Anything code-shaped goes to Knight, whose runner enforces the test gate. Anything not
+# on this list comes back to Brad by name.
+#
+#   moses-remediate rerun-probe <persona>    re-run one persona's own check
+#   moses-remediate ops                      list what this wrapper can do
+#
+# THE DEPLOY PAIR IS GONE, and the reason is the good kind. They existed because /opt/moses was a
+# COPY of the source that had to be pushed and could fall behind. On 2026-09-02 the listener moved to
+# a systemd user unit that runs the source directly, so there is no copy, nothing to push, and
+# nothing to fall behind. Deploying is now `systemctl --user restart moses` — no sudo, and therefore
+# no business being in a root wrapper at all.
+#
+# Keeping them would have been worse than useless: `deploy-status` would compare against a directory
+# that no longer exists and `deploy-moses` would restart a unit that is no longer there.
+
+set -uo pipefail
+
+# THE ROSTER IS THE CANONICAL ONE OR NOTHING. An earlier draft fell back to the copy in the source
+# tree when /etc/moses/personas.json was unreadable, and that copy is stale — it has no Therapist,
+# so re-running her probe would have been refused with "not a persona in the roster." A wrapper that
+# cannot read its own allowlist must say it could not read it, never answer as though the allowlist
+# were empty. Same rule as the git hooks: "could not check" is not "checked and denied".
+# /etc/moses/roster.json — VERIFIED to exist (644, root-owned, world-readable), not recalled.
+# The first version used /etc/moses/personas.json because a memory line called that "THE ROSTER".
+# That path has never existed. The wrapper refused to run and said NOTHING WAS CHECKED, which is
+# exactly what it should do with an unreadable allowlist — the guard caught its author's own bad
+# path on the first real run.
+# THE OPERATOR'S HOME. Keyed off PRIVILEGE, not SUDO_USER — that variable names whoever invoked
+# sudo, so when root runs `sudo -u brad moses`, SUDO_USER is *root* and a naive lookup resolves to
+# /root. That is exactly what happened on 2026-09-02: the migration verified itself through
+# `sudo -u brad` and reported two failures against a system that was working correctly. A guard that
+# fires on correct work gets switched off, and this one nearly did on its first run.
+#
+# Unprivileged: $HOME is right, and sudo sets it for the target user (verified, not assumed).
+# Privileged: this is the standup timer, where there is no invoking user to ask — so it is a
+# declared operator, defaulting to brad, and root is never treated as the operator.
+if [ "$(id -u)" -ne 0 ]; then
+  OP_HOME=${MOSES_OP_HOME:-$HOME}
+else
+  # Never sourced (this runs as root): the sudo caller, /etc/moses/operator, else account 1000, said aloud.
+  _op=${MOSES_OPERATOR_USER:-}
+  [ -z "$_op" ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] && _op=$SUDO_USER
+  [ -z "$_op" ] && [ -r /etc/moses/operator ] && _op=$(head -1 /etc/moses/operator | tr -d '[:space:]')
+  # Last resort, declared and said aloud: account 1000 — what this hard-coded before (/run/user/1000).
+  if [ -z "$_op" ]; then
+    _op=$(getent passwd 1000 | cut -d: -f1)
+    [ -n "$_op" ] || { echo "moses-remediate: no operator — set MOSES_OPERATOR_USER or write /etc/moses/operator" >&2; exit 2; }
+    echo "moses-remediate: no operator declared — using account 1000 ($_op); write it to /etc/moses/operator" >&2
+  fi
+  OP_HOME=${MOSES_OP_HOME:-$(getent passwd "$_op" | cut -d: -f6)}
+fi
+GUARD=${MOSES_EXEC_GUARD:-/usr/local/lib/moses/roster-exec-guard.sh}
+# A MISSING GUARD MUST NOT MEAN "RUN IT ANYWAY". If the file is gone, every roster-declared command
+# is refused rather than executed unchecked — the roster is operator-writable now, so an absent
+# check is the one failure that turns this back into arbitrary root execution.
+if [ -r "$GUARD" ]; then . "$GUARD"; else
+  roster_argv_ok() { echo "roster: exec guard missing at $GUARD — refusing to run anything it named" >&2; return 1; }
+fi
+ROSTER=${MOSES_ROSTER:-$OP_HOME/.config/moses/roster.json}
+# Overridable so the tests can exercise the REAL script against a throwaway ledger rather
+# than a reimplementation of it. A test that runs a copy of the logic proves the copy.
+LOG=${MOSES_REMEDIATION_LOG:-/var/lib/moses/remediations.jsonl}
+
+die() { echo "moses-remediate: $*" >&2; exit 1; }
+
+[ -r "$ROSTER" ] || die "cannot read the roster at $ROSTER — NOTHING was checked and nothing was
+  changed. Run me with sudo; if that still fails, the roster is missing and every op here is
+  unsafe until it is back."
+
+# Every attempt is recorded, allowed or refused. An agent that can change things has to leave a
+# trail that is readable without asking the agent — the same reason the turn log exists.
+record() {
+  local op=$1 target=$2 outcome=$3 detail=${4:-}
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '{"at":"%s","by":"%s","op":"%s","target":"%s","outcome":"%s","detail":"%s"}\n' \
+    "$(date -Is)" "${SUDO_USER:-$(id -un)}" "$op" "$target" "$outcome" \
+    "$(printf '%s' "$detail" | tr -d '"' | head -c 300)" >> "$LOG" 2>/dev/null || true
+}
+
+# Personas, derived from the roster — never a list written here. A hardcoded set is what made
+# moses-morning the accidental definition of who owed a report.
+persona_ids() { python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+ps=d.get("personas", d if isinstance(d,list) else [])
+print(" ".join(p.get("id","") for p in ps if p.get("id")))' "$ROSTER" 2>/dev/null; }
+
+# The check command a persona declares for itself, so this wrapper never re-implements one.
+persona_check() { python3 -c '
+import json,sys
+d=json.load(open(sys.argv[1]))
+ps=d.get("personas", d if isinstance(d,list) else [])
+for p in ps:
+    if p.get("id")==sys.argv[2]:
+        c=p.get("check") or {}
+        if c.get("type")=="command": print("\n".join(c.get("argv") or []))
+        break' "$ROSTER" "$2" 2>/dev/null; }
+
+op=${1:-ops}; target=${2:-}
+
+case "$op" in
+  ops)
+    echo "rerun-probe <persona>   personas: $(persona_ids)"
+    exit 0 ;;
+
+
+
+  rerun-probe)
+    [ -n "$target" ] || die "rerun-probe needs a persona id. Have: $(persona_ids)"
+    case " $(persona_ids) " in *" $target "*) ;; *)
+      record "$op" "$target" refused "not in roster"
+      die "'$target' is not a persona in the roster." ;;
+    esac
+    mapfile -t argv < <(persona_check "$ROSTER" "$target")
+    [ "${#argv[@]}" -gt 0 ] || { record "$op" "$target" refused "no command check"
+      die "'$target' declares no command check to re-run."; }
+    # A TRANSIENT probe failure is the case this exists for: the domain expiry lookup calls a public
+    # RDAP service with a 25s timeout, and it failed once at 08:00 while working perfectly minutes
+    # later. Re-running answers "was that real?" without changing anything.
+    roster_argv_ok "${argv[0]:-}" || { record "$op" "$target" refused "roster names an unsafe command"
+      die "'$target' names a command this wrapper will not run as root."; }
+    out=$("${argv[@]}" 2>&1); rc=$?
+    record "$op" "$target" "$([ $rc -eq 0 ] && echo ok || echo failed)" "rc=$rc"
+    echo "$out" | tail -25
+    [ $rc -eq 0 ] && echo "→ re-run CLEAN: the original alarm was transient." \
+                  || echo "→ re-run FAILED the same way: the alarm is real, not a blip."
+    exit $rc ;;
+
+  *) record "${op}" "$target" refused "unknown op"
+     die "unknown op '${op}'. Try: moses-remediate ops" ;;
+esac

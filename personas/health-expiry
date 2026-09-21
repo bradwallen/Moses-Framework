@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# health-expiry — everything that can EXPIRE or RUN OUT and take Viatica down for a paying
+# customer. Called by ops-report; runnable by hand.
+#
+#   health-expiry            report lines on stdout; exit 0 = all clear, 1 = something needs a look
+#   health-expiry --oneline  a single healthy summary line (used by the morning all-clear)
+#
+# WHY THIS EXISTS (Brad, 2026-08-11): "I do NOT want anything that expires to bite a paying Viatica
+# customer." The trigger was Moses's connector token going stale — the CHEAPEST version of the
+# failure, since it only cost one tool in one session. The same class of failure aimed at Customs
+# looks like the AI features dying mid-trip, or password email silently not sending.
+#
+# THREE KINDS OF FAILURE, and only the first has a date on it:
+#   1. EXPIRES on a known date  — TLS certs, the domain registration. Computable, exact.
+#   2. RUNS OUT with no date    — prepaid Anthropic and Railway credit. No expiry to read; the only
+#                                 signal is the balance, or the thing failing.
+#   3. REVOKED / MISCONFIGURED  — a key that still exists and no longer works. Invisible to config.
+#
+# So checking that a credential is SET proves nothing: that is the declaration. Only a real request
+# proves the behavior — the same distinction that let a push target sit unreachable for a whole day
+# while the preflight happily printed its URL. Everything below either reads a real expiry date or
+# makes a real call.
+
+set -uo pipefail
+
+
+# THE OPERATOR'S HOME. Keyed off PRIVILEGE, not SUDO_USER — that variable names whoever invoked
+# sudo, so when root runs `sudo -u brad moses`, SUDO_USER is *root* and a naive lookup resolves to
+# /root. That is exactly what happened on 2026-09-02: the migration verified itself through
+# `sudo -u brad` and reported two failures against a system that was working correctly. A guard that
+# fires on correct work gets switched off, and this one nearly did on its first run.
+#
+# Unprivileged: $HOME is right, and sudo sets it for the target user (verified, not assumed).
+# Privileged: this is the standup timer, where there is no invoking user to ask — so it is a
+# declared operator, defaulting to brad, and root is never treated as the operator.
+if [ "$(id -u)" -ne 0 ]; then
+  OP_HOME=${MOSES_OP_HOME:-$HOME}
+else
+  _op=${MOSES_OPERATOR_USER:-${SUDO_USER:-brad}}; [ "$_op" = root ] && _op=${MOSES_OPERATOR_USER:-brad}
+  OP_HOME=${MOSES_OP_HOME:-$(getent passwd "$_op" | cut -d: -f6)}
+fi
+MOSES_ROOT=${MOSES_ROOT:-$OP_HOME/Projects/moses}
+
+ONELINE=0
+[ "${1:-}" = "--oneline" ] && ONELINE=1
+
+# VIATICA_APP_URL / CRON_SECRET — never echoed. LATER FILES WIN, and the operator's own config is
+# last: the agent runs as the operator now, so ~/.config/moses is where these live. The retired
+# root-only file is still sourced if present, so removing it cannot silently blank a value.
+for f in /etc/moses/ops.env /etc/moses/moses.env \
+         "$OP_HOME/.config/moses/knight.env" "$OP_HOME/.config/moses/customs.env"; do
+    # shellcheck disable=SC1090
+    [ -r "$f" ] && . "$f"
+done
+: "${VIATICA_APP_URL:=}"
+: "${CRON_SECRET:=}"
+
+# The domain whose registration expiry we watch. Derived from the app URL when not set separately,
+# because an operator who has already told us the URL should not have to say it twice.
+APP_DOMAIN=${APP_DOMAIN:-$(printf '%s' "${VIATICA_APP_URL:-}" | sed -e 's#^https\?://##' -e 's#/.*##')}
+
+# SCOPE, tracked separately from RESULT. A check that could not run must never borrow the
+# vocabulary of one that ran and failed — see Atlas, 2026-08-14: a null result rendering as a
+# negative one is how "I couldn't look" becomes "it's broken".
+APP_CHECKED=0
+# Deliverability tracked as THREE states, not two. "mail is flowing", "no mail sent", and "the key
+# cannot read metrics" are different facts, and only the first is good news. See check_email below.
+MAIL_STATE=""
+
+CERT_WARN_DAYS=21      # certs auto-renew ~30 days out; under 21 means renewal is NOT happening
+DOMAIN_WARN_DAYS=45    # a lapsed registration takes the site, email and Moses with it
+ISSUES=0
+OUT=""
+
+add()   { OUT="$OUT
+$1"; }
+issue() { ISSUES=$((ISSUES+1)); add "$1"; }
+
+norm_host() {  # strip scheme and any path, so a URL or a bare host both work
+    local h="${1%/}"; h="${h#http://}"; h="${h#https://}"; printf '%s' "${h%%/*}"
+}
+
+# ── 1. Is Customs actually serving? ──────────────────────────────────────────
+# The broadest canary there is: if this fails nothing else matters, and it catches the outages no
+# expiry date predicts — Railway credit exhausted, a bad deploy, the database gone.
+check_app() {
+    local host code
+    [ -n "$VIATICA_APP_URL" ] || { issue "⚠️ *Customs* — VIATICA_APP_URL is not set, so nothing here was checked"; return; }
+    host=$(norm_host "$VIATICA_APP_URL")
+    APP_CHECKED=1
+    code=$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 25 "https://$host/" 2>/dev/null)
+    case "$code" in
+        200|301|302|307|308) APP_OK=1 ;;
+        000) issue "🔴 *Viatica is unreachable* — no response from \`$host\`" ;;
+        *)   issue "🔴 *Viatica returned HTTP $code* at \`$host\`" ;;
+    esac
+}
+
+# ── 2. Certificates ──────────────────────────────────────────────────────────
+# The number itself is not the alarm — these renew automatically. A number that STOPS FALLING is,
+# which is why the threshold sits below the normal renewal window rather than at it.
+check_cert() {  # check_cert <label> <host-or-url>
+    local label="$1" host days end
+    host=$(norm_host "$2")
+    end=$(echo | timeout 15 openssl s_client -servername "$host" -connect "$host":443 2>/dev/null \
+          | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
+    if [ -z "$end" ]; then
+        issue "⚠️ *$label cert* — could not read the certificate for \`$host\`"
+        return
+    fi
+    days=$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 ))
+    CERT_MIN=$(( days < CERT_MIN ? days : CERT_MIN ))
+    if [ "$days" -lt "$CERT_WARN_DAYS" ]; then
+        issue "⚠️ *$label cert expires in $days days* (\`$host\`) — auto-renewal is not happening"
+    fi
+}
+
+# ── 3. Domain registration ───────────────────────────────────────────────────
+# The quiet catastrophe: it takes the site, the email domain and Moses at once, and the warning
+# arrives as email to whatever address is on the registration. Read over RDAP, the registry's own
+# structured record — no whois binary needed, and no scraping.
+check_domain() {
+    local json exp days
+    json=$(curl -sSL --max-time 25 -H 'Accept: application/rdap+json' \
+           https://rdap.org/domain/"$APP_DOMAIN" 2>/dev/null)
+    exp=$(printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for e in d.get("events", []):
+        if e.get("eventAction") == "expiration":
+            print(e.get("eventDate", "")); break
+except Exception:
+    pass' 2>/dev/null)
+    if [ -z "$exp" ]; then
+        issue "⚠️ *Domain* — could not read the registration expiry for $APP_DOMAIN"
+        return
+    fi
+    days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
+    DOMAIN_DAYS=$days
+    if [ "$days" -lt "$DOMAIN_WARN_DAYS" ]; then
+        issue "🔴 *viatica.travel expires in $days days* — renew it; a lapse takes the site, email and Moses"
+    fi
+}
+
+# ── 4. The dependencies Viatica cannot serve without ─────────────────────────
+# Asks the app to exercise its own credentials — database, Stripe, email, AI — and report which ones
+# actually answered. A key that is merely PRESENT tells us nothing; these are real calls.
+check_deps() {
+    local host code body
+    [ -n "$VIATICA_APP_URL" ] && [ -n "$CRON_SECRET" ] || return 0
+    host=$(norm_host "$VIATICA_APP_URL")
+    body=$(mktemp)
+    code=$(curl -sSL -o "$body" -w '%{http_code}' --max-time 45 \
+           -H "Authorization: Bearer $CRON_SECRET" "https://$host/api/health/deps" 2>/dev/null)
+    if [ "$code" = "404" ]; then
+        # Deliberately an issue, not silence. The whole point of this check is that a monitor which
+        # is not running looks exactly like a monitor with nothing to say.
+        issue "⚠️ *Dependency canary not deployed* — \`/api/health/deps\` returns 404 on Customs"
+        rm -f "$body"; return
+    fi
+    if [ "$code" != "200" ] && [ "$code" != "503" ]; then
+        issue "⚠️ *Dependency canary* — HTTP ${code:-000} from \`/api/health/deps\`"
+        rm -f "$body"; return
+    fi
+    # 503 is the CONTRACT for "a dependency is down" (same reasoning as the 502 from the cron
+    # endpoints: a failure that answers 200 is a monitor switched off). Both codes carry the detail.
+    # Parser in a QUOTED heredoc, never an inline -c string. Nested quotes inside a shell string are
+    # what silently broke Knight's brief: content that looks like syntax must not reach a parser.
+    local bad
+    bad=$(python3 - "$body" <<'PY' 2>/dev/null
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("unreadable"); sys.exit()
+for name, v in (d.get("checks") or {}).items():
+    if not v.get("ok"):
+        detail = (v.get("error") or "failed")[:90]
+        print(name + ": " + detail)
+PY
+)
+    rm -f "$body"
+    if [ "$bad" = "unreadable" ]; then
+        issue "⚠️ *Dependency canary* — response was not readable JSON"
+    elif [ -n "$bad" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && issue "🔴 *Customs dependency down* — $line"
+        done <<< "$bad"
+    else
+        DEPS_OK=1
+    fi
+}
+
+APP_OK=0; DEPS_OK=0; CERT_MIN=99999; DOMAIN_DAYS=""
+
+check_app
+check_cert "viatica.travel" "viatica.travel"
+[ -n "$VIATICA_APP_URL" ] && check_cert "Railway" "$VIATICA_APP_URL"
+check_domain
+check_deps
+
+# ── 5. Is our mail actually arriving? ────────────────────────────────────────
+# THE GAP THIS CLOSES is named in this file's own header: "password email silently not sending", and
+# failure class 3, "a key that still exists and no longer works. Invisible to config." Until now
+# nothing read a delivery OUTCOME back — only whether Resend accepted the send, which is not whether
+# it arrived. Resend's metrics API (GA, September 2026) answers it without sending anything, so this
+# stays a canary rather than becoming a sender.
+#
+# The sharpest case is the magic-link login: an email that does not arrive is a total outage for that
+# user AND they cannot report it, because they cannot log in to tell us.
+#
+# Read from Customs, not from here, because the Resend key lives on Customs and only there. A probe
+# that needed the key copied to Reserve would trade a blind spot for a production credential in a
+# second place, which is the worse trade.
+check_email() {
+    local host code body verdict
+    [ -n "$VIATICA_APP_URL" ] && [ -n "$CRON_SECRET" ] || { MAIL_STATE="not checked"; return 0; }
+    host=$(norm_host "$VIATICA_APP_URL")
+    body=$(mktemp); local week; week=$(mktemp)
+    code=$(curl -sSL -o "$body" -w '%{http_code}' --max-time 30 \
+           -H "Authorization: Bearer $CRON_SECRET" \
+           "https://$host/api/agents/report?persona=email&hours=24" 2>/dev/null)
+    # The 7-day window is what DECIDES; the 24h one only colors the line. See the parser.
+    curl -sSL -o "$week" --max-time 30 \
+         -H "Authorization: Bearer $CRON_SECRET" \
+         "https://$host/api/agents/report?persona=email&hours=168" >/dev/null 2>&1
+
+    if [ "$code" = "404" ]; then
+        MAIL_STATE="not deployed"
+        issue "⚠️ *Deliverability canary not deployed* — \`persona=email\` returns 404 on Customs"
+        rm -f "$body" "$week"; return
+    fi
+    if [ "$code" != "200" ]; then
+        MAIL_STATE="not checked"
+        issue "⚠️ *Deliverability* — HTTP ${code:-000} asking Customs; mail was NOT checked"
+        rm -f "$body" "$week"; return
+    fi
+
+    # Parser in a QUOTED heredoc, never an inline -c string — same rule as check_deps.
+    verdict=$(python3 - "$body" "$week" <<'PYEMAIL' 2>/dev/null
+import json, sys
+
+def load(path):
+    try:
+        return json.load(open(path))
+    except Exception:
+        return None
+
+day, week = load(sys.argv[1]), load(sys.argv[2])
+if day is None or week is None:
+    print("BLIND|the deliverability response was unreadable"); sys.exit()
+
+if not week.get("ok"):
+    reason, detail = week.get("reason") or "unknown", week.get("detail") or ""
+    # A key that cannot READ metrics may be sending perfectly. Reported as blindness, never as an
+    # outage — the deps check cried wolf on exactly this in August 2026, and a monitor that cries
+    # wolf gets ignored, which costs more than the check was ever worth.
+    print(f"BLIND|{detail or reason}")
+    sys.exit()
+
+wk = week.get("sent") or 0
+today = (day.get("sent") or 0) if day.get("ok") else None
+
+# THE WINDOW IS SEVEN DAYS, NOT ONE, AND THE REAL NUMBERS ARE WHY. Measured 2026-09-02: Viatica
+# sent 16 emails in a week and 0 in the preceding 24 hours. A 24h zero-alarm would therefore fire
+# on most days at this volume, and a guard that fires on correct work gets switched off. A full
+# WEEK of silence at 16/week is a real signal; a quiet Tuesday is not.
+if wk == 0:
+    print("QUIET|no mail sent or delivered in 7 days")
+    sys.exit()
+
+br, cr = week.get("bounce_rate"), week.get("complaint_rate")
+bw = week.get("bounce_warn") or 0.05
+cw = week.get("complaint_warn") or 0.001
+
+# RATES NEED A SAMPLE. At 16 sends a week, one bounce is a 6% rate and two is 12% — both over the
+# warning line, neither meaning anything. Below the floor the counts are reported and no rate is
+# allowed to raise an alarm, because a percentage of a handful is noise wearing a decimal point.
+MIN_SAMPLE = 20
+bad = []
+if wk >= MIN_SAMPLE:
+    if isinstance(br, (int, float)) and br > bw:
+        bad.append(f"bounce rate {br*100:.1f}% (over {bw*100:.0f}%)")
+    if isinstance(cr, (int, float)) and cr > cw:
+        # A complaint spike on a broadcast degrades delivery for MAGIC LINKS on the same domain.
+        bad.append(f"complaint rate {cr*100:.2f}% (over {cw*100:.1f}%)")
+
+if bad:
+    print("BAD|" + "; ".join(bad) + f" — {wk} sent in 7d")
+    sys.exit()
+
+bounced = week.get("bounced") or 0
+note = "" if today is None else (", none today" if today == 0 else f", {today} today")
+low = " (too few to rate)" if wk < MIN_SAMPLE else ""
+print(f"OK|{wk} sent in 7d{note}, {bounced} bounced{low}")
+PYEMAIL
+)
+    rm -f "$body" "$week"
+    case "${verdict%%|*}" in
+        OK)    MAIL_STATE="mail ${verdict#*|}" ;;
+        QUIET) MAIL_STATE="NO MAIL 7d"
+               issue "⚠️ *Deliverability* — ${verdict#*|}. Magic-link login goes out this way, and a user who never receives one cannot tell us." ;;
+        BAD)   MAIL_STATE="MAIL DEGRADED"
+               issue "⚠️ *Deliverability* — ${verdict#*|}" ;;
+        *)     MAIL_STATE="not checked"
+               issue "⚠️ *Deliverability* — ${verdict#*|}. Mail was NOT checked; this is not an all-clear." ;;
+    esac
+}
+
+check_email
+
+if [ "$ONELINE" -eq 1 ]; then
+    if [ "$APP_CHECKED" -eq 0 ]; then
+        # NOT the same as unreachable. This is the probe reporting its own blindness, which is a
+        # fact about the check and not about Viatica.
+        parts="not checked (no app url readable as $(id -un))"
+    elif [ "$APP_OK" -eq 1 ]; then
+        parts="reachable"
+    else
+        parts="UNREACHABLE"
+    fi
+    [ "$DEPS_OK" -eq 1 ] && parts="$parts, deps ok"
+    [ "$CERT_MIN" -lt 99999 ] && parts="$parts, certs ${CERT_MIN}d"
+    [ -n "$DOMAIN_DAYS" ] && parts="$parts, domain ${DOMAIN_DAYS}d"
+    [ -n "$MAIL_STATE" ] && parts="$parts, $MAIL_STATE"
+    printf '%s\n' "$parts"
+    [ "$ISSUES" -eq 0 ] && exit 0 || exit 1
+fi
+
+if [ "$ISSUES" -eq 0 ]; then
+    printf '✅ *Customs* — all clear (%s)\n' \
+      "reachable$([ "$DEPS_OK" -eq 1 ] && printf ', deps ok'), certs ${CERT_MIN}d, domain ${DOMAIN_DAYS:-?}d${MAIL_STATE:+, $MAIL_STATE}"
+    exit 0
+fi
+
+printf '%s\n' "${OUT#$'\n'}"
+exit 1

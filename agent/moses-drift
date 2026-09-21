@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""moses-drift — compare what Moses DECLARES about himself against what is actually running.
+
+    moses-drift            report only disagreements; silence means they agree
+    moses-drift --all      show every check, agreeing or not
+
+WHY THIS EXISTS. Brad, 2026-08-22: "I just don't get why we're still finding things so very wrong
+with Moses." Nothing was wrong with the mechanisms. Every surprise that day was a DECLARATION that
+nothing compared against reality, and then quoted as fact:
+
+  * the roster said Knight was "parked - needs a model" — he had been pushing to master since Aug 8
+  * memory named the roster /etc/moses/personas.json — that path has never existed
+  * the roster in the source tree was three weeks stale and had no Therapist in it
+  * mcp_server.py in the source tree served 16 tools; the running server served 34
+  * TWO Moses listeners answered Slack for six days, one running week-old code
+
+`project_status` was built on the right principle — the DISAGREEMENT between declared and actual is
+the signal — and nothing applied it to the roster or the infrastructure. This does.
+
+TWO RULES IT KEEPS ABOUT ITSELF:
+  1. A check that could not run says so, and is never counted as agreement. "Couldn't look" and
+     "looked and found nothing" are different facts; collapsing them is the failure this whole day
+     was made of.
+  2. It reports disagreements only. A wall of green is a wall nobody reads, and the finding gets
+     lost in it.
+"""
+from __future__ import annotations
+
+import sys as _sys, pathlib as _pl  # noqa: E401
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent / "lib"))
+import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
+import datetime as _dt
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REGISTRY = Path(os.environ.get("MOSES_REGISTRY",
+                               str(Path.home() / ".claude" / "memory" / "projects.json")))
+ROSTER = Path(os.environ.get("MOSES_ROSTER", str(Path.home() / ".config" / "moses" / "roster.json")))
+SRC = Path(os.environ.get("MOSES_SRC") or _env.ROOT / "agent")
+DEPLOYED = Path(os.environ.get("MOSES_DEPLOYED", "/opt/moses"))
+MCP_URL = _env.setting("MOSES_MCP_URL", "http://127.0.0.1:8765/mcp")
+USER_ENV = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")}
+
+DRIFT: list[tuple[str, str]] = []      # (what, detail)
+BLIND: list[tuple[str, str]] = []      # (what, why it could not be checked)
+AGREED: list[str] = []
+
+
+def drift(what: str, detail: str) -> None: DRIFT.append((what, detail))
+def blind(what: str, why: str) -> None: BLIND.append((what, why))
+def agreed(what: str) -> None: AGREED.append(what)
+
+
+def sh(argv: list[str], env=None) -> tuple[int, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
+        return p.returncode, ((p.stdout or "") + (p.stderr or "")).strip()
+    except Exception as e:                                        # noqa: BLE001
+        return 127, f"{type(e).__name__}: {e}"
+
+
+
+def _our_unit_names() -> set[str]:
+    """Units this box runs on Moses's behalf — derived from the roster plus the moses-* family.
+
+    Never a hardcoded list: a hardcoded list is what made moses-morning the accidental definition of
+    who owed a report.
+    """
+    names = {"moses.service"}
+    try:
+        for p in json.loads(ROSTER.read_text()).get("personas", []):
+            if p.get("id"):
+                names.add(f"{p['id']}.service")
+    except Exception:                                             # noqa: BLE001
+        pass
+    rc, out = sh(["systemctl", "list-unit-files", "moses-*.service", "--no-legend", "--plain"])
+    if rc == 0:
+        names |= {ln.split()[0] for ln in out.splitlines() if ln.strip()}
+    return names
+
+
+def _declared_tools() -> set[str]:
+    """READ_TOOLS + ACT_TOOLS, parsed as PYTHON.
+
+    The first version used a regex and pulled the inline comments in with the names, then reported
+    whole sentences as tools the server was missing. A list literal is code; read it as code.
+    """
+    import ast
+    tree = ast.parse((SRC / "conversation.py").read_text())
+    out: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Name) and tgt.id in ("READ_TOOLS", "ACT_TOOLS"):
+                for el in getattr(node.value, "elts", []):
+                    if isinstance(el, ast.Constant) and isinstance(el.value, str):
+                        out.add(el.value)
+    return out
+
+
+# ── 1. The same unit running in BOTH scopes ─────────────────────────────────────
+# Two Moses listeners answered Slack for six days. systemd will happily run a system unit and a user
+# unit of the same name; nothing warns you, and both hold a Socket Mode connection.
+def check_duplicate_units() -> None:
+    rc_s, out_s = sh(["systemctl", "list-units", "--type=service", "--state=running",
+                      "--no-legend", "--plain"])
+    rc_u, out_u = sh(["systemctl", "--user", "list-units", "--type=service", "--state=running",
+                      "--no-legend", "--plain"], env=USER_ENV)
+    if rc_s != 0:
+        return blind("duplicate units", "could not list system units")
+    if rc_u != 0:
+        # The exact trap that hid this for six days: without XDG_RUNTIME_DIR this returns nothing
+        # and looks like "no user units", which is indistinguishable from "no duplicates".
+        return blind("duplicate units", "could not list USER units — is XDG_RUNTIME_DIR set?")
+    names = lambda out: {ln.split()[0] for ln in out.splitlines() if ln.strip()}
+    # OURS ONLY. A user dbus alongside a system dbus is how systemd is meant to work; flagging it
+    # would be a false positive on the very first run, and a checker that cries wolf gets ignored —
+    # which is the failure this file exists to prevent.
+    ours = _our_unit_names()
+    both = {n for n in names(out_s) & names(out_u) if n in ours}
+    if both:
+        drift("the same service is running in BOTH scopes",
+              ", ".join(sorted(both)) + " — system and --user; both will receive everything")
+    else:
+        agreed("no service is running in both system and user scope")
+
+
+def deployment_is_live() -> bool | None:
+    """Does anything actually execute out of DEPLOYED? True/False, or None when it cannot be asked.
+
+    Since 2026-09-02 the listener is a user unit running its SOURCE directly, so /opt/moses is a
+    leftover. Every check that compares against it has to ask this first or it reports the same
+    non-finding every morning — and this instrument is the only thing watching for real drift, so a
+    daily false alarm is how it gets ignored. None (not False) when systemctl cannot answer:
+    could-not-ask is not not-running.
+    """
+    rc, execstart = sh(["systemctl", "--user", "show", "moses.service", "-p", "ExecStart", "--value"],
+                       env=USER_ENV)
+    if rc == 0 and execstart:
+        return str(DEPLOYED) in execstart
+
+    # SYSTEMD IS NOT THE ONLY PLACE THIS IS WRITTEN DOWN, and asking it is the half that depends on
+    # who is running. `systemctl --user` as ROOT talks to root's own manager, not the operator's, so
+    # it cannot answer — and the standup IS root (moses-morning is a system unit). This returned
+    # None, callers correctly refused to treat could-not-ask as not-running, and the 08:00 report
+    # named eleven modules as missing from /opt/moses — a directory deleted on purpose on
+    # 2026-09-02. Every morning for a week, in the one report Brad reads.
+    #
+    # The unit FILE says the same thing and any user can read it. Same fix as user_unit_dir() below,
+    # for the same reason: the answer must not depend on who asked. None is still returned when
+    # BOTH sources are unavailable, because could-not-ask must never become not-running.
+    try:
+        text = (user_unit_dir() / "moses.service").read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.startswith("ExecStart="):
+            return str(DEPLOYED) in line
+    return None
+
+
+# ── 2. Deployed code vs the source it was deployed from ─────────────────────────
+def check_deployed_matches_source() -> None:
+    """Compare what /opt HAS, not what the source tree contains.
+
+    The first version demanded that every source module also exist at /opt, and called a missing one
+    "never deployed". That premise was wrong: project_status.py is source the deployment does not
+    install — the root-owned `moses` CLI runs it straight from the agent tree — so fixing it produced
+    a red check that no correct action could clear. A guard that fires on correct work gets switched
+    off, and a switched-off guard protects nothing.
+
+    So: compare the names present in BOTH, and report separately the modules at /opt with no source
+    at all. Those are the genuinely dangerous ones — nobody can rebuild them, and nothing says
+    whether anything still runs them.
+    """
+    # ONLY COMPARE A COPY SOMETHING ACTUALLY RUNS. Once the listener moved to a user unit running
+    # the SOURCE directly, /opt/moses became a leftover nothing executes — and this check would have
+    # reported "deployed code differs from source" every morning, forever, about a directory that no
+    # longer matters. A guard that fires on correct work gets switched off, and this one is the only
+    # thing watching for real deploy drift.
+    if deployment_is_live() is False:
+        return agreed(f"nothing runs from {DEPLOYED} any more — the listener runs its source directly")
+
+    if not DEPLOYED.is_dir():
+        return blind("deployed vs source", f"{DEPLOYED} is not readable")
+
+    src = {f.name: f for f in SRC.glob("*.py") if not f.name.endswith("_test.py")}
+    dep = {f.name: f for f in DEPLOYED.glob("*.py")}
+
+    stale = [n for n in sorted(src.keys() & dep.keys())
+             if src[n].read_bytes() != dep[n].read_bytes()]
+    if stale:
+        drift("deployed code differs from source",
+              ", ".join(stale) + f" — {DEPLOYED} is what actually runs")
+
+    orphans = sorted(dep.keys() - src.keys())
+    if orphans:
+        drift("deployed code with no source",
+              ", ".join(orphans) + f" in {DEPLOYED} — nothing can rebuild these, "
+              "and nothing here says whether anything still runs them")
+
+    if not stale and not orphans:
+        agreed(f"all {len(src.keys() & dep.keys())} deployed modules match their source")
+
+
+# ── 3. A persona's declared status against its own preflight ────────────────────
+# The roster said Knight was parked and needed a model. `knight doctor` was all green and he had
+# pushed to master. A status line is a claim; a preflight is evidence.
+PREFLIGHT = {"knight": [str(_env.ROOT / "knight/bin/knight"), "doctor"]}
+
+
+def check_declared_status() -> None:
+    try:
+        personas = json.loads(ROSTER.read_text()).get("personas", [])
+    except Exception as e:                                        # noqa: BLE001
+        return blind("declared status", f"cannot read {ROSTER}: {type(e).__name__}")
+    # ASSERT THE SWEEP, not just the verdict. The first version `continue`d past every persona whose
+    # status looked fine, so the check reported nothing at all — neither drift, nor agreement, nor
+    # "could not look". A check that vanishes when it passes is indistinguishable from one that was
+    # never wired up, which is how a stale roster line survived for two weeks.
+    swept, unverifiable = 0, []
+    for p in personas:
+        pid, status = p.get("id", ""), (p.get("status") or "")
+        claims_broken = any(w in status.lower() for w in ("parked", "needs a", "not built", "disabled"))
+        argv = PREFLIGHT.get(pid)
+        if claims_broken and not argv:
+            unverifiable.append(f"{pid} (\"{status}\")")
+        if not (claims_broken and argv):
+            continue
+        swept += 1
+        if not Path(argv[0]).exists():
+            blind(f"{pid} status", f"no preflight at {argv[0]} to contradict it")
+            continue
+        rc, out = sh(argv)
+        if rc == 0:
+            drift(f"{pid} is declared \"{status}\"",
+                  f"but `{Path(argv[0]).name} {argv[1]}` passes — the declaration is stale")
+        else:
+            agreed(f"{pid}'s declared status matches its preflight")
+    if unverifiable:
+        blind("declared status", "no preflight exists to test these claims: " + ", ".join(unverifiable))
+    agreed(f"checked {len(personas)} roster entries; {swept} made a testable claim about being broken")
+
+
+# ── 4. Every path the roster names must exist ───────────────────────────────────
+def check_roster_paths() -> None:
+    try:
+        personas = json.loads(ROSTER.read_text()).get("personas", [])
+    except Exception as e:                                        # noqa: BLE001
+        return blind("roster paths", f"cannot read {ROSTER}: {type(e).__name__}")
+    missing = []
+    for p in personas:
+        c = p.get("check") or {}
+        if c.get("type") == "command":
+            argv = c.get("argv") or []
+            if argv and not Path(argv[0]).exists():
+                missing.append(f"{p.get('id')} → {argv[0]}")
+    if missing:
+        drift("a persona's declared check does not exist", "; ".join(missing))
+    else:
+        agreed("every declared check command exists on disk")
+
+
+# ── 5. The conversation allowlist against the tools the server really serves ────
+# READ_TOOLS is a list of names in a file. If the server stops serving one, Moses is told he may
+# call something that is not there — and if it serves something new, nobody notices.
+def check_tool_allowlist() -> None:
+    payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+    rc, out = sh(["curl", "-s", "-m", "15", "-X", "POST", MCP_URL,
+                  "-H", "Content-Type: application/json",
+                  "-H", "Accept: application/json, text/event-stream", "-d", payload])
+    if rc != 0 or '"tools"' not in out:
+        return blind("tool allowlist", f"MCP server at {MCP_URL} did not answer")
+    live = set()
+    for line in out.splitlines():
+        line = line.removeprefix("data: ").strip()
+        if line.startswith("{"):
+            try:
+                for t in json.loads(line)["result"]["tools"]:
+                    live.add(t["name"])
+            except Exception:                                     # noqa: BLE001
+                pass
+    if not live:
+        return blind("tool allowlist", "could not parse the server's tool list")
+    try:
+        declared = _declared_tools()
+    except Exception as e:                                        # noqa: BLE001
+        return blind("tool allowlist", f"cannot read conversation.py: {type(e).__name__}: {e}")
+    if not declared:
+        return blind("tool allowlist", "found no tool lists in conversation.py to compare")
+    dangling = {d for d in declared if d and not d.startswith("#")} - live
+    if dangling:
+        drift("Moses is allowed tools the server does not serve", ", ".join(sorted(dangling)))
+    else:
+        agreed(f"every allowlisted tool exists on the server ({len(live)} served)")
+
+
+
+# ── 6. Does the prompt agree with the tools he is actually given? ───────────────
+# 2026-08-22: `knight_start` was granted and shipped, and the system prompt still said "Everything
+# you can reach is read-only. You cannot start a build." Moses obeyed the prompt and told Brad he
+# could not dispatch Knight. The turn log showed `"tools": []` — he never tried. A capability the
+# prompt denies is a capability that does not exist.
+def check_prompt_matches_tools() -> None:
+    try:
+        conv = (SRC / "conversation.py").read_text()
+    except Exception as e:                                        # noqa: BLE001
+        return blind("prompt vs tools", f"cannot read conversation.py: {type(e).__name__}")
+    try:
+        import ast
+        tree = ast.parse(conv)
+        act = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "ACT_TOOLS" for t in node.targets):
+                act = {e.value for e in getattr(node.value, "elts", [])
+                       if isinstance(e, ast.Constant) and isinstance(e.value, str)}
+    except Exception as e:                                        # noqa: BLE001
+        return blind("prompt vs tools", f"cannot parse ACT_TOOLS: {type(e).__name__}")
+
+    # READ THE PROMPT, NOT THE FILE. The first version grepped the whole source and fired on the
+    # COMMENT explaining this very bug, which quotes the old sentence verbatim. A checker that
+    # flags its own documentation is a false positive, and false positives are what get a checker
+    # switched off.
+    try:
+        prompt_text = ""
+        for node in tree.body:
+            if isinstance(node, ast.Assign) and any(
+                    isinstance(t, ast.Name) and t.id == "SYSTEM" for t in node.targets):
+                if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                    prompt_text = node.value.value
+        # The capability paragraph is generated per turn, so include what it can produce.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("_conv_probe", SRC / "conversation.py")
+        # Not imported — executing it would start clients. The generated text is checked by its own
+        # test; here we only need the static half.
+    except Exception as e:                                        # noqa: BLE001
+        return blind("prompt vs tools", f"cannot extract SYSTEM: {type(e).__name__}")
+    if not prompt_text:
+        return blind("prompt vs tools", "could not find the SYSTEM prompt to read")
+
+    denials = ["everything you can reach is read-only", "you cannot start a build",
+               "you are talking, not acting", "you cannot .{0,30}run a command"]
+    import re
+    hits = [d for d in denials if re.search(d, prompt_text, re.I)]
+    if act and hits:
+        drift("the prompt denies capabilities the allowlist grants",
+              f"ACT_TOOLS has {len(act)} tools ({', '.join(sorted(act))}) but the prompt still says: "
+              + "; ".join(hits))
+    elif not act:
+        agreed("no act tools granted, so no prompt contradiction is possible")
+    else:
+        agreed(f"the prompt does not contradict the {len(act)} granted act tools")
+
+
+
+# ── 7. IS ANYTHING RUNNING THAT NOBODY WROTE DOWN? ──────────────────────────────
+#
+# THE INVERSION, and it is the whole reason this check exists. Every other mechanism here — and
+# `arch_check.py` too — validates CLAIMS THE DOCS MAKE. arch_check says so in its own output:
+# "A component nobody documented is invisible to it — no checker can find those." That sentence was
+# written, was true, and named the exact hole nobody then closed.
+#
+# 2026-08-22: `moses-dashboard` — a web service on projects.viatica.travel — appeared in no
+# architecture document at all. It was built days earlier, and the omission survived because
+# everything we had asked "are the written things still true" and nothing asked "is anything here
+# unwritten". Brad: "You build something, it gets documented SOMEWHERE that then gets CHECKED by
+# you, Moses, Knight, everybody before any of you does anything."
+#
+# So this ENUMERATES what is running rather than being handed a list — a list would have the same
+# blind spot one level up, since a component missing from the list is invisible exactly like a
+# component missing from the doc.
+# HAND-WRITTEN architecture only. `infrastructure.md` is deliberately NOT here: it is GENERATED
+# daily by moses-inventory from the running system, so it lists everything automatically and can
+# never show a gap. Counting it as documentation would make this check pass on the very thing it
+# exists to find — it already listed moses-dashboard while no architecture doc mentioned it.
+# Moses's own, plus the operator's other projects from MOSES_ARCH_DOCS (space-separated paths).
+ARCH_DOCS = [
+    str(_env.ROOT / "agent/docs/ARCHITECTURE.md"),
+    str(_env.ROOT / "knight/repo/docs/ARCHITECTURE.md"),
+    *_env.setting("MOSES_ARCH_DOCS").split(),
+]
+
+# Things systemd runs for a desktop session, not things we built. Named explicitly so the list of
+# exclusions is auditable — a prefix rule would silently swallow something of ours one day.
+# WHOSE SERVICE IS IT? Derived from where the unit file lives, never from a list of names.
+#   /usr/lib/systemd/...   the distribution's — not ours to document
+#   /etc/systemd/system    installed here on purpose
+#   /home/brad/.config     a user unit we wrote
+# The first version carried an exclusion list of desktop daemons and flagged 23 OS services on its
+# first run. An exclusion list is the same disease this file treats: something new arrives, nobody
+# adds it, and the checker shouts about the wrong thing until it gets ignored.
+def _is_ours(unit: str, user: bool) -> bool:
+    argv = ["systemctl"] + (["--user"] if user else []) + ["show", unit, "-p", "FragmentPath", "--value"]
+    rc, path = sh(argv, env=USER_ENV if user else None)
+    if rc != 0 or not path.strip():
+        return False
+    return not path.strip().startswith("/usr/lib/")
+
+
+def check_undocumented_components() -> None:
+    corpus = ""
+    read_any = False
+    for d in ARCH_DOCS:
+        try:
+            corpus += Path(d).read_text(errors="ignore").lower()
+            read_any = True
+        except Exception:                                         # noqa: BLE001
+            continue
+    if not read_any:
+        return blind("undocumented components", "could not read any architecture document")
+
+    rc, out = sh(["systemctl", "--user", "list-units", "--type=service", "--state=running",
+                  "--no-legend", "--plain"], env=USER_ENV)
+    if rc != 0:
+        return blind("undocumented components",
+                     "could not list user services — is XDG_RUNTIME_DIR set?")
+    rc2, out2 = sh(["systemctl", "list-units", "--type=service", "--state=running",
+                    "--no-legend", "--plain"])
+    if rc2 != 0:
+        return blind("undocumented components", "could not list system services")
+
+    running = set()
+    for text, user in ((out, True), (out2, False)):
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            unit = line.split()[0]
+            name = unit.removesuffix(".service")
+            if name.startswith(("systemd-", "user@", "session-", "dbus-")):
+                continue
+            if _is_ours(unit, user):
+                running.add(name)
+
+    missing = sorted(n for n in running if n.lower() not in corpus)
+    if missing:
+        drift("running, but in no architecture document",
+              ", ".join(missing) + " — built and never written down; nothing else here can see them")
+    else:
+        agreed(f"all {len(running)} of our running services appear in an architecture document")
+
+
+# ── 8. One copy of each module, across both trees ───────────────────────────────
+# mcp_server.py existed in the agent tree AND the MCP tree, 393 lines apart. The agent copy served 16
+# tools; the process served 34 — and the source is what gets read when someone asks what Moses can
+# do, so Moses was twice described as lacking tools he had had for weeks. Three more modules were
+# duplicated byte-for-byte, which is the same trap with the timer not yet expired.
+#
+# Worse, an installer still copied the stale copy over the live one. That is not drift waiting to
+# happen; it is a downgrade waiting for someone to run a script that already ran once before.
+def check_duplicate_modules() -> None:
+    trees = [SRC, Path(os.environ.get("MOSES_MCP_SRC") or _env.ROOT / "mcp")]
+    missing = [t for t in trees if not t.is_dir()]
+    if missing:
+        blind("duplicate modules", f"tree not found: {', '.join(str(m) for m in missing)}")
+        return
+    seen: dict[str, list[Path]] = {}
+    for t in trees:
+        for f in t.glob("*.py"):
+            if f.name.endswith("_test.py"):
+                continue
+            seen.setdefault(f.name, []).append(f)
+    dupes = {n: ps for n, ps in seen.items() if len(ps) > 1}
+    if not dupes:
+        agreed(f"one copy of each module across {len(trees)} trees")
+        return
+    for name, paths in sorted(dupes.items()):
+        bodies = {p.read_bytes() for p in paths}
+        same = "identical today, which is the trap, not the reassurance" if len(bodies) == 1 \
+            else "AND THEY DIFFER — one of them is being read by somebody"
+        drift("the same module in two trees",
+              f"{name} — {', '.join(str(p) for p in paths)} ({same})")
+
+
+# ── 9. The tracked systemd units vs the ones systemd actually reads ─────────────
+# The repo tracked exactly two unit files and both were wrong: pre-migration copies still pointing at
+# /opt/moses/mcp_server.py, from before the MCP server became a user service. The sixteen units that
+# were really running were tracked nowhere. A stale unit in a repo answers the question confidently,
+# which is worse than not answering it.
+def user_unit_dir() -> Path:
+    """Where the user units actually live — the REPO OWNER's home, not the caller's.
+
+    This used `Path.home()`, which is correct when Brad runs the check by hand and wrong every
+    single morning: the 08:00 standup is a SYSTEM unit, so it runs as root, `Path.home()` resolved
+    to /root, and six user units that were running perfectly well were reported as "the repo
+    describes a unit systemd does not have". That went out to the ops channel daily from 24 August
+    and was believed by nobody, which is the expensive part — a drift report that cries wolf is one
+    people stop reading, and this one is the only thing watching for real drift.
+
+    Derived from who owns the source tree rather than hardcoding a username, so the check is right
+    whoever runs it and does not have to be edited if the framework is used by someone else.
+    """
+    try:
+        return Path(pwd.getpwuid(SRC.stat().st_uid).pw_dir) / ".config/systemd/user"
+    except (KeyError, OSError):
+        return Path.home() / ".config/systemd/user"
+
+
+def check_customs_personas() -> None:
+    """Do the ON-DEMAND persona tools actually reach Customs?
+
+    THIS IS THE CHECK THAT DID NOT EXIST. Big Pipe and Tagilla answer two ways: a scheduled report,
+    which the standup already verifies over curl, and an on-demand MCP tool, which goes through
+    mcp/personas.py over Python's urllib. Cloudflare blocks `Python-urllib` by name, so from the day
+    the domain moved (20 August 2026) every on-demand answer — including every question about money
+    — was "Customs answered HTTP 403", while the scheduled half stayed green and nobody was any the
+    wiser for six days.
+
+    So it calls the REAL client rather than repeating its request here. A copy of the request would
+    have kept passing while the thing it stands for was broken, which is exactly the failure being
+    guarded against.
+    """
+    if not (os.environ.get("VIATICA_APP_URL") or "").strip() or not (os.environ.get("CRON_SECRET") or "").strip():
+        blind("the Customs-backed persona tools",
+              "VIATICA_APP_URL / CRON_SECRET are not in this environment")
+        return
+    personas_py = SRC.parent / "mcp"
+    if not (personas_py / "personas.py").is_file():
+        blind("the Customs-backed persona tools", f"{personas_py}/personas.py is not there")
+        return
+    sys.path.insert(0, str(personas_py))
+    try:
+        import personas                                     # noqa: PLC0415 — optional, by design
+        personas.fetch("support", hours=1)
+        agreed("Big Pipe and Tagilla can still reach Customs on demand")
+    except Exception as e:                                  # noqa: BLE001 — any failure is the point
+        drift("a persona tool cannot reach Customs",
+              f"{type(e).__name__}: {str(e)[:200]}")
+    finally:
+        sys.path.remove(str(personas_py))
+
+
+def check_tracked_units() -> None:
+    tracked_dir = SRC / "systemd"
+    if not tracked_dir.is_dir():
+        blind("tracked systemd units", f"{tracked_dir} does not exist")
+        return
+    pairs: list[tuple[Path, Path]] = []
+    for f in tracked_dir.glob("*.service"):
+        pairs.append((f, user_unit_dir() / f.name))
+    for f in tracked_dir.glob("*.timer"):
+        pairs.append((f, user_unit_dir() / f.name))
+    for f in (tracked_dir / "system").glob("*"):
+        if f.suffix in (".service", ".timer"):
+            pairs.append((f, Path("/etc/systemd/system") / f.name))
+
+    bad = 0
+    for tracked, installed in pairs:
+        if not installed.exists():
+            drift("a tracked unit is not installed",
+                  f"{tracked.name} — the repo describes a unit systemd does not have")
+            bad += 1
+        elif tracked.read_bytes() != installed.read_bytes():
+            drift("a tracked unit no longer matches what runs",
+                  f"{tracked.name} — {installed} is what systemd reads")
+            bad += 1
+
+    # The other direction, and the one that actually bit: a unit that runs and is recorded nowhere.
+    # KEYED BY (SCOPE, NAME), NOT NAME ALONE. A name tracked in one scope used to mask an untracked
+    # unit of the same name in the other — and that is not hypothetical: after Moses moved to a user
+    # unit on 2026-09-02, the repo still held the retired SYSTEM moses.service, so the live USER
+    # moses.service counted as "recorded" and this half of the check never mentioned it. The unit
+    # that actually runs Moses was untracked for a day and the instrument said nothing.
+    have = {(("system" if "/etc/systemd/system" in str(inst) else "user"), t.name)
+            for t, inst in pairs}
+    for scope, d in (("user", user_unit_dir()), ("system", Path("/etc/systemd/system"))):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("moses*")):
+            if f.is_symlink() or f.suffix not in (".service", ".timer"):
+                continue
+            if (scope, f.name) not in have:
+                drift("a running unit is recorded nowhere",
+                      f"{f.name} ({scope}) has no copy in {tracked_dir}")
+                bad += 1
+    if not bad:
+        agreed(f"{len(pairs)} systemd units match their tracked copies")
+
+
+# ── 10. The activity cross-check must not be silently blind ────────────────────
+# project_status exists to compare a project's DECLARED state against what actually happened, and
+# transcript activity is half of "what actually happened". It pointed the database path at its own
+# directory, which is the agent tree; the index is built and read by the MCP tree. It had therefore
+# never found the file. Every project reported "activity: no transcript index" — a caption that reads
+# exactly like a finding — while the database held 75 sessions.
+#
+# The lesson is not the path. It is that a miss returned a caption instead of raising, so the tool
+# went on answering confidently with half its evidence missing. This makes that condition loud.
+def check_activity_index() -> None:
+    import sqlite3
+    db = Path(os.environ.get("MOSES_TRANSCRIPT_DB") or _env.ROOT / "mcp/transcripts.db")
+    if not db.exists():
+        drift("the project activity cross-check is blind",
+              f"{db} does not exist — project_status will report 'no transcript index' for everything")
+        return
+    try:
+        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as c:
+            n = c.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    except Exception as e:                                        # noqa: BLE001
+        blind("project activity index", f"{db} unreadable: {type(e).__name__}: {e}")
+        return
+    if n == 0:
+        drift("the project activity cross-check is blind", f"{db} holds 0 sessions")
+    else:
+        agreed(f"the activity index is readable and holds {n} session(s)")
+
+
+# ── 11 and 12, retired 2026-09-15 ──────────────────────────────────────────────
+# Both read the FILES list in ~/scripts/install-moses-conversation.sh: 11 checked it against /opt/moses,
+# 12 against what listener.py imports. They caught real misses (budget.py, attachments.py, diagnose.py)
+# while the listener ran from that copy. Since 2026-09-02 it runs the source directly, so no manifest
+# decides what runs, and on 2026-09-15 the installer itself was retired: it started the CLI outside the
+# runner. A check of a list nothing reads is a green light measuring nothing.
+
+# THE CHECKS, ADDRESSABLE BY NAME. Whole-sweep was the only way to run any of these, which made
+# every finding un-re-runnable: on 2026-09-02 the standup reported that /opt/moses differed from
+# source, Brad ran the installer at 08:39, asked Moses to confirm it had landed — and Moses could
+# not, because the only thing that performs that comparison runs once a day at 08:00. He said so
+# honestly and was right, which is worse than useless: the answer was one byte-compare away.
+#
+# A finding nobody can re-check on demand is a finding that has to be believed or ignored. Naming
+# the checks is what turns "wait for tomorrow's standup" into an answer now.
+
+def check_work_is_recorded() -> None:
+    """Did the code move without the registry hearing about it?
+
+    THE FAILURE THIS EXISTS FOR (Brad, 2026-09-03): asked what was on today's list, Claude grepped
+    a chat log for it instead of reading the registry, because the registry had never been told.
+    One item — blog write access — was recorded in no system at all, and one Moses idea still asked
+    someone to reconcile /opt/moses, which stopped existing when the listener moved to a user unit.
+    His words: "it's mostly fixed but still a problem through day to day interactions."
+
+    The registry is not wrong because anybody neglected it. It is wrong because updating it was an
+    act of memory, and every other declaration in this estate that depended on memory has already
+    drifted. So this measures the one thing that cannot be forgotten — commits — against the one
+    thing that can.
+
+    A GRACE WINDOW, ON PURPOSE. Work landing and being filed are not simultaneous, and a check that
+    fires while someone is mid-session is a check they will switch off. Nothing is reported until a
+    commit has stood unrecorded for GRACE_HOURS, which puts the first mention at the next morning
+    run rather than ten minutes after a push.
+    """
+    GRACE_HOURS = 12
+    STALE_DAYS = 21
+    try:
+        reg = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    except Exception as e:                                          # noqa: BLE001
+        return blind("work vs registry", f"cannot read {REGISTRY}: {type(e).__name__}")
+
+    now = _dt.datetime.now()
+    checked = unlinked = 0
+    for proj in reg.get("projects", []):
+        repo = proj.get("repo")
+        if not repo:
+            # Only an ACTIVE project owes a repo. An idea or a piece of infrastructure work
+            # legitimately has no checkout, and a permanent "could not check" line for each of them
+            # every morning is the wall of green this tool refuses to print, wearing the other
+            # color. Nine standing lines would bury the one that means something.
+            if proj.get("status") == "active":
+                unlinked += 1
+            continue
+        rp = Path(repo)
+        if not (rp / ".git").exists():
+            blind(f"{proj['id']} repo", f"{repo} is not a git checkout")
+            continue
+        try:
+            out = subprocess.run(["git", "-C", repo, "log", "-1", "--format=%ct%x09%s"],
+                                 capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as e:
+            blind(f"{proj['id']} repo", f"git failed: {type(e).__name__}")
+            continue
+        if out.returncode != 0 or not out.stdout.strip():
+            blind(f"{proj['id']} repo", "git log returned nothing")
+            continue
+        checked += 1
+        epoch, _, subject = out.stdout.strip().partition("\t")
+        commit_at = _dt.datetime.fromtimestamp(int(epoch))
+        age_h = (now - commit_at).total_seconds() / 3600.0
+
+        lc = (proj.get("last_change") or {}).get("at")
+        recorded_at = None
+        if lc:
+            try:
+                recorded_at = _dt.datetime.fromisoformat(lc)
+            except ValueError:
+                recorded_at = None
+
+        if recorded_at is None:
+            drift(f"{proj['id']}: the registry has never been updated for it",
+                  f"newest commit {commit_at:%Y-%m-%d %H:%M} — \"{subject[:60]}\"")
+        elif commit_at > recorded_at and age_h >= GRACE_HOURS:
+            drift(f"{proj['id']}: code moved, the registry did not",
+                  f"commit {commit_at:%Y-%m-%d %H:%M} \"{subject[:50]}\" is newer than the "
+                  f"entry ({recorded_at:%Y-%m-%d %H:%M})")
+        else:
+            agreed(f"{proj['id']}'s registry entry is no older than its newest commit")
+
+        # The other direction: an entry that CLAIMS to be active while nothing has moved either
+        # side. Declared status is the thing this whole tool exists to distrust.
+        if proj.get("status") == "active":
+            idle_days = min((now - commit_at).days,
+                            (now - recorded_at).days if recorded_at else 10 ** 4)
+            if idle_days >= STALE_DAYS:
+                drift(f"{proj['id']} is declared \"active\"",
+                      f"but nothing has moved in {idle_days} days — neither a commit nor the entry")
+
+    if unlinked:
+        # NOT counted as agreement. A project with no repo declared is one this check is blind to,
+        # and the whole point of the tool is that "could not look" never renders as "looked".
+        blind("work vs registry",
+              f"{unlinked} ACTIVE project(s) declare no repo, so their work cannot be compared")
+    if checked:
+        agreed(f"compared {checked} repo(s) against their registry entries")
+
+
+# ── 14. A milestone that says, in its own title, that it already shipped ───────
+# The recency check above compares TIMESTAMPS: was the registry edited more recently than the last
+# commit. It never reads what the entry SAYS, so a registry can be freshly edited and completely
+# wrong and still report "declared matches actual" — which is what it did while the Projects page
+# showed "Delivery chain: … (SHIPPED 2026-09-04)" sitting UNTICKED, and travel-day mode filed as an
+# idea a day after it shipped. Brad, 2026-09-09: "the Projects page is way off as usual."
+#
+# Judging whether work is really done is not something this can do. A milestone CONTRADICTING ITSELF
+# is, and it needs no judgement: the title says shipped on a date, the box is empty. Deliberately
+# narrow — an uppercase SHIPPED/CLOSED immediately followed by an ISO date — because a guard that
+# fires on correct work gets switched off, and prose about shipping is common in these titles.
+_SHIPPED_IN_TITLE = re.compile(r"\b(SHIPPED|CLOSED)\b\s+(\d{4}-\d{2}-\d{2})")
+
+
+def check_milestone_says_shipped() -> None:
+    try:
+        reg = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    except Exception as e:                                          # noqa: BLE001
+        return blind("milestones vs their own text", f"cannot read {REGISTRY}: {type(e).__name__}")
+
+    scanned, bad = 0, []
+    for proj in reg.get("projects", []):
+        for n, m in enumerate(proj.get("milestones", []), 1):
+            scanned += 1
+            if m.get("done"):
+                continue
+            hit = _SHIPPED_IN_TITLE.search(m.get("title", ""))
+            if hit:
+                bad.append(f"{proj['id']} #{n} says {hit.group(1)} {hit.group(2)} but is not ticked")
+    if bad:
+        drift("a milestone contradicts itself",
+              "; ".join(bad) + " — the entry names a ship date and the box is still empty")
+    else:
+        agreed(f"none of the {scanned} milestones claim a ship date while still open")
+
+
+# THE PUBLIC FRAMEWORK FELL 57 COMMITS BEHIND IN 18 DAYS (found 2026-09-21), and nothing said so:
+# work lands here by restarting a service, and the framework's copy and its push were separate,
+# invisible, optional steps. agent/moses-framework-sync --check measures the first gap; `git` measures
+# the second. Both are read here so the standup says it, rather than someone noticing weeks later.
+_GIT_ANY_OWNER = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "safe.directory", "GIT_CONFIG_VALUE_0": "*"}
+
+
+def check_framework_in_step() -> None:
+    fw = Path(_env.setting("MOSES_FRAMEWORK") or _env.ROOT.parent / "moses-framework")
+    sync = _env.ROOT / "agent" / "moses-framework-sync"
+    if not (fw / ".git").exists():
+        return agreed(f"no public framework checkout at {fw} — nothing to keep in step")
+    env = {**os.environ, **_GIT_ANY_OWNER}   # the standup reads this as root; it only reads
+    rc, out = sh([sys.executable, str(sync), "--check", "--quiet", "--framework", str(fw)], env=env)
+    if rc == 0:
+        agreed(f"the public framework matches this tree ({out.strip().split(': ', 1)[-1]})")
+    elif rc == 1:
+        drift("the public framework is behind this tree",
+              f"{out.strip()} — run agent/moses-framework-sync, read the diff in {fw}, commit")
+    else:
+        blind("the public framework", f"moses-framework-sync could not compare: {out.strip()[:200]}")
+    rc, out = sh(["git", "-C", str(fw), "rev-list", "--count", "@{upstream}..HEAD"], env=env)
+    if rc != 0:
+        blind("the public framework's push", f"no upstream to compare against: {out.strip()[:120]}")
+    elif out.strip() != "0":
+        drift("the public framework has commits nobody pushed",
+              f"{out.strip()} commit(s) in {fw} are not on its remote — a push is the only way anyone sees them")
+    else:
+        agreed("every framework commit is on its remote")
+
+
+CHECKS = {
+    "units": check_duplicate_units,
+    "deployed": check_deployed_matches_source,
+    "status": check_declared_status,
+    "roster": check_roster_paths,
+    "allowlist": check_tool_allowlist,
+    "prompt": check_prompt_matches_tools,
+    "components": check_undocumented_components,
+    "modules": check_duplicate_modules,
+    "tracked": check_tracked_units,
+    "activity": check_activity_index,
+    "customs": check_customs_personas,
+    "recorded": check_work_is_recorded,
+    "self-contradiction": check_milestone_says_shipped,
+    "framework": check_framework_in_step,
+}
+
+
+def main() -> int:
+    show_all = "--all" in sys.argv
+    if "--list" in sys.argv:
+        print("checks: " + " ".join(sorted(CHECKS)))
+        return 0
+
+    selected = list(CHECKS.values())
+    if "--only" in sys.argv:
+        i = sys.argv.index("--only")
+        name = sys.argv[i + 1] if i + 1 < len(sys.argv) else ""
+        if name not in CHECKS:
+            # Refusing BY NAME rather than silently sweeping everything. A typo that quietly ran the
+            # full set would report drift the caller never asked about and read as an answer to the
+            # question they did ask.
+            print(f"moses-drift: no check named '{name}'. Have: {' '.join(sorted(CHECKS))}",
+                  file=sys.stderr)
+            return 2
+        selected = [CHECKS[name]]
+        show_all = True      # one check asked for by name should report agreement, not silence
+
+    for fn in selected:
+        try:
+            fn()
+        except Exception as e:                                    # noqa: BLE001
+            blind(fn.__name__, f"the check itself failed: {type(e).__name__}: {e}")
+
+    if DRIFT:
+        print("DRIFT — what Moses declares is not what is running:")
+        for what, detail in DRIFT:
+            print(f"  ✗ {what}\n      {detail}")
+    if BLIND:
+        print("\nCOULD NOT CHECK — this is not the same as agreement:")
+        for what, why in BLIND:
+            print(f"  ? {what} — {why}")
+    if show_all and AGREED:
+        print("\nagreed:")
+        for a in AGREED:
+            print(f"  ✓ {a}")
+    if not DRIFT and not BLIND:
+        n = len(AGREED)
+        print(f"no drift: {n} check{'' if n == 1 else 's'}, declared matches actual")
+    return 1 if DRIFT else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

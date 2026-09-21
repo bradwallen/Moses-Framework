@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# moses-morning — the 08:00 briefing. Now a thin wrapper: the work lives in `moses standup`.
+#
+# This used to hold the logic AND the list of who to call — a hardcoded `for ep in "cfo?period=daily"
+# "support"`. That list was the problem: it made the CALLER the definition of who owes a report, so a
+# persona dropped from it silently stopped being anyone's responsibility. The roster in
+# /etc/moses/personas.json is the definition now, and `moses standup` reads it at runtime.
+#
+# Kept as its own file purely so moses-morning.service needs no edit. Add personas to the roster,
+# never here.
+
+exec /usr/local/bin/moses standup

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""moses-selftest — run every Moses test, and write down what happened for Therapist to report.
+
+    agent/moses-selftest            run them all, write the result, print a one-line summary
+    agent/moses-selftest --print    also print every file's line
+
+WHY THIS EXISTS (Brad, 2026-09-14: "Therapist should check on Moses as part of the daily standup").
+Nothing ran Moses's tests. Viatica's run on every commit and push; Moses had no timer, no hook and no
+script. A test that pinned the old /usr/bin/claude failed 12 checks for a day after that install was
+removed, and nobody was told, because nobody was looking.
+
+This runs as brad from a user timer at 07:30 and writes a result. Therapist reads it at 08:00. She does
+not run the tests herself: she runs as root from the standup, and these tests were written against
+brad's interpreters, state and HOME (the reason she runs `knight doctor` as brad too).
+
+EACH TREE RUNS ON THE INTERPRETER IT RUNS ON IN PRODUCTION. agent/ is the Slack listener's code, so
+its tests run on the listener's venv. mcp/ is the MCP server's and the dashboard's, so its tests run on
+theirs. Using one interpreter for both would test a combination that never runs.
+
+THE LIVE STATE IS OFF LIMITS. Every test gets a temporary MOSES_STATE and a copy of the registry, and
+the real registry is fingerprinted before and after. Tests in this tree have written into live stores
+before (the registry, Knight's job records, a Slack channel); if one does again, that is a failure
+here, whatever the test itself printed.
+
+A FINDING IS NOT A FAULT. Exit 0 when everything passed, 1 when something failed (the unit treats both
+as success, like moses-drift, so a red test is reported rather than a unit that gets disabled), and
+2 when the sweep itself could not run, which must never read as "all passed".
+
+SELFTEST_SABOTAGE=1 adds a test that always fails, to prove the chain from here to Therapist's report
+goes red.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import glob
+import hashlib
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+HOME = Path(os.environ.get("HOME") or Path.home())
+RESULT = Path(os.environ.get("MOSES_SELFTEST_RESULT", HOME / ".local/state/moses/selftest.json"))
+REGISTRY = Path(os.environ.get("MOSES_REGISTRY_LIVE", HOME / ".claude/memory/projects.json"))
+AGENT_PY = os.environ.get("MOSES_AGENT_PY", str(HOME / "moses-venv/bin/python"))
+MCP_PY = os.environ.get("MOSES_MCP_PY", str(REPO / "mcp/venv/bin/python"))
+TIMEOUT_S = 300
+# Fewer than this many test files means the glob or the checkout is wrong, not that there is little to
+# test. A sweep that found nothing would otherwise report "0 failed", which reads as healthy.
+MIN_FILES = 20
+
+
+def _fingerprint(p: Path) -> str | None:
+    try:
+        return hashlib.sha256(p.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _plan() -> list[tuple[str, list[str]]]:
+    """(label, argv) for every test file, each on the interpreter its code runs on in production."""
+    plan = []
+    for f in sorted(glob.glob(str(REPO / "agent/*_test.py"))):
+        plan.append((os.path.relpath(f, REPO), [AGENT_PY, os.path.basename(f)]))
+    for f in sorted(glob.glob(str(REPO / "agent/*_test.sh"))):
+        plan.append((os.path.relpath(f, REPO), ["bash", os.path.basename(f)]))
+    for f in sorted(glob.glob(str(REPO / "mcp/*_test.py"))):
+        plan.append((os.path.relpath(f, REPO), [MCP_PY, os.path.basename(f)]))
+    # THE LIVE TOOL WALL, too (M20). It launches every runner profile against the real CLI and stops at
+    # the opening event, before any model call, so it costs nothing, and it is the only check here that
+    # sees what the CLI actually hands each agent rather than what the code asks for.
+    if (REPO / "agent/tool-wall-probe").is_file():
+        plan.append(("agent/tool-wall-probe", [AGENT_PY, "tool-wall-probe"]))
+    return plan
+
+
+def _last_line(text: str) -> str:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    return (lines[-1] if lines else "(no output)")[:160]
+
+
+def main(argv: list[str]) -> int:
+    verbose = "--print" in argv
+    started = time.time()
+    plan = _plan()
+    work = Path(tempfile.mkdtemp(prefix="moses-selftest-"))
+    sabotage_file = None
+    if os.environ.get("SELFTEST_SABOTAGE") == "1":
+        sabotage_file = work / "sabotage_test.py"
+        sabotage_file.write_text("print('SABOTAGE: this test always fails'); raise SystemExit(1)\n")
+        plan.append(("(sabotage)", [MCP_PY, str(sabotage_file)]))
+
+    state = work / "state"
+    state.mkdir()
+    reg_copy = work / "projects.json"
+    if REGISTRY.is_file():
+        shutil.copy2(REGISTRY, reg_copy)
+    env = dict(os.environ, MOSES_STATE=str(state), MOSES_REGISTRY=str(reg_copy))
+
+    before = _fingerprint(REGISTRY)
+    files = []
+    for label, cmd in plan:
+        cwd = REPO / os.path.dirname(label) if label != "(sabotage)" else work
+        t0 = time.time()
+        try:
+            r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=TIMEOUT_S)
+            rc, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+        except subprocess.TimeoutExpired:
+            rc, out = 124, f"timed out after {TIMEOUT_S}s"
+        except OSError as e:
+            rc, out = 127, f"could not start: {e}"
+        files.append({"file": label, "interpreter": cmd[0], "rc": rc,
+                      "summary": _last_line(out), "seconds": round(time.time() - t0, 1)})
+        if verbose:
+            print(f"  {'PASS' if rc == 0 else 'FAIL'}  {label:<38} {_last_line(out)[:90]}")
+    after = _fingerprint(REGISTRY)
+    shutil.rmtree(work, ignore_errors=True)
+
+    failed = [f for f in files if f["rc"] != 0]
+    real = [f for f in files if f["file"] != "(sabotage)"]
+    could_not_run = len(real) < MIN_FILES
+    untouched = before == after
+    result = {
+        "at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "at_epoch": int(started),
+        "host": socket.gethostname(),
+        "total": len(files),
+        "passed": len(files) - len(failed),
+        "failed": len(failed),
+        "failing": [f"{f['file']}: {f['summary']}" for f in failed],
+        "registry_untouched": untouched,
+        "could_not_run": (f"found only {len(real)} test files (expected at least {MIN_FILES})"
+                          if could_not_run else ""),
+        "seconds": round(time.time() - started, 1),
+        "files": files,
+    }
+    ok = not failed and untouched and not could_not_run
+    result["ok"] = ok
+
+    RESULT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RESULT.with_suffix(".tmp")
+    tmp.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(RESULT)
+
+    line = f"moses-selftest: {result['passed']}/{result['total']} test files pass"
+    if failed:
+        line += f"; FAILING: {', '.join(f['file'] for f in failed)}"
+    if not untouched:
+        line += "; A TEST CHANGED THE LIVE REGISTRY"
+    if could_not_run:
+        line += f"; COULD NOT RUN: {result['could_not_run']}"
+    print(line + f"  ({result['seconds']}s, written to {RESULT})")
+    if could_not_run:
+        return 2
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
