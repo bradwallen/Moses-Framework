@@ -42,7 +42,10 @@ body{margin:0;background:var(--bg);color:var(--ink);
 font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
 padding:28px 18px 60px}
 .wrap{max-width:60rem;margin:0 auto}
-.wide .wrap,.wrap.wide{max-width:82rem}
+.wide .wrap,.wrap.wide{max-width:min(112rem,95vw)}
+/* A 2K widescreen was showing a 1312px column in a field of empty space (Brad, 2026-09-23).
+   The wide pages — Projects, the changelog — now use the room; the narrow ones stay at 60rem
+   because those are prose, and a 1700px line is miserable to read. */
 h1{font-size:1.15rem;letter-spacing:.14em;text-transform:uppercase;margin:0 0 4px}
 .sub{color:var(--mute);font-size:.82rem;margin:0 0 22px}
 .p{background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -118,6 +121,9 @@ letter-spacing:.02em;margin-right:3px}
 .lane .empty{color:var(--mute);font-size:.75rem;font-style:italic;opacity:.6}
 .more{color:var(--mute);font-size:.73rem;padding-top:2px}
 @media(max-width:900px){.board{grid-template-columns:1fr;}}
+@media(min-width:1600px){.board{gap:14px}
+ .grid{grid-template-columns:repeat(auto-fill,minmax(260px,1fr))}
+ .card{font-size:.9rem}}
 .arch{margin-top:26px;color:var(--mute);font-size:.85rem}
 .arch h2{font-size:.72rem;letter-spacing:.14em;text-transform:uppercase;color:var(--mute);margin:0 0 7px}
 .err{border-left:3px solid var(--bad);color:var(--bad)}
