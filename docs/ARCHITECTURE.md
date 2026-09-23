@@ -56,7 +56,7 @@ three ways.
                             │
                             │         CLOUDFLARE                    VIATICA (Railway, "Customs")
                             │         ──────────                    ───────────────────────────
-                            └────────▶ moses.viatica.travel/mcp     /api/cron/cfo     (Big Pipe)
+                            └────────▶ moses.bradwallen.com/mcp     /api/cron/cfo     (Big Pipe)
                                         │  MCP portal + Access      /api/cron/support (Tagilla)
                                         ▼                             ▲
                                        moses-origin.viatica.travel    │
@@ -271,7 +271,7 @@ Moses/Project stuff."*
    projects ▶ localhost:8791      code ─────▶ 100.87.21.18:8080
    code ────▶ 100.87.21.18:8080   moses-origin ▶ 127.0.0.1:8766
    moses ───▶ NOT YET                 │
-                                 moses.viatica.travel = MCP PORTAL, no ingress rule
+                                 moses.bradwallen.com = MCP PORTAL, no ingress rule
 ```
 
 **ADDITIVE, NEVER A CUT-OVER.** Both sets answer simultaneously. Nothing on `viatica.travel` is
@@ -282,7 +282,7 @@ in one place nor the other. The `viatica.travel` rows come out only when `moses`
 
 | object | what it is |
 |---|---|
-| `moses.viatica.travel` | an **MCP Portal** Access application. **No tunnel ingress rule at all.** |
+| `moses.bradwallen.com` | an **MCP Portal** Access application. **No tunnel ingress rule at all.** |
 | `moses-origin.viatica.travel` | the self-hosted origin behind the tunnel, on a **service token** |
 
 The portal is what the Claude app connects to. Moving it means creating both, repointing the
@@ -316,7 +316,7 @@ again — see [[project_labs_decommission_audit]].
 | Application | Type | Policy | Answers |
 |---|---|---|---|
 | `Moses` → `moses` | MCP | `Moses-MCP` (Emails) | who may USE the server's tools |
-| `Moses` → `moses.viatica.travel` | MCP Portal | `Moses-MCP` (Emails) | who may reach the portal |
+| `Moses` → `moses.bradwallen.com` | MCP Portal | `Moses-MCP` (Emails) | who may reach the portal |
 | `moses-origin` → `moses-origin.viatica.travel` | Self-hosted | `Moses MCP origin` (**Service Auth** + service token) | who may reach the tunnel origin |
 
 A service token needs Action `Service Auth`, never `Allow` — an Emails rule can never match a machine.
