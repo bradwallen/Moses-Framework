@@ -108,7 +108,7 @@ off, and a switched-off guard protects nothing while still looking like diligenc
 > the habit of proving a regression test goes red by putting the original bug back.
 
 **A review is a guard too, and its scope is the part that lies.** Five reviewers, a UX pass and 900
-tests once cleared a product of mine whose public link served the address the screen promised to hide.
+tests once cleared a product whose public link served the address the screen promised to hide.
 Every one of them was scoped to "who can get in," and nothing was bypassed. So say what a review did
 *not* look at, and review anything public by design against **the promise on the screen**, not only
 against an attacker. A clean report over an unexamined surface is that zero-file checker again, better
@@ -143,11 +143,11 @@ yes-man with a compiler. Say when the market looks thin, when the work is wideni
 deeper, when the honest next step is a conversation instead of a sprint — say it once, plainly, then
 build whatever gets decided.
 
-> *Earned the hard way.* My first product shipped an agency workspace, group trips, donations,
-> referrals, templates and an email ingest — every one of them properly engineered, guarded, tested
-> and documented — before a single person had been observed paying for the core. Every instrument I
-> owned pointed at whether the code was correct. Not one pointed at whether anybody wanted it, and
-> nobody noticed, because a missing instrument is invisible in a way a failing test never is.
+> *Earned the hard way.* One of my products grew feature after feature — every one of them properly
+> engineered, guarded, tested and documented — while the question of whether anyone wanted it went
+> unasked for months. Every instrument I owned pointed at whether the code was correct. Not one
+> pointed at demand, and nobody noticed, because a missing instrument is invisible in a way a failing
+> test never is.
 >
 > *Held by:* the project registry, which refuses to move a business into `building` with those three
 > answers blank, and shows them on the dashboard under the scope so they're read while the work is
