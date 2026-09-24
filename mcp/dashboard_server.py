@@ -43,6 +43,7 @@ font:15px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-seri
 padding:28px 18px 60px}
 .wrap{max-width:60rem;margin:0 auto}
 .wide .wrap,.wrap.wide{max-width:min(112rem,95vw)}
+.pblock.targeted{outline:2px solid var(--acc,#4c8dff);outline-offset:3px;border-radius:10px}
 /* A 2K widescreen was showing a 1312px column in a field of empty space (Brad, 2026-09-23).
    The wide pages — Projects, the changelog — now use the room; the narrow ones stay at 60rem
    because those are prose, and a 1700px line is miserable to read. */
@@ -304,6 +305,34 @@ def shell(title: str, current: str, body: str, refresh: int | None = None,
  }catch(e){}
 })();
 </script>""".replace("REFRESH_MS", str(int(refresh) * 1000))
+    # A LINK TO A PROJECT SHOULD OPEN THAT PROJECT (Brad, 2026-09-24). The workshop page links to
+    # …/projects#p-<id>, and the browser jumped to the block and left it shut: a parked project renders
+    # closed, so the reader landed on a collapsed summary with no sign anything had happened. This opens
+    # the targeted block and brings it into view, on load and on any later hash change, and again after
+    # the in-place refresh swaps #live (which rebuilds the element the first run opened).
+    #
+    # An enhancement, not a dependency (commandment 6): with script blocked the link still lands on the
+    # right block — it is simply still collapsed, which is exactly today's behavior.
+    target_js = """<script>
+(function(){
+ try{
+  var reveal=function(){
+    var id=(location.hash||"").replace(/^#/,"");
+    if(!id) return;
+    var el=document.getElementById(id);
+    if(!el) return;
+    if(el.tagName==="DETAILS") el.open=true;
+    else { var d=el.closest&&el.closest("details"); if(d) d.open=true; }
+    el.scrollIntoView({block:"start"});
+    el.classList.add("targeted");
+  };
+  if(document.readyState!=="loading") reveal(); else document.addEventListener("DOMContentLoaded",reveal);
+  window.addEventListener("hashchange",reveal);
+  document.addEventListener("live:updated",reveal);
+ }catch(e){}
+})();
+</script>"""
+
     # SEARCH (Brad, 2026-09-11). The box sits OUTSIDE #live on purpose: the in-place refresh replaces
     # #live wholesale, and a box inside it would lose what was typed every two minutes. It re-filters on
     # "live:updated", which the refresh fires after each swap. It is rendered `hidden` and shown by the
@@ -365,7 +394,10 @@ def shell(title: str, current: str, body: str, refresh: int | None = None,
       while(el&&!(el.classList&&el.classList.contains("wk"))){ if(el.hasAttribute&&el.hasAttribute("data-sitem")&&!el.hidden){vis=true;break;} el=el.nextElementSibling; }
       wks[i].hidden=!vis; }
     n.textContent=term?(hits+(hits===1?" match":" matches")):"";
-    try{ history.replaceState(null,"",term?location.pathname+"?q="+encodeURIComponent(q.value):location.pathname); }catch(e){}
+    // KEEP THE FRAGMENT. This ran on load to put the search term in the address, and rewrote the URL
+    // to the bare path — silently dropping #p-<id>, so a link from the workshop straight to a project
+    // lost its target before anything could act on it (2026-09-24).
+    try{ history.replaceState(null,"",(term?location.pathname+"?q="+encodeURIComponent(q.value):location.pathname)+location.hash); }catch(e){}
   }
   q.addEventListener("input",apply);
   document.addEventListener("live:updated",apply);
@@ -379,7 +411,7 @@ def shell(title: str, current: str, body: str, refresh: int | None = None,
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="robots" content="noindex">{meta_refresh}
 <title>{mp.esc(title)}</title><style>{CSS}</style>
-<div class="wrap{" wide" if wide else ""}"><nav>{nav}</nav>{search_html}<main id="live">{body}</main>{live_js}{search_js}
+<div class="wrap{" wide" if wide else ""}"><nav>{nav}</nav>{search_html}<main id="live">{body}</main>{live_js}{search_js}{target_js}
 <footer>Read-only. Ask Moses to change anything — everything here is rendered from the files that own it.</footer>
 </div></html>"""
 

@@ -115,6 +115,21 @@ out.clBody = { changes: await chg(), open: await page.$eval("details.chg", e => 
 await typeQ("");
 out.clCleared = { secs: await secs(), anyOpen: await page.$$eval("details.chg", es => es.some(e => e.open)) };
 
+// A LINK STRAIGHT TO ONE PROJECT opens that project — and the search box must not eat the fragment
+// on the way. It did: replaceState rewrote the address to the bare path on load, so #p-<id> was gone
+// before anything could act on it, and the reader landed on a collapsed block (2026-09-24).
+const deep = await browser.newContext();                 // cold: no history, nothing cached
+const p4 = await deep.newPage();
+await p4.goto(base + "/projects#p-gamma");   // parked, so it renders CLOSED — the link has work to do
+await p4.waitForTimeout(500);
+// The same page WITHOUT the fragment, so "it opened" means the link did it rather than the block
+// having been open all along.
+const p5 = await deep.newPage();
+await p5.goto(base + "/projects");
+await p5.waitForTimeout(200);
+out.deepLink = { open: await p4.$eval("#p-gamma", e => e.open), hash: await p4.evaluate(() => location.hash),
+                 closedByDefault: await p5.$eval("#p-gamma", e => !e.open) };
+
 const nojs = await browser.newContext({ javaScriptEnabled: false });
 const p2 = await nojs.newPage();
 await p2.goto(base + "/projects");
@@ -229,6 +244,11 @@ with tempfile.TemporaryDirectory() as root:
         check("a match in a description opens it", o["clBody"]["changes"] == ["Viatica 1.0"] and o["clBody"]["open"], o["clBody"])
         check("clearing closes what the search opened", o["clCleared"]["secs"] == ["v1.0.1", "v1.0.0", "v0.1.0"]
               and not o["clCleared"]["anyOpen"], o["clCleared"])
+        print("\na link straight to one project")
+        check("that project's block is open on arrival", o["deepLink"]["open"], o["deepLink"])
+        check("the fragment survives the search box's own URL rewrite", o["deepLink"]["hash"] == "#p-gamma", o["deepLink"])
+        check("and it was closed to begin with, so the check means something", o["deepLink"]["closedByDefault"], o["deepLink"])
+
         print("\nwith script blocked")
         check("no box shows at all", o["noJsBox"] is False)
 
