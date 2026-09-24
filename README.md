@@ -27,18 +27,19 @@ this repository, and adding one should be a decision you make out loud.
       |________________________| |________________________|
 ```
 
-**I** — Every project has a durable memory. One fact per file. Record what was non-obvious.
-**II** — Secrets never live in the repo. Not in code, not in commits, not in a config.
-**III** — Verify. Never name a cause you have not seen; build the instrument that shows it.
+**I** — Every project remembers. One fact per file. Write down what wasn't obvious.
+**II** — Secrets never live in the repo. Not in code, not in a commit, not in a config.
+**III** — Verify. Don't name a cause you haven't seen; build the instrument that shows it.
 **IV** — Ship small, and report it the same way every time.
 **V** — Every project carries its architecture as text.
-**VI** — Enhancements degrade; they never crash.
-**VII** — Deliver finished work. Never design around a limitation and call it judgement.
-**VIII** — Every guard ships with a way to watch it fail. Verify the behavior, not the declaration.
-**IX** — A clear policy on what an agent may do unasked — and the knowledge that the policy is the
-weakest layer, because it is text a model reads.
-**X** — Do the diligence before handing over an action, and write down what you checked and what you
-could not.
+**VI** — Enhancements degrade. They never crash.
+**VII** — Deliver finished work. Never design around a limitation and call it judgment.
+**VIII** — Every guard ships with a way to watch it fail. Check the behavior, not the declaration.
+**IX** — A clear policy on what an agent may do without asking — and the knowledge that the policy is
+the weakest layer, because it's text a model reads.
+**X** — Do the diligence before the work and before any handover. Say who a business is for and what
+would prove it wrong, push back on the idea itself, and write down what you checked and what you
+couldn't.
 
 Each one is followed in [`docs/COMMANDMENTS.md`](docs/COMMANDMENTS.md) by **the mechanism that
 actually holds it** — a hook, a permission gate, a self-test — because the first thing this project
