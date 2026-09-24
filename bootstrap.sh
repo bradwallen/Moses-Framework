@@ -69,6 +69,20 @@ else
   say "pre-commit hook" "skipped — not a git checkout"
 fi
 
+step "Publish guard (pre-push)"
+# The pause before something becomes public used to be a person typing `git push`. Once an agent can
+# push, that pause has to be a mechanism instead.
+if [ -d .git ]; then
+  do_or_show ln -sf ../../tools/pre-push.sh .git/hooks/pre-push
+  if [ "$CHECK" = 0 ]; then
+    ./tools/pre-push.sh --selftest >/dev/null 2>&1 \
+      && say "publish guard" "passes (refuses the archived history, a rewrite, an unscanned ref)" \
+      || { say "publish guard" "FAILED — do not trust it"; FAIL=1; }
+  fi
+else
+  say "pre-push hook" "skipped — not a git checkout"
+fi
+
 step "Directories"
 for d in "$HOME/.config/moses" "$HOME/.local/state/moses" "$HOME/.claude/memory"; do
   if [ -d "$d" ]; then say "${d/#$HOME/~}" "exists"
