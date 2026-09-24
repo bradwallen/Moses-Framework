@@ -55,7 +55,63 @@ def milestone_lane(m: dict) -> str:
     st = m.get("state")
     return st if st in MILESTONE_STATES else "next"
 STATUSES = ["active", "parked", "dormant", "scrapped"]
-SETTABLE = ["status", "stage", "rank", "target", "scope", "focus", "next", "phase", "name", "repo"]
+SETTABLE = ["status", "stage", "rank", "target", "scope", "focus", "next", "phase", "name", "repo",
+            "kind", "who_pays", "evidence", "kill_test"]
+
+# ── The demand gate: no business starts building on a hunch ──────────────────
+#
+# WHY (2026-09-24): "I don't always just want a yes-man to build exactly what I want."
+# Drawn from a real product in this estate, which grew feature after feature — every one properly
+# engineered, guarded, tested and documented — while the question of whether anyone wanted it went
+# unasked for months. Every instrument here points at whether the code is CORRECT. Not one pointed
+# at demand, and nobody noticed, because a missing instrument is invisible in a way a failing test
+# never is.
+#
+# So the three questions get asked once, at the moment building starts, and the answers are stored
+# where the dashboard shows them. It is three lines, not a business plan.
+#
+# NOT EVERY PROJECT IS A BUSINESS, and a gate that fires on correct work gets switched off
+# (commandment 8). Housekeeping — this machine's own site, the framework, backups — answers
+# `internal` and walks straight through. The one thing nobody may skip is SAYING WHICH IT IS:
+# "is this actually a business?" is the question that never gets asked out loud.
+#
+# IT REFUSES SILENCE, NOT DOUBT. "Nobody yet, this is a bet" is a valid answer and opens the gate,
+# because a gate that demands a particular answer only teaches people to write that answer.
+KINDS = ["business", "internal"]
+DEMAND_FIELDS = [
+    ("who_pays", "who SPECIFICALLY pays — a named person or a describable role, not 'travelers'"),
+    ("evidence", "what has been OBSERVED that says they want it — behavior, not a hunch"),
+    ("kill_test", "the cheapest test that could prove this wrong, and the result that would kill it"),
+]
+
+
+DEMAND_LABEL = {"who_pays": "pays", "evidence": "proof", "kill_test": "kills it"}
+
+
+def assert_may_build(p: dict) -> None:
+    """Refuse to enter `building` until the demand behind it is on the record.
+
+    Raises with the exact command to answer, because a gate that only says no is a gate people
+    route around — and one nobody can satisfy is one somebody deletes.
+    """
+    kind = (p.get("kind") or "").strip().lower()
+    if kind not in KINDS:
+        raise ProjectError(
+            f"{p['name']} has not said whether it is a business or housekeeping, and building "
+            f"starts here.\n"
+            f"  moses-project set {p['id']} kind business   — someone is meant to pay for this\n"
+            f"  moses-project set {p['id']} kind internal   — housekeeping, no case to make")
+    if kind != "business":
+        return
+    missing = [(f, why) for f, why in DEMAND_FIELDS if not (p.get(f) or "").strip()]
+    if missing:
+        lines = [f"{p['name']} is a business, and {len(missing)} of the three questions that decide "
+                 f"whether it is worth the months are unanswered:"]
+        lines += [f"  {f} — {why}" for f, why in missing]
+        lines.append(f"  moses-project set {p['id']} <field> \"<answer>\"")
+        lines.append("An honest \"nobody yet, this is a bet\" is an answer and opens the gate. "
+                     "Silence is not.")
+        raise ProjectError("\n".join(lines))
 
 # Ranks at or above this are "not in the running order" — finished or abandoned work that should
 # still be listed, but never numbered against live projects.
@@ -380,6 +436,12 @@ def dashboard() -> str:
             out.append(f"       {p['scope']}")
         else:
             out.append("       (no scope yet — still just an idea)")
+        # A business says who pays, right under its scope. Stored and never shown is paperwork:
+        # the answers are only worth collecting if they are in front of whoever is deciding what to
+        # work on. An answer that was never given shows as a gap rather than as nothing at all.
+        if (p.get("kind") or "").strip().lower() == "business":
+            for f, _why in DEMAND_FIELDS:
+                out.append(f"       {DEMAND_LABEL[f]}: {(p.get(f) or '').strip() or '— unanswered —'}")
         if p.get("next"):
             out.append(f"       next: {p['next']}")
         for b in p.get("blockers") or []:
@@ -495,6 +557,12 @@ def update(pid: str, field: str, value: str) -> str:
         raise ProjectError(f"stage must be one of: {', '.join(STAGES)}")
     if field == "status" and value not in STATUSES:
         raise ProjectError(f"status must be one of: {', '.join(STATUSES)}")
+    if field == "kind" and value and value.strip().lower() not in KINDS:
+        raise ProjectError(f"kind must be one of: {', '.join(KINDS)}")
+    # Only a genuine TRANSITION is gated. Re-stating a stage a project already holds asks nobody
+    # anything new, and a guard that fires on a no-op is the kind people learn to talk past.
+    if field == "stage" and value in ("building", "shipped") and p.get("stage") != value:
+        assert_may_build(p)
     if field == "target" and value and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         raise ProjectError("target must be YYYY-MM-DD, or empty to clear it")
     if field == "rank":
@@ -717,9 +785,12 @@ def set_milestone_state(pid: str, n, state: str) -> str:
     m = p["milestones"][k - 1]
     if m.get("done"):
         raise ProjectError(f"{p['name']} {m.get('ref') or n} is already done — undo it first if it is not")
-    m["state"] = state
+    # Marking a milestone "building" IS starting to build, so it is the same door and carries the
+    # same gate. Checked BEFORE the milestone is touched: a refusal must leave nothing half-changed.
     if state == "building" and p.get("stage") in ("idea", "scope", "milestones"):
+        assert_may_build(p)
         p["stage"] = "building"
+    m["state"] = state
     save(d)
     return f"{p['name']}: {m['ref']} {m['title'][:60]} — {MILESTONE_STATE_LABEL[state]}"
 

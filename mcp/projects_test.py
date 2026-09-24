@@ -212,6 +212,9 @@ _L = Path(tempfile.mkdtemp(prefix="projects-lane-")) / "projects.json"
 _L.write_text(json.dumps({"projects": [], "inbox": []}))
 projects.REGISTRY = _L
 projects.add("Lanes", rank=1)
+# Lanes is about which column a milestone sits in, not about demand — so it answers the demand
+# gate's one question for housekeeping and gets on with it. (The gate itself is tested at the end.)
+projects.update("lanes", "kind", "internal")
 projects.add_milestone("lanes", "one")
 projects.add_milestone("lanes", "two")
 projects.add_milestone("lanes", "three")
@@ -361,6 +364,83 @@ projects.remove_idea("", "V7")
 projects.add_idea("viatica", "i-five")
 check("dropping the newest item does not free its number", _v()["ideas"][-1]["ref"] == "V8",
       str(_v()["ideas"][-1]))
+
+
+# ── The demand gate ─────────────────────────────────────────────────────────
+#
+# The gate refuses to let a BUSINESS start building until someone has said who pays, what was
+# observed, and what would prove it wrong. It exists because this estate once ran months of
+# correctness guards with not one instrument aimed at demand.
+#
+# Both halves are under test, and the second is the one that matters more. A gate that fires on
+# housekeeping gets switched off within a week, and a switched-off gate protects nothing.
+seed(id="biz", name="A Business", stage="milestones", kind="", milestones=[{"title": "m1", "done": False}])
+
+try:
+    projects.update("biz", "stage", "building")
+    check("a project with no kind cannot start building", False, "it went through")
+except projects.ProjectError as _e:
+    check("a project with no kind cannot start building",
+          "business" in str(_e) and "internal" in str(_e), str(_e))
+
+projects.update("biz", "kind", "business")
+try:
+    projects.update("biz", "stage", "building")
+    check("a business with no demand answers cannot start building", False, "it went through")
+except projects.ProjectError as _e:
+    check("a business with no demand answers cannot start building",
+          all(f in str(_e) for f, _ in projects.DEMAND_FIELDS), str(_e))
+
+# Partly answered is still refused, and the refusal must name WHICH ones are missing — a gate that
+# says only "no" teaches people to guess.
+projects.update("biz", "who_pays", "a travel agent who books group trips")
+try:
+    projects.update("biz", "stage", "building")
+    check("a half-answered business is refused, naming what is missing", False, "it went through")
+except projects.ProjectError as _e:
+    check("a half-answered business is refused, naming what is missing",
+          "evidence" in str(_e) and "kill_test" in str(_e) and "who_pays" not in str(_e), str(_e))
+
+projects.update("biz", "evidence", "they email a PDF to every client today")
+projects.update("biz", "kill_test", "ask what they would pay; 'nothing' kills it")
+projects.update("biz", "stage", "building")
+check("answered, it goes through", projects.find(projects.load(), "biz")["stage"] == "building")
+
+# THE FALSE-POSITIVE HALF. Housekeeping answers one question and is never asked the other three.
+seed(id="house", name="Housekeeping", stage="milestones", kind="internal",
+     milestones=[{"title": "m1", "done": False}])
+projects.update("house", "stage", "building")
+check("housekeeping walks straight through", projects.find(projects.load(), "house")["stage"] == "building")
+
+# The other door: marking a milestone "building" IS starting to build.
+seed(id="biz2", name="Another Business", stage="milestones", kind="business",
+     milestones=[{"title": "m1", "done": False}])
+try:
+    projects.set_milestone_state("biz2", 1, "building")
+    check("the milestone door carries the same gate", False, "it went through")
+except projects.ProjectError as _e:
+    check("the milestone door carries the same gate", "who_pays" in str(_e), str(_e))
+check("a refused milestone is left untouched",
+      not projects.find(projects.load(), "biz2")["milestones"][0].get("state"),
+      str(projects.find(projects.load(), "biz2")["milestones"][0]))
+
+# And it does not fire twice: a project already building is asked nothing when another milestone
+# starts. The question is "should this be built", which is answered once, not per milestone.
+seed(id="biz3", name="Already Building", stage="building", kind="business",
+     milestones=[{"title": "m1", "done": False}, {"title": "m2", "done": False}])
+projects.set_milestone_state("biz3", 2, "building")
+check("a project already building is not re-interrogated",
+      projects.find(projects.load(), "biz3")["milestones"][1].get("state") == "building")
+
+# Visible, not merely stored.
+seed(id="biz4", name="Shown Business", stage="building", kind="business", who_pays="a travel agent",
+     evidence="they email PDFs today", kill_test="ask what they would pay", milestones=[])
+_dash = projects.dashboard()
+check("the dashboard shows who pays",
+      "pays: a travel agent" in _dash and "proof: they email PDFs today" in _dash, _dash)
+seed(id="biz5", name="Silent Business", stage="building", kind="business", milestones=[])
+check("an unanswered question shows as a gap, not as nothing",
+      "— unanswered —" in projects.dashboard(), projects.dashboard())
 
 
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
