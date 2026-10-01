@@ -55,6 +55,10 @@ MOSES_SAID = moses_said()
 listener.BOT_USER_ID = BOT
 listener.BOT_ID = "B_MOSES"
 listener.OWNER_ID = BRAD
+# The proposal check (scout.py) starts a real model. Off by default; tests that want it stub a verdict,
+# and the background thread runs in-line so its posts land inside the same fire().
+listener.scout.check_target = lambda *a, **k: None
+listener._spawn = lambda fn, *a: fn(*a)
 
 posted: list = []
 history: list = []
@@ -562,12 +566,38 @@ check("PROPOSE the reply still posts", body.startswith("That generalizes."))
 check("PROPOSE it is offered, not filed", "Proposed" in body and len(_prop.pending()) == 1)
 check("PROPOSE nothing is filed against the project yet", not _project_ideas())
 
+
 # Brad confirms with a bare word — one pending, so no id needed.
 reset()
 out = fire({"user": BRAD, "text": "confirm"}, ts="13.2")
 check("CONFIRM a bare confirm files it", out and "Filed" in out[0]["text"])
 check("CONFIRM it reached the project it named",
+
       "make probes emit identity and scope" in _project_ideas())
+
+# ── The proposal is checked against the code before Brad can confirm it (2026-10-01) ──
+# 6848b820 asked to extend a mechanism Atlas has and we do not. A false premise is now withdrawn.
+reset(); clear_proposals()
+_seen = []
+listener.scout.check_target = lambda task, proj: (_seen.append(proj) or
+    {"verdict": "PREMISE_FALSE", "findings": "GAP: there is no coverage assertion here", "files": "", "at": "abc123"})
+stub_conversation(text="Same shape as ours.\nPROPOSE: [moses] add a skip counter to the coverage assertion")
+out = fire({"user": BRAD, "text": "Moses, what do you make of that?"}, ts="13.05")
+_all = " ".join(m.get("text", "") for m in out)
+check("SCOUT the proposal is checked against its own project's code", _seen == ["moses"])
+check("SCOUT a false premise is withdrawn before Brad can confirm it", len(_prop.pending()) == 0)
+check("SCOUT and the thread says why", "Withdrawn" in _all and "no coverage assertion" in _all)
+
+reset(); clear_proposals()
+listener.scout.check_target = lambda task, proj: \
+    {"verdict": "GROUNDED", "findings": "FOUND: diagnose.py:107 has the probes", "files": "agent/diagnose.py", "at": "abc123"}
+stub_conversation(text="Worth doing.\nPROPOSE: [moses] add a mail probe to the diagnosis")
+out = fire({"user": BRAD, "text": "Moses, what do you make of that?"}, ts="13.06")
+_all = " ".join(m.get("text", "") for m in out)
+check("SCOUT a grounded proposal stays pending", len(_prop.pending()) == 1)
+check("SCOUT and names the files it would touch", "agent/diagnose.py" in _all and "GROUNDED" in _all)
+listener.scout.check_target = lambda *a, **k: None
+clear_proposals()
 check("CONFIRM pending is emptied", _prop.pending() == [])
 
 # ONLY BRAD. Jon confirming must do nothing at all.

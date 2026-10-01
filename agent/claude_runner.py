@@ -183,6 +183,15 @@ def _liveness() -> Profile:
                    effort=os.environ.get("MOSES_CHAT_EFFORT", "low"), output="text")
 
 
+def _scout() -> Profile:
+    # Checks an idea against the code before it is proposed or built (agent/scout.py). Read, Grep and
+    # Glob only: it cannot write and cannot run anything — not even git — so what it reports is what the
+    # files say. Sonnet at medium: this is reading and judging, not building.
+    return Profile("moses-scout", model=os.environ.get("MOSES_SCOUT_MODEL", "claude-sonnet-5-5"),
+                   effort=os.environ.get("MOSES_SCOUT_EFFORT", "medium"),
+                   builtins=("Glob", "Grep", "Read"), takes_dirs=True)
+
+
 def _explorer() -> Profile:
     # The browser tool names live in Viatica (src/lib/e2e/explorer.ts), next to the checks that use
     # them. This is the CEILING they must fit inside: a browser tool on one of the explorer's own
@@ -211,6 +220,8 @@ APPS: dict[str, tuple[str, object]] = {
                           "edit would be an author", _reviewer),
     "zryachiy-explorer": ("drives the sandbox's browsers through their own MCP servers, with no "
                           "built-in tool at all", _explorer),
+    "moses-scout": ("reads one repository to check whether an idea's premise exists in the code before "
+                    "it is proposed or built; it can read and search, never write or run", _scout),
 }
 GRANTS_NOTHING = {"moses-diagnosis", "moses-liveness"}
 

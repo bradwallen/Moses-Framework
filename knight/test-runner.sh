@@ -483,6 +483,51 @@ else
     bad "$_posts Slack post(s) were made by this suite — KNIGHT_SLACK_CHANNEL is not being honored"
 fi
 
+hdr "The pre-check — a false premise ends the job before any build (2026-10-01)"
+# 6848b820 asked Knight to extend a mechanism that exists in Atlas's system, not ours. The scout now
+# asks first. KNIGHT_FAKE_SCOUT stands in for its answer, so these cost nothing.
+job=$(start_job env KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='PREMISE_FALSE\nGAP: there is no coverage assertion here' \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" "add a skip counter to the coverage assertion") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$job" ] && wait_done "$job"; then
+    [ "$(cat "$JOBS/$job/status")" = "refused-precheck" ] \
+        && ok "a false premise ends the job as refused-precheck" \
+        || bad "a false premise did not stop the job (status: $(cat "$JOBS/$job/status"))"
+    grep -q "no coverage assertion here" "$JOBS/$job/report.txt" 2>/dev/null \
+        && ok "the report is the scout's finding, not an empty build" \
+        || bad "the refusal's report does not carry what the code actually holds"
+    grep -q "PRE-CHECK" "$JOBS/$job/brief.txt" \
+        && bad "a refused job still briefed a builder" || ok "no builder was briefed"
+else
+    bad "the false-premise job never finished"
+fi
+
+job=$(start_job env KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='GROUNDED\nFILES: agent/diagnose.py' \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" "add a mail probe to the diagnosis") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$job" ] && wait_done "$job"; then
+    [ "$(cat "$JOBS/$job/status")" != "refused-precheck" ] \
+        && ok "a grounded task is built" || bad "a grounded task was refused"
+    head -1 "$JOBS/$job/brief.txt" | grep -q "^PRE-CHECK.*GROUNDED" && grep -q "FILES: agent/diagnose.py" "$JOBS/$job/brief.txt" \
+        && ok "and Knight's brief opens with what the scout found" \
+        || bad "the scout's findings never reached Knight's brief"
+else
+    bad "the grounded job never finished"
+fi
+
+job=$(start_job env KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='COULD_NOT_CHECK\nthe check took longer than 240s' \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" "add a mail probe to the diagnosis") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$job" ] && wait_done "$job"; then
+    [ "$(cat "$JOBS/$job/status")" != "refused-precheck" ] \
+        && ok "a check that could not run does not block the build" || bad "the scout's own outage blocked a build"
+    grep -q "NOT checked against the code" "$JOBS/$job/brief.txt" \
+        && ok "but Knight is told it was not checked, and why" \
+        || bad "an unchecked task reached Knight looking checked"
+else
+    bad "the could-not-check job never finished"
+fi
+
 # ── Verdict ─────────────────────────────────────────────────────────────────
 hdr "Result"
 printf '  %d passed, %d failed\n' "$pass" "$fail"

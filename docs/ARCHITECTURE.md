@@ -713,6 +713,22 @@ chokepoint the same week; the probe is ours, the chokepoint test and the reason 
 
 ## 4c. Knight — the one persona that writes, and deploys
 
+**The scout, at both doors (2026-10-01).** Moses could not read code — his chat profile offers no file tool —
+so every idea he proposed, most of them from Atlas, was judged in prose against his memory. Proposal
+6848b820 asked to extend a coverage assertion that exists in Atlas's system and not in ours, and reached
+Knight before anyone looked. `agent/scout.py` asks one narrow question — does what the task ASSUMES
+already exist? — at the two moments it matters:
+
+```
+  PROPOSING   listener posts the proposal ──▶ background thread ──▶ scout vs the target's checkout
+                                              PREMISE_FALSE/ALREADY_DONE → withdrawn, reason in thread
+                                              GROUNDED → "checked: touches <files>" in thread
+  BUILDING    knight-run, before the builder ──▶ scout vs the clone at the fetched tip (catches drift
+                                              from work done directly in Claude Code) — see the diagram
+```
+A check that could not run never blocks and never passes: it is said, and Knight is told to verify the
+premise himself. The verdict is the first line or it is UNCLEAR (scout_test.py proves prose cannot pass).
+
 ```
   knight_start(task, target) ──▶ knight   preflight: kill switch · 1 concurrent · 8/day
                             │
@@ -722,6 +738,17 @@ chokepoint the same week; the probe is ours, the chokepoint test and the reason 
                             ▼
                         knight-run          (separate script: permission lists are ARRAYS)
                             │
+                    ┌── THE PRE-CHECK (2026-10-01) ─────────────────────┐
+                    │  agent/scout.py --app moses-scout: Read/Grep/Glob │
+                    │  only, against THIS clone as freshly fetched —    │
+                    │  "does what the task assumes exist here?"         │
+                    └───────────────┬───────────────────────────────────┘
+       PREMISE_FALSE / ALREADY_DONE ┴ GROUNDED / UNCLEAR / COULD_NOT_CHECK
+                 │                                │
+       NO BUILD. status refused-precheck,  findings (or "NOT checked, and why")
+       Slack: "🔎 not built — what the     prepended to the builder's brief
+       code actually holds"                       │
+                                                  ▼
               agent/claude-run --app knight-builder   (the one runner; lists from guards.env)
                 → claude -p --model opus --effort high --restricted --permission-mode acceptEdits
                   --tools and --allowedTools built from one declaration

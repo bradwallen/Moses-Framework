@@ -68,6 +68,7 @@ import diagnose  # noqa: E402
 import dispatch  # noqa: E402
 import pacing  # noqa: E402
 import proposals  # noqa: E402
+import scout  # noqa: E402 — checks a proposal against the code before Brad weighs it
 import silence  # noqa: E402
 import knight_notify  # noqa: E402
 
@@ -792,6 +793,10 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
         # Remember which message carried them, so a checkmark on it confirms the right thing.
         for h in held:
             proposals.attach_message(h["id"], (posted or {}).get("ts", ""))
+        # CHECK EACH ONE AGAINST THE CODE before Brad weighs it — after posting, off the reply path, so
+        # a reply is never slower for it. A false premise is withdrawn with the reason; see scout.py.
+        if held:
+            _spawn(_ground, held, say)
         addressing.record_considered(channel, passed=False)
         pacing.record_reply(reactive=machine)
         return
@@ -826,6 +831,43 @@ BOT_ID = ""
 # Recently handled (channel, ts) pairs, bounded. A set would need its own eviction; a list this
 # short is cheaper to reason about than to optimize.
 SEEN: list = []
+def _spawn(fn, *args) -> None:
+    """Run off the event thread. One name so a test can make it synchronous."""
+    threading.Thread(target=fn, args=args, daemon=True, name=fn.__name__).start()
+
+
+def _ground(held: list[dict], say) -> None:
+    """Check each held proposal against its project's code, and say what was found in the thread.
+
+    Brad, 2026-10-01: Moses "tends to ALWAYS lean toward proposing whatever Atlas says and needs to
+    do the due diligence before proposing anything to me". 6848b820 asked to extend a mechanism Atlas
+    has and we do not, and reached Knight before anyone looked. The proposal is still POSTED first —
+    the check takes seconds to minutes, and a reply held hostage to it would be the slower Moses
+    nobody asked for — but a false premise is WITHDRAWN before Brad can confirm it, with the reason.
+    """
+    for h in held:
+        try:
+            r = scout.check_target(h["task"], h.get("project", ""))
+        except Exception as e:                                          # noqa: BLE001
+            r = {"verdict": scout.COULD_NOT_CHECK, "findings": f"{type(e).__name__}: {e}", "at": "?"}
+        if r is None:
+            continue                                   # not a code project: nothing to check against
+        pid, proj = h["id"], h.get("project", "")
+        try:
+            if r["verdict"] in scout.REJECT:
+                proposals.drop([pid])
+                say(f"🔎 *Withdrawn* `{pid}` — I checked it against the {proj} code before asking you: "
+                    f"{scout.one_line(r)}")
+            elif r["verdict"] == scout.COULD_NOT_CHECK:
+                say(f"⚠️ `{pid}` could not be checked against the {proj} code ({r['findings'][:160]}). "
+                    f"Knight checks it again before he builds anything.")
+            else:
+                files = f" · touches {r['files'][:160]}" if r.get("files") else ""
+                say(f"🔎 `{pid}` checked against the {proj} code: {scout.one_line(r)}{files}")
+        except Exception as e:                                          # noqa: BLE001
+            print(f"moses: could not report the check on {pid}: {type(e).__name__}: {e}", flush=True)
+
+
 SEEN_LOCK = threading.Lock()
 
 

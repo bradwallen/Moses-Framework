@@ -47,13 +47,56 @@ RUNNER=$MOSES_ROOT/agent/claude-run
 
 cd "$REPO" || { echo failed > "$DIR/status"; exit 1; }
 
+# ── Check the idea against the code before building it ───────────────────────
+# Brad, 2026-10-01: "when I say to implement it, re-do the homework before tasking Knight, because
+# there can be drift since I work in both Slack and Claude Code." Proposal 6848b820 reached Knight
+# asking him to extend a mechanism that exists in Atlas's system and not in ours; Knight found that
+# out himself, at the last possible moment. Now a read-only scout asks first — against THIS clone,
+# freshly fetched, which is exactly the code about to be built on, so drift cannot slip past it.
+#
+# A false premise or work already done ends the job here: no build, and the report says what the
+# code actually holds. A grounded task hands Knight the findings. A check that could not run does
+# NOT block — it is said, in the brief and in the report, and Knight is told to verify the premise
+# himself. A guard that failed closed on its own outage would be switched off the first week.
+#
+# KNIGHT_FAKE_SCOUT is the test seam: its text stands in for the scout's answer, verdict first.
+precheck_refused=0
+if [ -n "${KNIGHT_FAKE_SCOUT:-}" ]; then
+    printf '%b\n' "$KNIGHT_FAKE_SCOUT" > "$DIR/precheck.txt"
+elif [ -z "${KNIGHT_FAKE_AGENT:-}" ]; then
+    python3 "$MOSES_ROOT/agent/scout.py" --repo "$REPO" --task-file "$DIR/task.txt" \
+        > "$DIR/precheck.txt" 2>> "$DIR/stderr.log" \
+        || printf 'COULD_NOT_CHECK\nthe scout exited non-zero\n' > "$DIR/precheck.txt"
+fi
+if [ -s "$DIR/precheck.txt" ]; then
+    precheck_verdict=$(head -1 "$DIR/precheck.txt")
+    case "$precheck_verdict" in
+      PREMISE_FALSE|ALREADY_DONE)
+          precheck_refused=1 ;;
+      COULD_NOT_CHECK)
+          { printf 'PRE-CHECK: the task was NOT checked against the code before this job (%s). Verify its premise yourself before building, and stop and report if what it assumes is not here.\n\n' \
+                "$(sed -n 2p "$DIR/precheck.txt")"; cat "$DIR/brief.txt"; } > "$DIR/brief.txt.new" \
+              && mv "$DIR/brief.txt.new" "$DIR/brief.txt" ;;
+      *)  { printf 'PRE-CHECK (read-only scout, this checkout as fetched): %s\n' "$precheck_verdict"
+            sed -n '2,$p' "$DIR/precheck.txt"
+            printf 'This is what exists right now. Build from it; if it is wrong, say so in the report.\n\n'
+            cat "$DIR/brief.txt"; } > "$DIR/brief.txt.new" && mv "$DIR/brief.txt.new" "$DIR/brief.txt" ;;
+    esac
+fi
+
 # ── Run the agent ────────────────────────────────────────────────────────────
 # KNIGHT_FAKE_AGENT is a TEST SEAM, not a feature: it substitutes `sleep N` for the model so the
 # timeout/kill/record path can be proven in seconds instead of an hour, and without spending any of
 # Brad's Pro allowance. The wall-clock SIGKILL is the backstop the entire unattended design leans
 # on, and it went a full day untested while `doctor` printed "wall-clock ceiling 60 min" with total
 # confidence — a claim nobody had ever exercised. It gets exercised now.
-if [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
+if [ "$precheck_refused" -eq 1 ]; then
+    # NO BUILD. The scout's findings become the report, in the same result shape the builder writes,
+    # so everything downstream — the report file, the classifier, the Slack post — needs no special case.
+    python3 -c 'import json,sys; json.dump({"result": open(sys.argv[1]).read(), "is_error": False,
+        "permission_denials": []}, open(sys.argv[2], "w"))' "$DIR/precheck.txt" "$DIR/result.json"
+    rc=0
+elif [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
     timeout --signal=TERM --kill-after=5 "$KNIGHT_TIMEOUT_SEC" \
         sleep "$KNIGHT_FAKE_AGENT" > "$DIR/result.json" 2> "$DIR/stderr.log"
     rc=$?
@@ -618,6 +661,7 @@ sys.exit(0 if any(c['status']=='unverified' for c in d['criteria']) else 1)" 2>/
              fi ;;
     *)       echo failed > "$DIR/status" ;;
 esac
+[ "$precheck_refused" -eq 1 ] && echo "refused-precheck" > "$DIR/status"
 date +%Y-%m-%dT%H:%M:%S%z > "$DIR/ended"
 
 # ── Slack ────────────────────────────────────────────────────────────────────
@@ -655,7 +699,10 @@ if [ -r "$OPTENV" ]; then
         # Set from the same conditions as $head rather than asked of the agent in the brief — a
         # label that must be correct is not something to request in prose and hope for.
         ship_label="What this would do"
-        if [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ] && [ -n "${deploy_state:-}" ]; then
+        if [ "$precheck_refused" -eq 1 ]; then
+            head="🔎 *$TARGET → not built* — checked against the code first: *$precheck_verdict*. Nothing was written."
+            ship_label="What the code actually holds"
+        elif [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ] && [ -n "${deploy_state:-}" ]; then
             case "$deploy_state" in
               live)       # LANDED IS NOT DONE. If criteria remain unverified the report says so and
                           # names the ones Brad has to look at himself — the request stays open until
