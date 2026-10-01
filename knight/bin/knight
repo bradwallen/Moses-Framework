@@ -366,7 +366,10 @@ SPEC
             printf 'would change. A red gate ships nothing.\n\n'
         fi
         printf 'Anything uncommitted is thrown away. Commit in coherent steps with real messages.\n'
-        printf 'Run the gate commands above yourself and fix what you break.\n\n'
+        printf 'Run that whole gate yourself with this ONE command, exactly as written — it runs the steps\n'
+        printf 'above in order, the same way the runner will, and is the only way to run them all here:\n'
+        printf '  %s/knight/bin/knight-gate\n' "$MOSES_ROOT"
+        printf 'Shell loops, script files and sh -c are refused, so do not try them. Fix what you break.\n\n'
 
         # The incident, if this job came from one. Deliberately just the id and a sentence: the agent
         # has no network and no credential, so it can neither look it up nor close it. What it can do

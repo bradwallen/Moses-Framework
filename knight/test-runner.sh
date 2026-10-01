@@ -528,6 +528,27 @@ else
     bad "the could-not-check job never finished"
 fi
 
+hdr "knight-gate — the whole gate as one permitted command (2026-10-01)"
+# The brief told Knight to run the gate, and on the Python targets the gate is a loop he may not run.
+KG=$MOSES_ROOT/knight/bin/knight-gate
+SUITE_CLONE=$MOSES_ROOT/knight/repo/zzz-suite
+if [ -d "$SUITE_CLONE/.git" ]; then
+    out=$(cd "$SUITE_CLONE" && "$KG" 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && grep -q "GATE GREEN" <<<"$out" \
+        && ok "inside a Knight clone it runs that target's gate and reports green" \
+        || bad "knight-gate did not run the suite's gate (exit $rc): $(tail -1 <<<"$out")"
+else
+    bad "the suite's clone was never provisioned, so knight-gate could not be exercised"
+fi
+out=$(cd "$SUITE/src" && "$KG" 2>&1); rc=$?
+[ "$rc" -ne 0 ] && grep -q "not a Knight clone" <<<"$out" \
+    && ok "in any other repository it refuses, so it cannot be aimed at a gate it does not belong to" \
+    || bad "knight-gate ran outside a Knight clone (exit $rc)"
+grep -q 'knight/bin/knight-gate)"' "$MOSES_ROOT/knight/guards.env" \
+    && ok "and Knight is permitted to run it" || bad "knight-gate is not on Knight's allow list"
+grep -q 'knight-gate' "$KNIGHT" \
+    && ok "and his brief tells him to use it" || bad "the brief still asks for gate commands he cannot run"
+
 # ── Verdict ─────────────────────────────────────────────────────────────────
 hdr "Result"
 printf '  %d passed, %d failed\n' "$pass" "$fail"

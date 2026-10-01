@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# knight-gate — run this clone's gate exactly as the runner will, as ONE permitted command.
+#
+#   /home/brad/Projects/moses/knight/bin/knight-gate        (from inside a Knight clone)
+#
+# WHY THIS EXISTS (2026-10-01). Knight's brief said "Run the gate commands above yourself" — and for the
+# Python targets the gate IS a shell loop (`fail=0; for t in $(find …); do …`), which his permission
+# list refuses, correctly, because a for-loop is an arbitrary shell program. So every build on those
+# targets was ordered to run a command it was forbidden to run. 24 of 29 builds recorded refusals; on
+# the day this was written every one of the seven was Knight trying to run the gate another way — a
+# loop, a .gate.sh he then could not delete, `xargs sh -c` — and his report said "I wasn't allowed to
+# run the full gate".
+#
+# THIS GRANTS NOTHING NEW. The commands it runs are the target's own KT_GATE, read from the LIVE config
+# in the Moses tree — outside the clone, where Knight cannot edit them — and they are what the runner
+# executes anyway the moment he commits. Running a test file is already running arbitrary code; that is
+# what testing is. What changes is that a wall which only produced wasted turns and scratch files is gone.
+#
+# The target comes from WHERE IT IS RUN, never from an argument or the environment: the working tree must
+# be a clone under knight/repo/<target>. Anything else is refused, so it cannot be pointed at another
+# target's gate or run outside the sandbox.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"
+
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "knight-gate: not inside a git working tree" >&2; exit 2; }
+repos=$(readlink -f "$MOSES_ROOT/knight/repo")
+case "$(readlink -f "$top")" in
+  "$repos"/*) ;;
+  *) echo "knight-gate: $top is not a Knight clone (must be under $repos) — refusing" >&2; exit 2 ;;
+esac
+target=$(basename "$top")
+[[ "$target" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "knight-gate: odd target name '$target' — refusing" >&2; exit 2; }
+env_file="$MOSES_ROOT/knight/targets/$target.env"
+[ -r "$env_file" ] || { echo "knight-gate: no target registry file for '$target'" >&2; exit 2; }
+
+KT_GATE=()
+# shellcheck disable=SC1090
+. "$env_file"
+[ "${#KT_GATE[@]}" -gt 0 ] || { echo "knight-gate: '$target' declares no gate" >&2; exit 2; }
+
+cd "$top" || exit 2
+n=0
+for step in "${KT_GATE[@]}"; do
+    n=$((n+1))
+    echo "== gate step $n/${#KT_GATE[@]}: $step"
+    if ! bash -c "$step"; then
+        echo "GATE RED at step $n — fix this before committing; the runner will stop here too."
+        exit 1
+    fi
+done
+echo "GATE GREEN — all ${#KT_GATE[@]} step(s) passed, exactly as the runner will run them."
