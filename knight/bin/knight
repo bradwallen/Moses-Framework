@@ -228,6 +228,15 @@ ensure_repo() {
     git -C "$REPO" reset -q --hard FETCH_HEAD
     git -C "$REPO" clean -qfd -e node_modules -e .venv
 
+    # MOVE THE CLONE'S OWN MAINLINE LABEL TOO. Every job branched from the freshly fetched tip, but the
+    # local `$KT_BRANCH` ref was set once, at clone time, and never again. By 2026-09-27 Viatica's
+    # read 55 commits behind the real master. The agent, asked to "land this on master", compared
+    # against that label, decided master was missing 55 commits, pulled in a stale "prerequisite",
+    # and turned a two-commit fix into a conflicting rebase — three blocked runs and a human merge
+    # requested for work that was never actually in conflict. Inside the clone, `master` must mean
+    # the mainline as it is now. HEAD is detached here, so moving the ref is always safe.
+    git -C "$REPO" update-ref "refs/heads/$KT_BRANCH" FETCH_HEAD
+
     # Prep comes from the target file, and runs HERE — outside the agent. The sandbox has no network,
     # and more importantly a dev agent that cannot run the test suite is barely worth having. Every
     # prep line is written to be idempotent, so this is cheap when there is nothing to do.
