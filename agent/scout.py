@@ -69,6 +69,11 @@ that does not exist yet is GROUNDED as long as the things it builds ON are real.
 extends or fixes something that is not here — or that works so differently the task cannot be done as
 written — has a false premise. Look before answering; do not answer from the task's own description.
 
+If ACCEPTANCE CRITERIA are included, check each one the same way: a criterion that requires changing
+something that is not in this code, or something we cannot change at all (a third-party or
+browser-injected script, another repository, a hosted service), is a false premise too — name it in GAP.
+A build judged against a criterion that cannot be met is blocked however good the code is.
+
 The FIRST line of your reply must be exactly one of these words and nothing else:
 GROUNDED
 PREMISE_FALSE

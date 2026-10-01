@@ -64,7 +64,11 @@ precheck_refused=0
 if [ -n "${KNIGHT_FAKE_SCOUT:-}" ]; then
     printf '%b\n' "$KNIGHT_FAKE_SCOUT" > "$DIR/precheck.txt"
 elif [ -z "${KNIGHT_FAKE_AGENT:-}" ]; then
-    python3 "$MOSES_ROOT/agent/scout.py" --repo "$REPO" --task-file "$DIR/task.txt" \
+    # The CRITERIA are checked too, not only the task: on 2026-09-27 a criterion asked Knight to guard
+    # code that Brave's browser injects, so the right build was blocked by a ruler nobody could meet.
+    { cat "$DIR/task.txt"; [ -s "$DIR/acceptance.txt" ] && { printf '\n\nACCEPTANCE CRITERIA:\n'; cat "$DIR/acceptance.txt"; }; } \
+        > "$DIR/precheck-input.txt"
+    python3 "$MOSES_ROOT/agent/scout.py" --repo "$REPO" --task-file "$DIR/precheck-input.txt" \
         > "$DIR/precheck.txt" 2>> "$DIR/stderr.log" \
         || printf 'COULD_NOT_CHECK\nthe scout exited non-zero\n' > "$DIR/precheck.txt"
 fi
