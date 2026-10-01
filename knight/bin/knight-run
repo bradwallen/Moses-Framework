@@ -205,6 +205,35 @@ except Exception: pass" > "$DIR/review.txt" 2>/dev/null
 
         review_verdict "$rrc" "$DIR/review.txt"
 
+        # ONE MORE ASK FOR A MISSING VERDICT — asked, never inferred. 2026-10-01: a green build was
+        # thrown away because the review settled six criteria in detail and left out the one word
+        # the runner reads. Guessing CLEAN from that prose would be a model talking its way to a pass;
+        # discarding the build was the opposite waste. So the same reviewer gets the same brief again
+        # with the rule it skipped spelled out, once. Still no verdict: the block stands, said twice.
+        if [ "$rrc" -eq 0 ] && [ "${review_noverdict:-0}" -eq 1 ]; then
+            mv "$DIR/review.txt" "$DIR/review-first.txt"
+            { cat "$DIR/review-brief.txt"
+              printf '\n\nYOUR PREVIOUS REVIEW OF THIS DIFF HAD NO VERDICT LINE, so it could not be read and blocked\n'
+              printf 'the change. Review it again and START with the verdict lines: one CONFIRMED, MISSED or\n'
+              printf 'PLAUSIBLE line per finding, or the single word CLEAN when the change is sound and every\n'
+              printf 'criterion is met. A criterion you cannot judge from the diff is MISSED, naming what you\n'
+              printf 'could not check. Then the SETTLED lines.\n'; } > "$DIR/review-brief-retry.txt"
+            if [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
+                printf '%s\n' "${KNIGHT_FAKE_REVIEW_RETRY:-}" > "$DIR/review.txt"; rrc=0
+            else
+                timeout --signal=TERM --kill-after=15 "$KNIGHT_REVIEW_TIMEOUT_SEC" \
+                    "$RUNNER" --app zryachiy-reviewer --prompt-file "$DIR/review-brief-retry.txt" --add-dir "$DIR" \
+                    > "$DIR/review-retry.json" 2>> "$DIR/review.err"
+                rrc=$?
+                python3 -c "
+import json,sys
+try: sys.stdout.write(json.load(open('$DIR/review-retry.json')).get('result') or '')
+except Exception: pass" > "$DIR/review.txt" 2>/dev/null
+            fi
+            review_verdict "$rrc" "$DIR/review.txt"
+            [ "${review_noverdict:-0}" -eq 1 ] && review_why="$review_why, even after being asked twice"
+        fi
+
         # ── Zryachiy says it himself, in the channel ──────────────────
         # His verdict used to reach Brad only as a clause inside Knight's report, which is
         # the builder announcing his own review. Brad, 2026-09-04: put him in the dev

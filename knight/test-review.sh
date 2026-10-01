@@ -178,5 +178,28 @@ grep -q 'MISSED BLOCKS THE PUSH' bin/knight \
   && ok "and is told MISSED blocks" \
   || bad "the reviewer is not told MISSED blocks"
 
+
+# ── A review with no verdict line is asked once more, never guessed (2026-10-01) ──
+# The real case: six criteria SETTLED in detail, no CLEAN, no MISSED for the seventh. A green build
+# was thrown away and the report claimed the review "returned nothing".
+printf 'SETTLED: 1 — the no-coverage line is inserted first\nSETTLED: 2 — it names the ALWAYS probes\n' > "$TMP/r.txt"
+review_verdict 0 "$TMP/r.txt"
+[ "$review_ok" -eq 0 ] && ok "SETTLED lines alone are still a block — a verdict is never inferred" \
+                       || bad "a review with no verdict line passed"
+[ "${review_noverdict:-0}" -eq 1 ] && ok "and it is flagged as having no verdict, so the runner can ask again" \
+                                   || bad "a missing verdict is not distinguishable from a real block"
+case "$review_why" in *"returned nothing"*) bad "the message still claims the review returned nothing" ;;
+                      *"no verdict line"*) ok "and the message says what is actually missing" ;;
+                      *) bad "unexpected message: $review_why" ;; esac
+printf 'CLEAN\nSETTLED: 1 — x\n' > "$TMP/r.txt"; review_verdict 0 "$TMP/r.txt"
+[ "${review_noverdict:-1}" -eq 0 ] && ok "a review WITH a verdict is not flagged" || bad "a verdict was flagged as missing"
+printf 'MISSED: 6 — cannot judge from the diff\n' > "$TMP/r.txt"; review_verdict 0 "$TMP/r.txt"
+[ "${review_noverdict:-1}" -eq 0 ] && [ "$review_ok" -eq 0 ] && ok "a real MISSED is a block, not a missing verdict" \
+                                   || bad "MISSED was mistaken for a missing verdict"
+grep -q 'review_noverdict:-0}" -eq 1 ] && \[ -z\|"\${review_noverdict:-0}" -eq 1 \]' bin/knight-run \
+  && grep -q 'review-brief-retry.txt' bin/knight-run \
+  && ok "the runner asks the reviewer once more when the verdict is missing" \
+  || bad "the runner no longer retries a review with no verdict"
+
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

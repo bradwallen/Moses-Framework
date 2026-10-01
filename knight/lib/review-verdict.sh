@@ -18,7 +18,7 @@
 # "could not look" has never meant "fine" anywhere else in this estate.
 review_verdict() {
     local rrc=$1 file=$2 body
-    review_ok=1; review_why=""; plausible=""
+    review_ok=1; review_why=""; plausible=""; review_noverdict=0
     # A LINE THAT REPORTS NOTHING IS NOT A FINDING. 2026-09-11: Zryachiy passed Brad's bot-cap change
     # with "CONFIRMED: none — no defects found in the diff." and then CLEAN, and this blocked it for
     # starting with the word CONFIRMED. Nothing shipped; a correct build sat on a branch.
@@ -37,8 +37,12 @@ review_verdict() {
         review_ok=0
         review_why="the review agent exited $rrc — NOT a clean review, so nothing ships"
     elif ! grep -qE '^(CONFIRMED|MISSED|PLAUSIBLE|CLEAN)\b' <<<"$body"; then
-        review_ok=0
-        review_why="the review returned nothing this runner could read — treated as a block, not a pass"
+        # NOT "returned nothing". 2026-10-01: the review settled six of seven criteria in detail and
+        # simply never wrote its verdict line; this message told Brad it had returned nothing at all.
+        # Still a block — a verdict is a line, never inferred from the prose around it — but said
+        # truthfully, and flagged so the runner can ask once more (review_noverdict).
+        review_ok=0; review_noverdict=1
+        review_why="the review gave no verdict line (CLEAN, PLAUSIBLE, CONFIRMED or MISSED) — treated as a block, not a pass"
     elif grep -qE '^CONFIRMED\b' <<<"$body"; then
         review_ok=0
         # The label once, then the findings — this read "review CONFIRMED: CONFIRMED: …" in Slack.
