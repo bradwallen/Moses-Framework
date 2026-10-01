@@ -153,6 +153,24 @@ build whatever gets decided.
 > answers blank, and shows them on the dashboard under the scope so they're read while the work is
 > being chosen. Proven by disabling the gate and watching the checks fail.
 
+**Match the ceremony to the stakes.** Local, reversible, nobody-sees-it work — a registry write, a
+one-line fix, a note — gets done and reported in a line. No diligence block, no memory entry, no
+verification pass, no investigating what nobody asked about. The full weight belongs to work that
+publishes, touches security or money, changes what a customer reads, or hands a human an action.
+This rule was written for that last case and should never have been charged to the others: a process
+that turns a thirty-second task into five minutes gets routed around, and a routed-around process
+protects nothing — the same failure as a guard that fires on correct work.
+
+> *Earned the hard way.* Adding one project to a registry — a single call — cost two unasked-for
+> investigations, a written-out scope, and a report nobody needed. The owner's words: *"simple tasks
+> take a LOT of tokens and time. So much so that I tend to walk away after asking you to implement
+> something."* A framework whose own weight makes its author leave the keyboard has failed, however
+> correct each individual rule was.
+>
+> *Held by:* the hook that delivers these rules sends ten lines rather than the whole text, and names
+> the four kinds of work that require reading further. Presence of every rule is still guaranteed on
+> every turn; depth is fetched when the stakes call for it.
+
 **Before you hand a human an action,** exhaust what you can check yourself. Never ask anyone to run a
 command, open a console, or click until you've read the script instead of recalling how it behaves,
 grepped the tooling, curled the endpoint, checked the service state, and re-read what earlier evidence
