@@ -131,6 +131,12 @@ grep -q 'git printed no error this runner could find' "$RUN" \
   && ok "an unrecognized failure says so rather than guessing" \
   || bad "an unknown rebase failure still asserts a cause"
 
+# The review diff must be the branch's own change. Two dots on a branch behind the mainline shows every
+# newer mainline commit as a revert (2026-09-27: "the diff is against the wrong base").
+grep -q 'diff FETCH_HEAD\.\.\.HEAD > "\$DIR/review.diff"' "$RUN" \
+  && ok "the review diff starts at the merge-base, so a behind branch is reviewed as itself" \
+  || bad "the review diff compares trees again — a behind branch looks like it reverts the mainline"
+
 # 3. THE SKIPPED REVIEW. The review lived inside the successful-rebase branch, so the one class of
 #    build most likely to need eyes was the only class that got none.
 grep -q '^run_review() {' "$RUN" \

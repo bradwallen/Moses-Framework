@@ -133,7 +133,12 @@ run_review() {
     # returns something unparseable, nothing ships and the report says exactly why.
     review_ok=1; review_why=""; plausible=""
     if [ "${regate:-1}" -eq 1 ]; then
-        git -C "$REPO" diff FETCH_HEAD..HEAD > "$DIR/review.diff" 2>/dev/null
+        # THREE dots: from the merge-base, i.e. only what this branch changed. Two dots compares the
+        # two trees, so on a branch behind the mainline — exactly the failed-rebase case, where this
+        # still runs — every newer mainline commit appears as something the branch "reverts". On
+        # 2026-09-27 that made Zryachiy call the evidence unusable and read the files by hand. After a
+        # successful rebase the two are identical, so this costs nothing there.
+        git -C "$REPO" diff FETCH_HEAD...HEAD > "$DIR/review.diff" 2>/dev/null
         if [ -n "${KNIGHT_FAKE_AGENT:-}" ]; then
             # Test seam, same as the builder: exercise the parse and the block/allow paths
             # without spending any of Brad's allowance.
