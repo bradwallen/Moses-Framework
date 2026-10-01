@@ -85,6 +85,9 @@ esac
 # merges a branch as this makes before it pushes one. Two copies would drift, and the drift would
 # be invisible until a branch landed that this runner would have blocked.
 source "$(dirname "$0")/../lib/review-verdict.sh"
+# The stalled-job diagnosis — measured against the real mainline, so a blocked report carries a
+# verdict (re-run vs genuine human merge, with the files) rather than a guess. See the lib's header.
+source "$(dirname "$0")/../lib/diagnose-branch.sh"
 
 # ── Back to whoever asked ────────────────────────────────────────────────────
 # Brad, 2026-09-11, in #the_4_horsemen: "Ping me here when Knight is done." Moses promised it twice
@@ -234,6 +237,8 @@ if [ "$gate_ok" -eq 1 ]; then
     # tip rather than force anything, and re-run the gate afterwards — a clean rebase can still break
     # the build when someone else changed what this code depends on.
     if git -C "$REPO" fetch -q "$KT_PUSH_REMOTE" "$KT_BRANCH" 2>>"$DIR/gate.log"; then
+        # Pinned now: later steps fetch and diff, and FETCH_HEAD is not a stable name to diagnose against.
+        main_sha=$(git -C "$REPO" rev-parse FETCH_HEAD)
         # --autostash BECAUSE THE BUILD DIRTIES THE TREE AND THAT IS NORMAL. 2026-09-04, the
         # first real end-to-end run: `npm install` rewrote package-lock.json (Viatica's committed
         # lockfile disagrees with its package.json), git refused with "cannot rebase: You have
@@ -295,7 +300,10 @@ $plausible" 2>>"$DIR/gate.log" || true
             rb_err=$(tail -20 "$DIR/gate.log" | grep -iE "^(error|fatal|CONFLICT)" | tail -2 | tr '\n' ' ')
             case "$rb_err" in
               *CONFLICT*|*"could not apply"*)
-                    gate_why="$KT_BRANCH moved and the rebase genuinely conflicted — needs a human merge" ;;
+                    # Not "needs a human merge" any more: a rebase replays commit by commit and can
+                    # conflict where the finished change would merge cleanly. The diagnosis below
+                    # decides which, and that verdict is what Brad should be asked to act on.
+                    gate_why="the rebase onto $KT_BRANCH conflicted" ;;
               *"unstaged changes"*|*"local changes"*)
                     gate_why="the rebase could not start: the working tree was dirty ($rb_err)" ;;
               "")   gate_why="the rebase onto $KT_BRANCH failed and git printed no error this runner could find — see gate.log" ;;
@@ -303,6 +311,8 @@ $plausible" 2>>"$DIR/gate.log" || true
             esac
             git -C "$REPO" rebase --abort 2>/dev/null
             rebase_failed=1
+            # MEASURE BEFORE ANYONE IS ASKED. Read-only, no model, no tokens.
+            gate_why="$gate_why · DIAGNOSIS: $(diagnose_branch "$REPO" "$main_sha")"
             # REVIEW IT ANYWAY. Nothing will be pushed — but the diff is readable, and the person
             # who now has to merge by hand should start from a verdict instead of an unreviewed
             # change. Moses, 2026-09-04: "review is wired behind a clean rebase, which means the one

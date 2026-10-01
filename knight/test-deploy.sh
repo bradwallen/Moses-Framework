@@ -118,9 +118,15 @@ grep -q 'rebase -q --autostash FETCH_HEAD' "$RUN" \
 grep -q 'the working tree was dirty' "$RUN" \
   && ok "a dirty tree is reported as a dirty tree" \
   || bad "a dirty tree is still described as a merge conflict"
-grep -q 'genuinely conflicted' "$RUN" \
+grep -q 'the rebase onto $KT_BRANCH conflicted' "$RUN" \
   && ok "and a real conflict is still called a conflict" \
   || bad "a genuine conflict lost its own message"
+# 2026-10-01: a conflicted REPLAY is not the same as a conflicted CHANGE — the clipboard fix sat four
+# days on "needs a human merge" when the finished change merged cleanly. The verdict now comes from a
+# measurement against the real mainline (knight/test-diagnose.sh proves the measurement itself).
+grep -q 'DIAGNOSIS: $(diagnose_branch "$REPO" "$main_sha")' "$RUN" \
+  && ok "a conflicted rebase is diagnosed against the real mainline before anyone is asked" \
+  || bad "a conflicted rebase reaches Brad as a guess again"
 grep -q 'git printed no error this runner could find' "$RUN" \
   && ok "an unrecognized failure says so rather than guessing" \
   || bad "an unknown rebase failure still asserts a cause"

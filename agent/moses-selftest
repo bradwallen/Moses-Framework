@@ -72,6 +72,11 @@ def _plan() -> list[tuple[str, list[str]]]:
         plan.append((os.path.relpath(f, REPO), ["bash", os.path.basename(f)]))
     for f in sorted(glob.glob(str(REPO / "mcp/*_test.py"))):
         plan.append((os.path.relpath(f, REPO), [MCP_PY, os.path.basename(f)]))
+    # Knight's stalled-job diagnosis (2026-10-01). Named rather than globbed: knight/test-*.sh also
+    # holds suites that spend model calls (test-guards runs a real guarded turn), and a daily sweep
+    # must stay free. This one builds throwaway repos and never leaves the machine.
+    if (REPO / "knight/test-diagnose.sh").is_file():
+        plan.append(("knight/test-diagnose.sh", ["bash", "test-diagnose.sh"]))
     # THE LIVE TOOL WALL, too (M20). It launches every runner profile against the real CLI and stops at
     # the opening event, before any model call, so it costs nothing, and it is the only check here that
     # sees what the CLI actually hands each agent rather than what the code asks for.
