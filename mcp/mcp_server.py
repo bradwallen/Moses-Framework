@@ -98,18 +98,63 @@ server = MCPServer(
     ),
 )
 
+# ── A tool that breaks reports the evidence ──────────────────────────────────────────────────────
+# 2026-10-03: knight_jobs raised on every call and Moses got one line back — "can't decode byte 0xe2
+# in position 1184" — with no shell to look further, so he asked Brad to run `xxd`. Every tool is now
+# registered through this wrapper: an exception comes back as a diagnosis (the exception, where in our
+# code, the bytes around a bad one) and is appended to tool-failures.jsonl. It reports on a failure
+# that already happened and runs nothing, so it adds no capability. See tool_diagnosis.py.
+import functools  # noqa: E402
+import tool_diagnosis  # noqa: E402
+from mcp.server.mcpserver.exceptions import ToolError  # noqa: E402
+
+TOOL_FAILURES = _env.STATE / "tool-failures.jsonl"
+_register_tool = server.tool
+
+
+def _diagnosed_tool(*dargs, **dkwargs):
+    register = _register_tool(*dargs, **dkwargs)
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except ToolError:
+                raise                 # already a deliberate, worded refusal
+            except Exception as e:     # noqa: BLE001 — every failure is reported, none is swallowed
+                d = tool_diagnosis.diagnose(fn.__name__, kwargs, e)
+                tool_diagnosis.record(TOOL_FAILURES, d)
+                raise ToolError(tool_diagnosis.render(d)) from e
+        register(wrapper)
+        return fn                     # the module keeps the plain function, so tests call it directly
+    return decorate
+
+
+server.tool = _diagnosed_tool
+
 
 def _run(argv: list[str], limit: int = 8000) -> str:
     """Run a fixed, whitelisted command. Nothing from a tool argument ever reaches a shell."""
     try:
-        # errors="replace": a command's output is evidence, and one undecodable byte must not throw the
-        # whole tool away. 2026-10-03: a title cut mid-character made knight_jobs raise on every call,
-        # so Moses could not read ANY job — an enhancement crashing the content around it (rule 6).
-        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=60)
+        p = subprocess.run(argv, capture_output=True, timeout=60)
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return f"(could not run {argv[0]}: {type(e).__name__})"
-    out = ((p.stdout or "") + (p.stderr or "")).strip() or "(no output)"
-    return out[-limit:] if len(out) > limit else out
+    raw = (p.stdout or b"") + (p.stderr or b"")
+    # A command's output is evidence, and one undecodable byte must not throw the whole tool away
+    # (2026-10-03: a title cut mid-character made knight_jobs raise on every call). The bad byte
+    # becomes U+FFFD — and the output SAYS so, with the bytes around it, because a silent "�" is
+    # a defect in that command nobody would ever be told about.
+    out = raw.decode("utf-8", "replace").strip() or "(no output)"
+    out = out[-limit:] if len(out) > limit else out
+    bad = tool_diagnosis.first_bad_byte(raw)
+    if bad:
+        tool_diagnosis.record(TOOL_FAILURES, {"tool": Path(argv[0]).name, "error": "undecodable output "
+                                              "(shown with U+FFFD; the rest is intact)", "evidence": bad})
+        out += (f"\n\n(note: {Path(argv[0]).name} wrote bytes that are not valid UTF-8 — {bad}. "
+                "The output above is otherwise intact; this is a defect in that command, recorded in "
+                "tool_failures.)")
+    return out
 
 
 def _safe_memory_path(name: str) -> Path | None:
@@ -557,6 +602,16 @@ def knight_land(job_or_branch: str = "", anyway: bool = False) -> str:
     if anyway:
         argv.append("--anyway")
     return _run(argv, limit=4000)
+
+
+@server.tool(
+    description="MOSES: the tools that have broken recently, newest first — which tool, the error, the "
+                "evidence (e.g. the bytes around an undecodable one) and where in the code it was "
+                "raised. Read this when a tool fails or returns odd output, before saying anything about "
+                "why; never ask Brad to run commands to find out."
+)
+def tool_failures(limit: int = 10) -> str:
+    return tool_diagnosis.recent(TOOL_FAILURES, max(1, min(int(limit), 50)))
 
 
 @server.tool(

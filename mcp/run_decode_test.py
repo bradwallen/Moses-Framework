@@ -22,6 +22,10 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import mcp_server  # noqa: E402 — importing does not start the server (it runs only under __main__)
 
+# The bad bytes below are recorded as a tool failure; that record belongs in a scratch ledger, never
+# the live one Moses reads.
+mcp_server.TOOL_FAILURES = Path(tempfile.mkdtemp(prefix="run-decode-test-")) / "tool-failures.jsonl"
+
 fails = []
 
 

@@ -188,6 +188,9 @@ READ_TOOLS = [
     # WHAT SHIPPED BUT IS NOT CONFIRMED. Reading the ledger is free and he needs it constantly — to
     # answer "is that done", to raise open rows unprompted, and to know which ones are Brad's.
     "verification_open",
+    # WHAT BROKE AND THE EVIDENCE. Added 2026-10-03, after knight_jobs failed and his only move was to
+    # ask Brad to run `xxd`. A failing tool now records the bytes and the line; reading that is free.
+    "tool_failures",
 ]
 # ── Acting: allowed ONLY on a turn a human directed ─────────────────────────────
 #
