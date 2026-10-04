@@ -60,6 +60,8 @@ except UnicodeDecodeError as e:
     text, ok = repr(raw), False
 check("a title with a multi-byte character at the cut still decodes cleanly", ok, text[-200:])
 check("the job is still listed", "20990101-000000-1" in text, text[-200:])
+# Atlas, 2026-10-03: assert the exit code, not only the output — iconv exits 1 on the half character.
+check("and knight list exits 0", p.returncode == 0, f"exit {p.returncode}")
 check("and only the first line of a multi-line brief is shown", "second line" not in text, text[-200:])
 
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")

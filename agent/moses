@@ -118,23 +118,101 @@ GRACE=$(jq -r '.grace_factor // 1.5' "$REG")
 # ── Slack ─────────────────────────────────────────────────────────────────────
 # Degrades loudly, like birdeye: with no credentials the message still reaches stderr. A manager whose
 # alert silently doesn't send is the precise failure this layer exists to catch.
-post() {
-  local text="$1"
+#
+# EVERY STANDUP POST IS A RECORD (2026-10-04). The post used to be a fire-and-forget curl at the very
+# end of the run, its outcome echoed to stderr and nowhere else. On 2026-10-04 the roster showed the
+# standup had reported — `record moses` runs before the post — and Slack never got it, and there was
+# nothing readable to say why. (The cause that morning turned out to be `say_msg`, below: the post was
+# never reached. The record is still the right shape — it is what would have said so.) Now each post gets a job directory shaped like Knight's
+# (jobs/<YYYYmmdd-HHMMSS>-<pid>/): message.txt is what was meant to be said, slack.json is Slack's raw
+# answer, and post.json is the outcome —
+#   {posted, http_status, error, attempts, last_attempt[, gave_up]}
+# — which the Knight runner's own fix (6cb33227) is meant to write beside its slack.json too, so one
+# reader can answer "did it reach Slack?" for both.
+STANDUPS="$STATE/standups"
+# Three tries in all: the run that made it and two mornings of sweep. A standup that still has not
+# landed is two days stale, and a token or channel that is wrong for that long needs a person, not a
+# fourth identical attempt every morning forever.
+STANDUP_MAX_ATTEMPTS=${MOSES_STANDUP_MAX_ATTEMPTS:-3}
+
+post_record() {   # post_record DIR POSTED STATUS ERROR ATTEMPTS
+  jq -n --argjson p "$2" --argjson s "$3" --arg e "$4" --argjson n "$5" --argjson t "$(date +%s)" \
+    '{posted:$p, http_status:$s, error:(if $e == "" then null else $e end), attempts:$n, last_attempt:$t}' \
+    > "$1/post.json.tmp" && mv "$1/post.json.tmp" "$1/post.json"
+}
+
+# post_job DIR [PREFIX] — post DIR/message.txt and write DIR/post.json whatever happens. 0 only when
+# Slack answered ok:true.
+post_job() {
+  local dir=$1 prefix=${2:-} n code=000 rc=0 err="" status=null payload
+  n=$(jq -r '.attempts // 0' "$dir/post.json" 2>/dev/null); n=$(( ${n:-0} + 1 ))
+  # Written BEFORE the attempt, so a run killed mid-post (timer timeout, reboot) still leaves an
+  # unposted record for the next sweep instead of nothing — the exact absence this replaced.
+  post_record "$dir" false null "post started and never finished" "$n"
+  : > "$dir/slack.json"
   if [ -z "$SLACK_BOT_TOKEN" ] || [ -z "$SLACK_OPS_CHANNEL" ]; then
+    err="no Slack credentials"
     echo "moses: no Slack credentials — message NOT sent:" >&2
-    echo "--- $text" >&2
-    return 1
+    echo "--- $(cat "$dir/message.txt")" >&2
+  else
+    payload=$(jq -n --arg c "$SLACK_OPS_CHANNEL" --arg t "$prefix$(cat "$dir/message.txt")" \
+      --arg u "$MOSES_NAME" --arg e "$MOSES_EMOJI" \
+      '{channel:$c, text:$t, username:$u, icon_emoji:$e, unfurl_links:false}')
+    code=$(curl -sS --max-time 20 -o "$dir/slack.json" -w '%{http_code}' \
+      -X POST https://slack.com/api/chat.postMessage \
+      -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
+      -H "Content-type: application/json; charset=utf-8" --data "$payload" 2>"$dir/curl.err"); rc=$?
+    [[ "$code" =~ ^[1-9][0-9][0-9]$ ]] && status=$code   # 000 is curl's "no answer", not a status
+    if [ "$rc" -ne 0 ]; then
+      err="curl exited $rc: $(tr '\n' ' ' < "$dir/curl.err")"
+    elif [ "${code:0:1}" != 2 ]; then
+      err=$(head -c 2000 "$dir/slack.json")   # a proxy or Slack outage: the body, whatever it is
+    elif ! jq -e '.ok == true' "$dir/slack.json" >/dev/null 2>&1; then
+      # Slack answers 200 with ok:false for most refusals (channel_not_found, invalid_auth).
+      err=$(jq -r '.error // empty' "$dir/slack.json" 2>/dev/null)
+      [ -n "$err" ] || err=$(head -c 2000 "$dir/slack.json")
+    fi
+    rm -f "$dir/curl.err"
   fi
-  local payload resp
-  payload=$(jq -n --arg c "$SLACK_OPS_CHANNEL" --arg t "$text" \
-    --arg u "$MOSES_NAME" --arg e "$MOSES_EMOJI" \
-    '{channel:$c, text:$t, username:$u, icon_emoji:$e, unfurl_links:false}')
-  resp=$(curl -sS --max-time 20 -X POST https://slack.com/api/chat.postMessage \
-    -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-    -H "Content-type: application/json; charset=utf-8" --data "$payload" 2>&1)
-  jq -e '.ok' <<<"$resp" >/dev/null 2>&1 && return 0
-  echo "moses: Slack rejected the message: $(jq -r '.error // .' <<<"$resp" 2>/dev/null)" >&2
+  if [ -z "$err" ]; then
+    post_record "$dir" true "$status" "" "$n"
+    return 0
+  fi
+  post_record "$dir" false "$status" "$err" "$n"
+  echo "moses: standup ${dir##*/} NOT posted (HTTP ${status/null/none}, attempt $n): $err" >&2
   return 1
+}
+
+# standup_post TEXT — the standup's one way to speak, so no path can post without leaving a record.
+standup_post() {
+  local dir; dir="$STANDUPS/$(date +%Y%m%d-%H%M%S)-$$"
+  # An unwritable state dir must not cost the message itself: post it unrecorded and say so.
+  mkdir -p "$dir" || { echo "moses: cannot record the standup at $dir — posting it unrecorded" >&2; dir=$(mktemp -d); }
+  printf '%s' "$1" > "$dir/message.txt"
+  post_job "$dir"
+}
+
+# Re-posts every earlier standup that did not land, before today's is generated, so a missed morning
+# arrives late and labeled rather than not at all. A record with no post.json counts as unposted. Past
+# STANDUP_MAX_ATTEMPTS it is given up on, said once in the journal, and marked so it is not said again.
+standup_sweep() {
+  local dir n why when
+  for dir in "$STANDUPS"/*/; do
+    dir=${dir%/}
+    [ -r "$dir/message.txt" ] || continue
+    jq -e '.posted == true or .gave_up == true' "$dir/post.json" >/dev/null 2>&1 && continue
+    n=$(jq -r '.attempts // 0' "$dir/post.json" 2>/dev/null); n=${n:-0}
+    why=$(jq -r '.error // "no outcome recorded"' "$dir/post.json" 2>/dev/null); why=${why:-no outcome recorded}
+    if [ "$n" -ge "$STANDUP_MAX_ATTEMPTS" ]; then
+      echo "moses: giving up on standup ${dir##*/} after $n attempts — last error: $why" >&2
+      jq '.gave_up = true' "$dir/post.json" > "$dir/post.json.tmp" && mv "$dir/post.json.tmp" "$dir/post.json"
+      continue
+    fi
+    when=$(date -d "@$(stat -c %Y "$dir/message.txt")" '+%a %b %-d, %H:%M')
+    post_job "$dir" "_Late — the standup from $when did not reach Slack then (${why:0:120})._
+
+" || true
+  done
 }
 
 human_ago() {
@@ -289,7 +367,8 @@ run_periodic() {
 # richer trigger language would be a second scheduler to debug, and a scheduler nobody debugs fails
 # silently — which is the exact failure this is meant to prevent.
 DEFERRED_FILE=$OP_HOME/.claude/memory/deferred.md
-DEFERRED_STATE=/var/lib/moses/deferred-surfaced
+# Under $STATE (/var/lib/moses unless overridden) so a test run never writes the live file.
+DEFERRED_STATE=$STATE/deferred-surfaced
 
 # Emits one "id<TAB>title<TAB>why" line per item that is due now. Silence means nothing is due.
 deferred_due() {
@@ -382,6 +461,8 @@ cmd_deferred() {
 cmd_standup() {
   local failures="" overdue="" id name detail
 
+  standup_sweep
+
   for id in $(ids); do
     case "$(pfield "$id" '.check.type')" in
       self|none|"") continue ;;   # self = the manager; none = acts on request, nothing to poll
@@ -445,15 +526,19 @@ $line"
   fi
 
   if [ -z "$failures" ] && [ -z "$overdue" ] && [ -z "$gap" ] && [ -z "$drift" ]; then
-    # A clean standup normally says nothing, and that restraint is correct. A deferred decision is
-    # not an exception though — it is a reminder — and a quiet morning is exactly when one would
-    # otherwise stay buried. So it is worth breaking the silence for, and only for.
-    if [ -n "$deferred" ]; then
-      say_msg "🗓️ *Worth revisiting*$deferred"
-      return 0
-    fi
-    echo "moses: standup clean — nothing to report (by design)"
-    return 0
+    # A CLEAN MORNING SAYS SO, IN ONE LINE (Brad, 2026-10-04). It used to say nothing, on the theory
+    # that silence meant all clear. It also meant crashed: this path called `say_msg`, which has never
+    # existed, and on 2026-09-20, 09-21 and 10-04 the standup died on "command not found", exited 0,
+    # and #ops looked exactly like a quiet morning. Nobody noticed until Brad asked where it was.
+    # Birdeye and Therapist already post one line when all is well; now the standup does too, so its
+    # absence means something. A due deferred decision rides along under it.
+    local clear
+    clear="✅ *Standup* — all clear ($(ids | wc -w) on the roster, everyone inside cadence, no drift)"
+    [ -n "$deferred" ] && clear+="
+
+🗓️ *Worth revisiting*$deferred"
+    standup_post "$clear"
+    return
   fi
 
   local msg="📋 *Standup — someone's behind*"
@@ -499,7 +584,7 @@ _Who owns what: \`moses roster\` · ask @Moses in Slack._"
 
 🗓️ *Worth revisiting*$DEFERRED_TAIL"
 
-  post "$msg"
+  standup_post "$msg"
 }
 
 cmd_status() {

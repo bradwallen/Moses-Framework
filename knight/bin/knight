@@ -611,6 +611,11 @@ cmd_list() {
         printf '  %-24s %-8s %s\n' "$(basename "$d")" "$(cat "$d/status" 2>/dev/null)" "$(head -n1 "$d/task.txt" 2>/dev/null | head -c 60 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)"
     done
     [ "$any" -eq 0 ] && echo "  no jobs yet"
+    # Said explicitly: the line above returns 1 whenever there ARE jobs, so `knight list` exited 1 on
+    # every normal call (found 2026-10-04 testing Atlas's question). iconv's own nonzero exit on a cut
+    # character is harmless — its output is an argument to printf, whose status is the one that counts.
+    # Not `cut -c`: the coreutils here cuts by byte too, and splits the em dash exactly as head -c did.
+    return 0
 }
 
 cmd_cancel() {
