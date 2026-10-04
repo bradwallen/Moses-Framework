@@ -102,7 +102,10 @@ server = MCPServer(
 def _run(argv: list[str], limit: int = 8000) -> str:
     """Run a fixed, whitelisted command. Nothing from a tool argument ever reaches a shell."""
     try:
-        p = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        # errors="replace": a command's output is evidence, and one undecodable byte must not throw the
+        # whole tool away. 2026-10-03: a title cut mid-character made knight_jobs raise on every call,
+        # so Moses could not read ANY job — an enhancement crashing the content around it (rule 6).
+        p = subprocess.run(argv, capture_output=True, text=True, errors="replace", timeout=60)
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return f"(could not run {argv[0]}: {type(e).__name__})"
     out = ((p.stdout or "") + (p.stderr or "")).strip() or "(no output)"

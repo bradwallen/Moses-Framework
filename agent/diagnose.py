@@ -254,9 +254,35 @@ def _run(argv: list[str], limit: int = 2500, label: str = "", target: str = "") 
     return out, coverage(argv, out, p.returncode, label, target)
 
 
-def gather(alarm: str) -> str:
-    """Collect evidence for this alarm. Fixed probes only, selected by keyword."""
-    low = (alarm or "").lower()
+def uncovered(alarm: str) -> str:
+    """The one line that says no keyword picked a probe for this alarm, and what ran instead.
+
+    Therapist's "no mail sent or delivered in 7 days" was diagnosed "unclear" four mornings running
+    (#ops 2026-09-24..27) on uptime and disk alone — nothing looked at mail, and nothing said so. A
+    diagnosis that ran nothing relevant read exactly like one that looked and found nothing.
+
+    The alarm is redacted BEFORE it is cut, so a token cannot survive by being truncated mid-match, and
+    flattened to one line, so an alarm carrying its own "VERDICT: ..." line cannot become the verdict
+    parse_verdict() reads off the posted report.
+    """
+    said = " ".join(redact(alarm if isinstance(alarm, str) else "").split())
+    if len(said) > 100:
+        said = said[:99] + "…"
+    ran = ", ".join(label for label, _, _ in ALWAYS)
+    return (f"⚠️ *No probe covers this alarm* — \"{said or '(no alarm text)'}\" matched no targeted "
+            f"check; only {ran} ran, so this verdict rests on host health, not on what the alarm reports.")
+
+
+def gather(alarm: str) -> tuple[str, str]:
+    """Collect evidence for this alarm. Fixed probes only, selected by keyword.
+
+    Returns (evidence, gap). GAP is "" when a keyword picked at least one probe, and otherwise the
+    uncovered() line — returned separately as well as written into the evidence, because a line only
+    in the evidence reaches Brad only if the model chooses to repeat it. diagnose() posts it itself.
+    The ALWAYS probes still run either way: this labels the gap, it does not narrow the coverage.
+    """
+    text = alarm if isinstance(alarm, str) else ""   # a non-text alarm degrades to "nothing matched"
+    low = text.lower()
     seen: set[str] = set()
     parts: list[str] = []
     for keys, label, argv, note, target in PROBES:
@@ -269,10 +295,13 @@ def gather(alarm: str) -> str:
             block += f"_Limitation: {note}_\n"
         block += "```\n" + out + "\n```"
         parts.append(block)
+    gap = "" if seen else uncovered(text)
+    if gap:
+        parts.append(f"### no probe covers this alarm\n{gap}")
     for label, argv, target in ALWAYS:
         out, cov = _run(argv, limit=600, label=label, target=target)
         parts.append(f"### {label}\n{cov}\n```\n{out}\n```")
-    return "\n\n".join(parts)
+    return "\n\n".join(parts), gap
 
 
 SYSTEM = """You are Moses, diagnosing an alarm raised by one of Brad Allen's monitoring personas on
@@ -375,21 +404,31 @@ def is_alarm(text: str) -> bool:
 
 
 def diagnose(alarm: str, alarm_by: str = "a persona") -> tuple[str, float]:
-    """Produce a diagnosis for one alarm. Returns (report, cost). Never changes anything."""
-    evidence = gather(alarm)
-    prompt = (f"{alarm_by} raised this alarm:\n\n```\n{redact(alarm)[:2000]}\n```\n\n"
+    """Produce a diagnosis for one alarm. Returns (report, cost). Never changes anything.
+
+    When gather() found no probe for the alarm, its line leads the report — prefixed here, from what
+    gather() knows, never left to the model. The listener posts the report as-is, so it is the first
+    thing under "Diagnosis" in Slack. An empty report stays empty: nothing is posted for it today.
+    """
+    text = alarm if isinstance(alarm, str) else ""
+    evidence, gap = gather(text)
+    prompt = (f"{alarm_by} raised this alarm:\n\n```\n{redact(text)[:2000]}\n```\n\n"
               f"Evidence gathered just now on the server:\n\n{evidence}")
+
+    def flagged(report: str) -> str:
+        return f"{gap}\n{report}" if gap and report else report
+
     try:
         data = _invoke(prompt)
     except subprocess.TimeoutExpired:
         return "", 0.0
     except Exception as e:
-        return f":warning: couldn't diagnose — {type(e).__name__}: {str(e)[:140]}", 0.0
+        return flagged(f":warning: couldn't diagnose — {type(e).__name__}: {str(e)[:140]}"), 0.0
 
     cost = float(data.get("total_cost_usd") or 0.0)
     if data.get("is_error"):
         return "", cost
-    return redact((data.get("result") or "").strip()), cost
+    return flagged(redact((data.get("result") or "").strip())), cost
 
 
 if __name__ == "__main__":          # `python3 diagnose.py tally`

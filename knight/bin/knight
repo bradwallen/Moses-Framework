@@ -602,9 +602,13 @@ print('  ' + (d.get('result') or '(no text)').replace(chr(10), chr(10)+'  ')[:25
 
 cmd_list() {
     local any=0 d
+    # TITLES ARE CUT BY CHARACTERS, NOT BYTES. `head -c 60` counts bytes, so a title with an em dash
+    # at byte 60 was cut mid-character (e2 80 …) and the MCP tool that reads this list crashed on
+    # decode (2026-10-03, "Docs-only job: write docs/stripe-live-mode-checklist.md —"). iconv -c drops a
+    # partial trailing character whatever the locale; first line only, so a multi-line brief stays one row.
     for d in $(ls -1dr "$JOBS"/*/ 2>/dev/null | head -15); do
         any=1
-        printf '  %-24s %-8s %s\n' "$(basename "$d")" "$(cat "$d/status" 2>/dev/null)" "$(head -c 60 "$d/task.txt" 2>/dev/null)"
+        printf '  %-24s %-8s %s\n' "$(basename "$d")" "$(cat "$d/status" 2>/dev/null)" "$(head -n1 "$d/task.txt" 2>/dev/null | head -c 60 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)"
     done
     [ "$any" -eq 0 ] && echo "  no jobs yet"
 }

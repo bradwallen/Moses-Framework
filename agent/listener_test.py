@@ -475,6 +475,7 @@ check("CAP other personas' posts do not count as his own replies", len(out) == 1
 # ── PHASE 1: diagnose an alarm, never fix it ────────────────────────────────
 os.environ["MOSES_ALARM_CHANNELS"] = OPS
 _diag_calls = []
+_real_diagnose = listener.diagnose.diagnose     # captured before stub_diagnose() replaces it
 
 
 def stub_diagnose(report="VERDICT: false-alarm\nSUMMARY: the remote is fine", cost=0.13):
@@ -528,6 +529,21 @@ reset()
 listener.diagnose.diagnose = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
 out = fire_in(OPS, {**THERAPIST, "text": ":warning: not ready"}, ts="12.7")
 check("DIAG a crash degrades to silence, not a broken post", out == [])
+
+# "No probe covers this alarm" must reach the POST, not only the evidence the model reads. The real
+# diagnose(), with only the probes and the model stubbed — and a model that never mentions the gap.
+reset()
+listener.diagnose.diagnose = _real_diagnose
+_orig_run, _orig_dinvoke = listener.diagnose._run, listener.diagnose._invoke
+listener.diagnose._run = lambda argv, limit=2500, label="", target="": ("ok", f"_coverage: {label}_")
+listener.diagnose._invoke = lambda prompt: {"result": "VERDICT: unclear\nSUMMARY: host is fine", "total_cost_usd": 0}
+try:
+    out = fire_in(OPS, {**THERAPIST, "text": ":warning: *Therapist* — no mail sent or delivered in 7 days"}, ts="12.8")
+finally:
+    listener.diagnose._run, listener.diagnose._invoke = _orig_run, _orig_dinvoke
+check("DIAG an uncovered alarm's post leads with the gap",
+      out and out[0]["text"].startswith("🟡 *Diagnosis* — ⚠️ *No probe covers this alarm*"))
+check("DIAG and still carries the model's verdict", out and "VERDICT: unclear" in out[0]["text"])
 
 # ── PROPOSE → confirm → file. The model never writes. ───────────────────────
 import proposals as _prop  # noqa: E402
