@@ -320,6 +320,56 @@ check("SAFE the parser itself never writes anything",
       len(proposals.pending()) == 3)
 
 
+# ── "confirm both", and a confirm followed by prose (Brad, 2026-10-05) ──────
+# "Confirm both - go ahead and task Knight" matched nothing and was silently conversation.
+def _two_proposed_after_an_older_one():
+    _fresh_registry()
+    old = proposals.add("an older pending thing about billing", "C_CHAT", project="viatica")
+    proposals.attach_message(old["id"], "100.1")
+    a = proposals.add("make getPage error on a miss", "C_CHAT", project="moses")
+    b = proposals.add("keep unlabeled articles in filtered results", "C_CHAT", project="moses")
+    proposals.attach_message(a["id"], "200.1")
+    proposals.attach_message(b["id"], "200.1")
+    return old, {a["id"], b["id"]}
+
+old, pair = _two_proposed_after_an_older_one()
+for msg in ["Confirm both - go ahead and task Knight", "confirm both", "both confirmed", "yes both please",
+            "Confirm both."]:
+    action, items, _ = proposals.resolve(msg)
+    check(f"BOTH {msg!r} confirms the pair just proposed, not the older one",
+          action == "confirm" and {i["id"] for i in items} == pair)
+action, items, _ = proposals.resolve("confirm all - go ahead")
+check("BOTH 'confirm all' with trailing prose confirms all", action == "confirm" and len(items) == 3)
+for msg in ["confirm all but the second", "confirm both, not the labels one", "confirm both - only the first"]:
+    check(f"BOTH {msg!r} may exclude something, so it asks", proposals.resolve(msg)[0] == "ambiguous")
+for msg in ["yes both are wrong", "confirm bothering", "both of those are good points", "ok both seem off to me"]:
+    check(f"BOTH {msg!r} is conversation, not a confirm", proposals.resolve(msg)[0] == "none")
+_fresh_registry()
+x = proposals.add("one thing", "C_CHAT", project="viatica"); proposals.attach_message(x["id"], "1.1")
+y = proposals.add("another unrelated thing", "C_CHAT", project="viatica"); proposals.attach_message(y["id"], "2.1")
+z = proposals.add("a third separate thing", "C_CHAT", project="viatica"); proposals.attach_message(z["id"], "3.1")
+check("BOTH with no pair to point at, it asks", proposals.resolve("confirm both")[0] == "ambiguous")
+
+
+# ── A proposal that could not be stored is never offered for confirmation (2026-10-05) ────────
+# Tagged with a repo name instead of a project, two proposals were posted as pending, Moses said
+# they were filed, and the confirm had nothing to find. Real add() calls, real render().
+_fresh_registry()
+ok_item = proposals.add("Fix the thing", "C_CHAT", project="viatica")
+lost = proposals.add("Make getPage return isError on a miss", "C_CHAT", project="some-repo-name")
+nothing = proposals.add("A task with no project", "C_CHAT", project="")
+check("UNFILED an unknown project is not stored", lost.get("unfiled") and len(proposals.pending()) == 1)
+note, held = proposals.render([ok_item, lost, nothing], len(proposals.pending()))
+check("UNFILED only the stored one is offered", [h["id"] for h in held] == [ok_item["id"]])
+offered = note.split("Not filed")[0]
+check("UNFILED the lost ones are not under 'say the word'",
+      "isError" not in offered and "no project" not in offered.lower())
+check("UNFILED the post says they were not filed, and why",
+      "Not filed" in note and "some-repo-name" in note and "no project given" in note)
+only_lost, none_held = proposals.render([lost], 0)
+check("UNFILED nothing stored means nothing to confirm", none_held == [] and "say the word" not in only_lost)
+
+
 # ── State handling ─────────────────────────────────────────────────────────
 _TESTREG.write_text("not json at all")
 check("STATE a corrupt file degrades to empty, it does not crash", proposals.pending() == [])

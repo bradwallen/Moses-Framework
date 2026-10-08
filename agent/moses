@@ -525,6 +525,11 @@ $line"
     fi
   fi
 
+  # THIS OPERATOR'S OWN SECTIONS (agent/local-standup, absent from the framework): whatever it prints
+  # is added to the briefing. Run as the operator, like everything else the standup runs from the tree.
+  local localsect=""
+  [ -f "$MOSES_ROOT/agent/local-standup" ] && { localsect=$(as_op "$MOSES_ROOT/agent/local-standup" 2>/dev/null) || localsect=""; }
+
   if [ -z "$failures" ] && [ -z "$overdue" ] && [ -z "$gap" ] && [ -z "$drift" ]; then
     # A CLEAN MORNING SAYS SO, IN ONE LINE (Brad, 2026-10-04). It used to say nothing, on the theory
     # that silence meant all clear. It also meant crashed: this path called `say_msg`, which has never
@@ -537,6 +542,9 @@ $line"
     [ -n "$deferred" ] && clear+="
 
 🗓️ *Worth revisiting*$deferred"
+    [ -n "$localsect" ] && clear+="
+
+$localsect"
     standup_post "$clear"
     return
   fi
@@ -583,6 +591,9 @@ _Who owns what: \`moses roster\` · ask @Moses in Slack._"
   [ -n "${DEFERRED_TAIL:-}" ] && msg="$msg
 
 🗓️ *Worth revisiting*$DEFERRED_TAIL"
+  [ -n "$localsect" ] && msg="$msg
+
+$localsect"
 
   standup_post "$msg"
 }

@@ -215,6 +215,11 @@ def search(query: str, limit: int = 12, db: Path = DB) -> str:
         out.append(f"\n[{(ts or '')[:16]}] {role} — {title or '(untitled)'}  ({project})")
         out.append(f"   {' '.join(snip.split())}")
         out.append(f"   session {sid[:8]} #{seq}")
+    # SNIPPETS ON PURPOSE, AND SAID SO. Every message is stored in full; this shows a window around the
+    # match. On 2026-10-05 a reader took the snippets for the whole store, went to the raw files for
+    # full text, and told Brad his messages weren't in the database. They all were.
+    out.append("\nThese are snippets. Every message is stored in full: read_session('<session>', "
+               "start=<#>, count=1) returns one whole, untruncated.")
     return "\n".join(out)
 
 
@@ -250,7 +255,8 @@ def read_session(session_id: str, start: int = 1, count: int = 30, db: Path = DB
     c.close()
     out = [f"{meta[0] or '(untitled)'} — {meta[1]}, started {(meta[2] or '')[:16]}"]
     for seq, role, text in rows:
-        body = text if len(text) < 1200 else text[:1200] + " …[truncated]"
+        # One message asked for is one message given, whole: it is how an exact quote is taken.
+        body = text if (count == 1 or len(text) < 1200) else text[:1200] + " …[truncated: count=1 gives it whole]"
         out.append(f"\n#{seq} {role}:\n{body}")
     return "\n".join(out)
 

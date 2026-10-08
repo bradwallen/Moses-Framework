@@ -267,15 +267,34 @@ def save(d: dict) -> None:
 
 
 def find(d: dict, pid: str) -> dict:
+    """The project named by its id, its code, its exact name, or ONE unambiguous piece of its name.
+
+    The partial-name pass used to return the FIRST project whose name contained the text, so "DO",
+    Docs over MCP's own code, resolved to "Donate Labs the…" (2026-10-05) and anything filed against
+    it would have landed on the wrong project without a word. Codes are checked before names now, and
+    a partial match that fits more than one project is refused with the candidates named.
+    """
     pid = (pid or "").strip().lower()
-    for p in d["projects"]:
+    if not pid:
+        raise ProjectError("which project? none was named")
+    projects = d["projects"]
+    for p in projects:
         if p["id"] == pid:
             return p
-    # Second pass on the NAME, because someone speaking to Moses says "the whitepaper", not an id.
-    for p in d["projects"]:
-        if pid and pid in p.get("name", "").lower():
+    for p in projects:                              # its code: "DO", "V", "M"
+        if (p.get("key") or "").lower() == pid:
             return p
-    known = ", ".join(x["id"] for x in d["projects"])
+    for p in projects:
+        if p.get("name", "").strip().lower() == pid:
+            return p
+    # Last, a piece of the name, because someone speaking to Moses says "the whitepaper", not an id.
+    hits = [p for p in projects if pid in p.get("name", "").lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if hits:
+        names = ", ".join(f"{p['id']} ({p['name'].strip()})" for p in hits)
+        raise ProjectError(f"'{pid}' matches more than one project: {names}. Name one by its id.")
+    known = ", ".join(x["id"] for x in projects)
     raise ProjectError(f"no project matching '{pid}'. Known: {known}")
 
 

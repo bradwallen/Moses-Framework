@@ -95,6 +95,15 @@ _VERB = (r"(?:confirm|affirm|approve|accept|file|do it|file it|ship it|make it s
 CONFIRM = re.compile(rf"^\s*{_VERB}(?:\s+(all|[0-9a-f]{{6,8}}))?\s*[.!]*\s*$", re.I)
 # "confirm all" said the other way round, e.g. "all confirmed".
 CONFIRM_ALL = re.compile(rf"^\s*(?:all\s+{_VERB}(?:ed)?|{_VERB}\s+all)\s*[.!]*\s*$", re.I)
+# "confirm both" / "both confirmed", and "confirm all" / "confirm both" FOLLOWED BY PROSE, e.g. Brad's
+# "Confirm both - go ahead and task Knight" (2026-10-05), which matched nothing: the whole-message
+# rules above refused it, so his confirm was silently ordinary conversation. The trailing words are
+# allowed because they add no condition, and refused (asked about) when they might: "confirm all
+# but the second" must never file the second.
+CONFIRM_SET = re.compile(rf"^\s*(?:{_VERB}\s+(all|both)|(all|both)\s+{_VERB}(?:ed)?)(?=$|[\s,.;:!—–-])(.*)$",
+                         re.I | re.S)
+_NARROWING = re.compile(r"\b(?:not|except|but|only|without|don'?t|no|exclude|excluding|skip|other than|"
+                        r"first|second|third|last|one of)\b", re.I)
 DISMISS = re.compile(r"^\s*(?:no|nope|drop it|forget it|cancel|dismiss|skip it|not that one)"
                      r"(?:\s+([0-9a-f]{6,8}))?\s*[.!]*\s*$", re.I)
 
@@ -299,6 +308,27 @@ def resolve(text: str) -> tuple[str, list[dict], str]:
     if CONFIRM_ALL.match(text or ""):
         return "confirm", items, ""
 
+    m = CONFIRM_SET.match(text or "")
+    if m:
+        which = (m.group(1) or m.group(2) or "").lower()
+        rest = m.group(3) or ""
+        # The rest must be a separate clause ("- go ahead", ", thanks") or just "please". Run on with
+        # no break ("yes both are wrong") and it is a sentence about the proposals, not a confirm.
+        if _NARROWING.search(rest):
+            return "ambiguous", items, ""       # the rest of the sentence may exclude something: ask
+        if not re.match(r"^\s*(?:$|please\b|[,.;:!—–-])", rest, re.I):
+            return "none", [], ""
+        if which == "all":
+            return "confirm", items, ""
+        # "both" is the pair just proposed: the newest proposal message, if it carried exactly two.
+        newest = max((it.get("msg_ts") or "") for it in items)
+        batch = [it for it in items if (it.get("msg_ts") or "") == newest] if newest else []
+        if len(batch) == 2:
+            return "confirm", batch, ""
+        if len(items) == 2:
+            return "confirm", items, ""
+        return "ambiguous", items, ""
+
     m = CONFIRM.match(text or "")
     if m:
         arg = (m.group(1) or "").lower()
@@ -499,3 +529,31 @@ def summary() -> str:
     if not items:
         return "nothing pending"
     return " · ".join(f"`{it['id']}` {it['task'][:60]}" for it in items)
+
+
+def render(results: list[dict], pending_count: int) -> tuple[str, list[dict]]:
+    """The note posted under a reply that proposed work, and the proposals that were actually HELD.
+
+    A proposal add() could not store comes back `unfiled`: no project, or one the registry does not
+    know. It used to be posted exactly like a held one ("say the word and I'll file them"), so on
+    2026-10-05 two proposals tagged with a repo name instead of a project were shown as pending,
+    Moses said they were "filed against DO", and Brad's confirm had nothing to find. An unfiled
+    proposal now says so, with the reason, and is never offered for confirmation.
+    """
+    held = [r for r in results if not r.get("duplicate") and not r.get("unfiled")]
+    lost = [r for r in results if r.get("unfiled")]
+    note = ""
+    if held:
+        note += "\n\n📋 *Proposed — say the word and I'll file " + ("them" if len(held) > 1 else "it") + ":*"
+        for h in held:
+            note += f"\n   • `{h['id']}`  {h['task']}"
+            if h.get("related"):   # overlaps something already tracked: shown, never suppressed
+                note += f"\n     _↳ close to an open item: {h['related'][:110]}_"
+        note += "\n_React ✅, or reply `confirm`" + (" / `confirm all`" if pending_count > 1 else "") + "._"
+    if lost:
+        note += "\n\n⚠️ *Not filed — nothing to confirm:*"
+        for r in lost:
+            why = r.get("error") or ("no project given" if not r.get("project") else f"no project named '{r['project']}'")
+            note += f"\n   • {r['task']}\n     _↳ {why}. Propose it again against a project from the list._"
+    return note, held
+

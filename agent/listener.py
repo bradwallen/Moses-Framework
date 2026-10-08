@@ -67,6 +67,10 @@ import conversation  # noqa: E402
 import diagnose  # noqa: E402
 import dispatch  # noqa: E402
 import pacing  # noqa: E402
+try:  # this operator's own Slack commands (agent/local_commands.py), kept out of the framework
+    import local_commands  # noqa: E402
+except ImportError:
+    local_commands = None
 import proposals  # noqa: E402
 import scout  # noqa: E402 — checks a proposal against the code before Brad weighs it
 import silence  # noqa: E402
@@ -465,6 +469,16 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
     # nobody re-says a bot's name to agree with it. Matching is whole-message and only ever
     # against something already pending, so ordinary conversation never reaches it.
     if event.get("user") == OWNER_ID and not machine:
+        # THIS OPERATOR'S OWN COMMANDS (agent/local_commands.py, absent from the framework). match()
+        # returns (what to say now, the work to run) or None. The work runs off the event thread, since
+        # it may take minutes, and its answer is posted here.
+        local = local_commands.match(raw) if local_commands else None
+        if local:
+            ack, work = local
+            say(ack)
+            _spawn(_local_run, say, work)
+            return
+
         # An explicit instruction naming ids, possibly several and possibly mixed. Tried first
         # because the whole-message matcher below refuses these, and refused them silently.
         acts = proposals.parse_actions(raw)
@@ -775,18 +789,13 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
         for r in results:
             if r.get("duplicate"):
                 print(f"moses: skipped a duplicate of pending `{r['id']}`", flush=True)
-        held = [h for h in results if not h.get("duplicate")]
+        add_note, held = proposals.render(results, len(proposals.pending()))
+        note += add_note
         if held:
-            note += "\n\n📋 *Proposed — say the word and I'll file " + \
-                    ("them" if len(held) > 1 else "it") + ":*"
-            for h in held:
-                note += f"\n   • `{h['id']}`  {h['task']}"
-                # Overlaps something already tracked. Shown, never suppressed — the call is Brad's.
-                if h.get("related"):
-                    note += f"\n     _↳ close to an open item: {h['related'][:110]}_"
-            note += ("\n_React ✅, or reply `confirm`" +
-                     (" / `confirm all`" if len(proposals.pending()) > 1 else "") + "._")
             print(f"moses: proposed {len(held)} task(s), awaiting Brad", flush=True)
+        for r in results:
+            if r.get("unfiled"):
+                print(f"moses: proposal NOT filed ({r.get('error') or 'no such project: ' + repr(r.get('project'))})", flush=True)
 
         print(f"moses: replied ({who}, ${spent:.4f})", flush=True)
         posted = say((value + note).strip() or note.strip())
@@ -831,6 +840,15 @@ BOT_ID = ""
 # Recently handled (channel, ts) pairs, bounded. A set would need its own eviction; a list this
 # short is cheaper to reason about than to optimize.
 SEEN: list = []
+def _local_run(say, work) -> None:
+    """Run one of the operator's own commands and say what it returned. Never raises into the thread."""
+    try:
+        say(work())
+    except Exception as e:                                                # noqa: BLE001
+        print(f"moses: local command failed ({type(e).__name__}: {e})", flush=True)
+        say(f"⚠️ That didn't work: {e}")
+
+
 def _spawn(fn, *args) -> None:
     """Run off the event thread. One name so a test can make it synchronous."""
     threading.Thread(target=fn, args=args, daemon=True, name=fn.__name__).start()

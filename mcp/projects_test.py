@@ -443,5 +443,29 @@ check("an unanswered question shows as a gap, not as nothing",
       "— unanswered —" in projects.dashboard(), projects.dashboard())
 
 
+# ── Finding a project by its code, never by the first name that contains it (2026-10-05) ──────
+# "DO" is Docs over MCP's code, and the partial-name pass returned "Donate Labs the…" because it
+# came first. Anything filed against "DO" would have landed on the wrong project in silence.
+_reg = {"projects": [
+    {"id": "donate-labs-the", "name": "Donate Labs the server", "key": "DL"},
+    {"id": "docs-over-mcp", "name": "Docs over MCP demo", "key": "DO"},
+    {"id": "whitepaper", "name": "Agentic whitepaper", "key": "W"},
+]}
+check("FIND a project's code finds it, ahead of any name containing those letters",
+      projects.find(_reg, "DO")["id"] == "docs-over-mcp" and projects.find(_reg, "do")["id"] == "docs-over-mcp")
+check("FIND the exact name finds it", projects.find(_reg, "Docs over MCP demo")["id"] == "docs-over-mcp")
+check("FIND one unambiguous piece of a name still works", projects.find(_reg, "whitepaper")["id"] == "whitepaper")
+try:
+    projects.find(_reg, "d")
+    check("FIND a piece matching two names is refused, not guessed", False)
+except projects.ProjectError as e:
+    check("FIND a piece matching two names is refused, not guessed",
+          "donate-labs-the" in str(e) and "docs-over-mcp" in str(e), str(e))
+try:
+    projects.find(_reg, "some-repo-name")
+    check("FIND a repo name that is no project is refused", False)
+except projects.ProjectError:
+    check("FIND a repo name that is no project is refused", True)
+
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

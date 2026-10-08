@@ -225,6 +225,16 @@ APPS: dict[str, tuple[str, object]] = {
 }
 GRANTS_NOTHING = {"moses-diagnosis", "moses-liveness"}
 
+# OPERATOR-LOCAL APPS. Agents that are one operator's own business rather than the framework's are
+# declared in agent/local_apps.py, which framework.map keeps private.
+# It hands back {app: (reason, builder)} built from this module's Profile, and gets the same rules as
+# everything above: a grant must say why, and nothing outside this module builds a command line.
+try:
+    import local_apps as _local_apps
+    APPS.update(_local_apps.apps(Profile))
+except ImportError:
+    pass
+
 
 def check_reasons(apps: dict | None = None) -> None:
     for app, (reason, _builder) in (APPS if apps is None else apps).items():
