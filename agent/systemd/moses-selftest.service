@@ -1,5 +1,5 @@
 [Unit]
-Description=Moses — run every Moses test and record the result for Therapist's 08:00 report
+Description=Moses — run every Moses test and record the result for the health report
 
 [Service]
 Type=oneshot

@@ -103,8 +103,8 @@ def capture(intent: Intent, memory: Path = MEMORY) -> str:
     # deleted — "Moses, add X to my list" is a thing he says, and silence would look like a bug.
     if intent.target != "ideas":
         return ("There's no general to-do list any more — tasks live on a project. Tell me which one "
-                "(\"add it to Viatica\") and I'll file it there, or say it as an idea and I'll "
-                "capture it for later.")
+                f"(\"add it to {_env.product_name()}\") and I'll file it there, or say it as an "
+                "idea and I'll capture it for later.")
 
     # ONE STORE, AND IT IS THE REGISTRY. This wrote to memory/ideas.md, a flat file beside the
     # Projects page rather than in it — and it died exactly the way the to-do list above died: two

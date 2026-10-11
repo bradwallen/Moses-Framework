@@ -97,11 +97,11 @@ DENY_COMMANDS: list[tuple[str, str, str]] = [
     # The Claude API rule. Belt-and-braces with the network sandbox: this catches the intent in a
     # readable way, deniedDomains catches the packet.
     (r"\bapi\.anthropic\.com\b", "api.anthropic",
-     "agents must not call the Claude API directly — cost and Viatica rate-limit interference"),
+     "agents must not call the Claude API directly — cost, and interference with the product's rate limits"),
     (r"(^|/)(claude|ant)\s", "api.cli",
      "the claude/ant CLIs spend against the API outside the agent's metered budget"),
     (r"/(itinerary/(generate|import)|api/ingest|api/slack/command)\b", "api.viatica",
-     "these Viatica routes invoke Claude — calling them costs money and can disturb itinerary parsing"),
+     "these product routes invoke Claude — calling them costs money and can disturb itinerary parsing"),
 
     # Git history rewriting on published work.
     (r"\bgit\b.*\bpush\b.*(--force|-f)\b", "git.force",
@@ -236,7 +236,7 @@ def check(tool_name: str, tool_input: dict) -> Verdict:
         if re.search(r"\bapi\.anthropic\.com\b", url, re.I):
             return Verdict("deny", "api.anthropic", "agents must not call the Claude API directly")
         if re.search(r"/(itinerary/(generate|import)|api/ingest|api/slack/command)\b", url, re.I):
-            return Verdict("deny", "api.viatica", "that Viatica route invokes Claude")
+            return Verdict("deny", "api.viatica", "that product route invokes Claude")
         return Verdict("allow", "web.fetch", "read-only web fetch")
 
     for key in ("file_path", "path", "notebook_path"):

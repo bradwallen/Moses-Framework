@@ -160,7 +160,7 @@ async def run(
         return AgentRun(
             error=("No agent credential in /etc/moses/agents.env, so I won't run this — falling back "
                    "to your personal CLI login would be spending on your account without asking. "
-                   "Add ANTHROPIC_API_KEY there (a key of its own, not Viatica's) to enable research."),
+                   "Add ANTHROPIC_API_KEY there (a key of its own, not the product's) to enable research."),
             stopped_reason="no_credential",
         )
 

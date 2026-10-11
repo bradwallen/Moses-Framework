@@ -96,6 +96,19 @@ MEMORY = Path(setting("MOSES_MEMORY_DIR") or HOME / ".claude" / "memory")
 STATE = Path(setting("MOSES_STATE") or HOME / ".local" / "state" / "moses")
 
 
+def product_name() -> str:
+    """What the operator's product is called, for prompt and message text: MOSES_PRODUCT_NAME, else
+    "the product". Read live, so a test or a restarted service sees the current setting."""
+    return setting("MOSES_PRODUCT_NAME", "the product").strip() or "the product"
+
+
+def product_label() -> str:
+    """The product's name with MOSES_PRODUCT_DESCRIPTION after it in parentheses, when there is one —
+    for the sentence that introduces the product to a model. Just the name otherwise."""
+    desc = setting("MOSES_PRODUCT_DESCRIPTION").strip()
+    return f"{product_name()} ({desc})" if desc else product_name()
+
+
 def claude_cli() -> str:
     """The `claude` CLI: MOSES_CHAT_CLI, else ~/.local/bin/claude (a per-user install, which updates
     without root — how the author runs it), else whatever PATH finds, else that per-user path anyway so

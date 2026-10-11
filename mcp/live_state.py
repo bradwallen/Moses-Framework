@@ -12,7 +12,7 @@ from __future__ import annotations
 import json, os, time, urllib.request
 
 CONF = os.path.expanduser("~/.config/moses/customs.env")
-CACHE = "/tmp/moses-viatica-state.json"
+CACHE = "/tmp/moses-product-state.json"
 CACHE_TTL = 120  # seconds — the page is refreshed by humans, not polled
 
 
@@ -40,7 +40,9 @@ def fetch(timeout: float = 8.0) -> dict | None:
         pass
 
     c = _conf()
-    base, secret = c.get("VIATICA_APP_URL", "").rstrip("/"), c.get("CRON_SECRET", "")
+    # MOSES_APP_URL is the name now; VIATICA_APP_URL is still read, so an older file keeps working.
+    base = (c.get("MOSES_APP_URL") or c.get("VIATICA_APP_URL", "")).rstrip("/")
+    secret = c.get("CRON_SECRET", "")
     if not base or not secret:
         return None
     try:

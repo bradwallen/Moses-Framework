@@ -258,8 +258,33 @@ check("LIMIT Brad is answered with the day's budget spent", len(out) == 1)
 reset(); calls = stub_conversation()
 history[:] = [{**ATLAS, "text": "Moses, thoughts?"}]
 pacing.record_reply(reactive=True)          # he posted to a bot a moment ago
+slept = []
+def _pass_time(s):
+    # Time passes: his last bot post is now well behind the gap.
+    slept.append(s)
+    pacing.record_reply(now=time.time() - 120, reactive=True)
+listener._sleep = _pass_time
 out = fire({**ATLAS, "text": "Moses, still there?"}, ts="4.6")
-check("LIMIT a bot reply inside the cooldown is withheld silently", out == [] and calls == [])
+listener._sleep = time.sleep
+# 2026-10-10: this used to assert the message was DROPPED, which is how Atlas's 11:00 follow-ups
+# went unanswered three days running. The gap is a wait now.
+check("LIMIT a bot message inside the gap is held, not dropped", len(slept) == 1 and 0 < slept[0] <= pacing.MIN_GAP_SECONDS + 1)
+check("LIMIT …and answered once the gap has passed", len(out) == 1 and len(calls) == 1)
+check("LIMIT …without announcing anything about a wait", all(pacing.BOWING_OUT not in (m.get("text") or "") for m in out))
+reset(); calls = stub_conversation()
+history[:] = [{**ATLAS, "text": "Moses, thoughts?"}]
+pacing.record_reply(reactive=True)
+listener._sleep = lambda s: slept.append(s)  # time never passes: the hold is bounded, then it gives up
+slept.clear()
+out = fire({**ATLAS, "text": "Moses, still there?"}, ts="4.65")
+listener._sleep = time.sleep
+check("LIMIT the hold is bounded — three waits, then silence", len(slept) == 3 and out == [] and calls == [])
+reset(); calls = stub_conversation()
+pacing.record_reply(reactive=True)
+slept.clear(); listener._sleep = lambda s: slept.append(s)
+out = fire({**moses_said("Right, and that's the better shape."), "text": "Right, and that's the better shape."}, ts="4.66")
+listener._sleep = time.sleep
+check("LIMIT his own post echoing back is not held — dropped at once, as before", slept == [] and out == [] and calls == [])
 out = fire({"user": BRAD, "text": "Moses, what do you think?"}, ts="4.7")
 check("LIMIT the cooldown never reaches Brad", len(out) == 1)
 

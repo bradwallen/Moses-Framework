@@ -13,7 +13,7 @@ set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
 ZHOME=$MOSES_ROOT/knight
 JOBS="${ZRYACHIY_JOBS:-$MOSES_ROOT/zryachiy/jobs}"
-VIATICA="${ZRYACHIY_VIATICA:-}"   # the product checkout Zryachiy explores, from the operator's settings
+CHECKOUT="${ZRYACHIY_CHECKOUT:-${ZRYACHIY_VIATICA:-}}"   # the product checkout Zryachiy explores (ZRYACHIY_VIATICA is the old name, still read)
 # About half an hour of Brad's Pro allowance each, shared with Knight and his own sessions.
 MAX_PER_DAY="${ZRYACHIY_MAX_PER_DAY:-4}"
 mkdir -p "$JOBS"
@@ -52,7 +52,7 @@ cmd_explore() {
   weak:   "group trips work"
   usable: "the roster never appears on the public link, whatever the privacy setting"'
     [[ "$minutes" =~ ^[0-9]+$ ]] && [ "$minutes" -ge 5 ] && [ "$minutes" -le 60 ] || die "--minutes must be a whole number from 5 to 60"
-    [ -d "$VIATICA/e2e" ] || die "no Viatica checkout at $VIATICA"
+    [ -d "$CHECKOUT/e2e" ] || die "no checkout of $MOSES_PRODUCT_NAME at $CHECKOUT (set ZRYACHIY_CHECKOUT)"
     [ -n "${ZRYACHIY_FAKE_EXPLORE:-}" ] || [ -x "$MOSES_CLAUDE_CLI" ] || die "claude CLI not found at $MOSES_CLAUDE_CLI"
     # One sandbox at a time: it owns fixed ports, and a second run would only fail on them later.
     [ "$(running)" -ge 1 ] && die "an exploration is already running (one sandbox at a time). See: zryachiy status"
@@ -75,7 +75,7 @@ cmd_explore() {
         die "the worker never started (job $id); see $dir/nohup.log"
     fi
     echo "Zryachiy started $id, exploring \"$feature\" for up to $minutes minutes, plus a few minutes to build the sandbox."
-    echo "He posts his findings to #viatica-dev when he is done, and back to the conversation that asked."
+    echo "He posts his findings to the Knight channel when he is done, and back to the conversation that asked."
 }
 
 cmd_status() {

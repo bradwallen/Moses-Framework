@@ -103,6 +103,7 @@ unset _openv _k _v
 : "${SLACK_BOT_TOKEN:=}"
 : "${SLACK_OPS_CHANNEL:=}"
 : "${VIATICA_APP_URL:=}"
+: "${MOSES_APP_URL:=$VIATICA_APP_URL}"   # the new name wins; the old one is still read
 : "${CRON_SECRET:=}"
 : "${MOSES_NAME:=Moses}"
 : "${MOSES_EMOJI:=:scroll:}"
@@ -268,10 +269,10 @@ run_check() {
     http)
       local path base code body why
       path=$(pfield "$id" '.check.path')
-      if [ -z "$VIATICA_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
-        echo "VIATICA_APP_URL / CRON_SECRET not set"; return 1
+      if [ -z "$MOSES_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+        echo "MOSES_APP_URL / CRON_SECRET not set"; return 1
       fi
-      base="${VIATICA_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
+      base="${MOSES_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
       body=$(mktemp)
       code=$(curl -sSL -o "$body" -w '%{http_code}' --max-time 90 \
         -H "Authorization: Bearer $CRON_SECRET" "$base$path" 2>/dev/null)
@@ -335,11 +336,11 @@ run_periodic() {
   count=$(jq -r --arg i "$id" '.personas[] | select(.id==$i) | (.periodic // []) | length' "$REG" 2>/dev/null)
   [ -n "$count" ] && [ "$count" != "null" ] && [ "$count" -gt 0 ] || return 0
 
-  if [ -z "$VIATICA_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
-    echo "periodic: VIATICA_APP_URL / CRON_SECRET not set"
+  if [ -z "$MOSES_APP_URL" ] || [ -z "$CRON_SECRET" ]; then
+    echo "periodic: MOSES_APP_URL / CRON_SECRET not set"
     return 0
   fi
-  base="${VIATICA_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
+  base="${MOSES_APP_URL%/}"; base="${base#http://}"; base="${base#https://}"; base="https://$base"
 
   i=0
   while [ "$i" -lt "$count" ]; do

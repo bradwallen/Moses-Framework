@@ -26,6 +26,7 @@ from __future__ import annotations
 import sys as _sys, pathlib as _pl  # noqa: E401
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "agent" / "lib"))
 import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
+import persona as _persona  # noqa: E402 — persona display names come from the roster, by id
 import os
 import re
 import subprocess
@@ -72,12 +73,13 @@ KNIGHT_LAND = str(_env.ROOT / "knight/bin/knight-land")
 ZRYACHIY_BIN = str(_env.ROOT / "knight/bin/zryachiy")
 JOB_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]+$")
 
+_PRODUCT = _env.product_name()  # the operator's product (MOSES_PRODUCT_NAME), for the text below
 server = MCPServer(
     name="moses",
     title="Moses — Brad's project-of-projects",
     instructions=(
         "Moses holds Brad's commandments, the state of every project, and the roster of who is "
-        "accountable for what across Reserve and Viatica. Viatica is his travel-itinerary product; "
+        f"accountable for what across Reserve and {_env.product_label()}; "
         "Reserve is the server everything runs on. Assume any project, tool or term he names is "
         "recorded here — the corpus is the source of truth for his work.\n\n"
         "HOW TO LOOK THINGS UP. Start with list_memory: its one-line descriptions usually identify "
@@ -85,7 +87,7 @@ server = MCPServer(
         "over notes written in shorthand, so a user's phrasing frequently misses — '25km' not "
         "'twenty five kilometers', 'iDrive' not 'the backup service'. **Never conclude a topic is "
         "unknown after one failed search.** Search a short distinctive word, or list_memory and read "
-        "the file whose description fits. Saying 'I have nothing about Viatica' when 40 lines mention "
+        f"the file whose description fits. Saying 'I have nothing about {_PRODUCT}' when 40 lines mention "
         "it is the failure to avoid.\n\n"
         "Once you have the file, read_memory it in full before answering. The notes record WHY "
         "things are the way they are, which is usually what Brad is actually asking.\n\n"
@@ -335,7 +337,7 @@ def who_is_behind() -> str:
 # Namespaced by owner, matching the roster. Each is the READ half of a persona whose scheduled
 # Slack report keeps running untouched on its own timer — asking a question here posts nothing.
 @server.tool(
-    description="BIRDEYE (ops): Reserve's disk headroom on every mounted drive, plus any long job "
+    description=f"{_persona.name_of('birdeye').upper()} (ops): Reserve's disk headroom on every mounted drive, plus any long job "
                 "handed off to him. Read-only — this does not post to Slack."
 )
 def birdeye_status() -> str:
@@ -345,7 +347,7 @@ def birdeye_status() -> str:
 
 
 @server.tool(
-    description="BIRDEYE (ops): his full ops report — backup liveness and staleness, iDrive cloud "
+    description=f"{_persona.name_of('birdeye').upper()} (ops): his full ops report — backup liveness and staleness, iDrive cloud "
                 "quota, disk alarms including drives declared in fstab but NOT mounted, and failed "
                 "jobs. This is the same assessment as the 06:00 Slack post, rendered rather than "
                 "posted. Use it for 'did the backup run', 'is anything wrong with Reserve'. "
@@ -388,14 +390,14 @@ def birdeye_report(mode: str = "full") -> str:
     if age_min > 60 * 26:
         # The morning run is daily. Past ~26h it has missed one, and a stale report presented as
         # current is exactly the silent-monitoring failure this system keeps running into.
-        warn = ("\n\n⚠️  This is more than a day old, so Birdeye's scheduled run has MISSED at least "
+        warn = (f"\n\n⚠️  This is more than a day old, so {_persona.name_of('birdeye')}'s scheduled run has MISSED at least "
                 "once. Treat the content as history, and check why the timer did not fire.")
-    return (f"Birdeye's last ops report (as posted to #ops, {stamp}):\n"
+    return (f"{_persona.name_of('birdeye')}'s last ops report (as posted to #ops, {stamp}):\n"
             f"Requested mode {mode!r}; the cache holds whichever mode ran last.\n\n{text}{warn}")
 
 
 @server.tool(
-    description="BIG PIPE (finance): Viatica's live P&L from Customs. period: ytd (default, the "
+    description=f"{_persona.name_of('bigpipe').upper()} (finance): Viatica's live P&L from Customs. period: ytd (default, the "
                 "standing year-to-date profit and loss with cost lines) | daily | weekly | monthly "
                 "| quarterly. Income is live Stripe; expenses are the recorded recurring costs. "
                 "Read-only — this does NOT post his scheduled report to #finance."
@@ -406,11 +408,11 @@ def bigpipe_pnl(period: str = "ytd") -> str:
         return personas.cfo(period)
     except Exception as e:
         # Financial figures: report the failure, never a zero that reads like a fact.
-        return f"Big Pipe could not answer: {e}"
+        return f"{_persona.name_of('bigpipe')} could not answer: {e}"
 
 
 @server.tool(
-    description="TAGILLA (support): Viatica's support queue from Customs — what came in over the "
+    description=f"{_persona.name_of('tagilla').upper()} (support): Viatica's support queue from Customs — what came in over the "
                 "window, how much the AI answered, and the backlog still waiting on Brad, oldest "
                 "first. hours defaults to 24, max 168. Read-only — posts nothing to #support."
 )
@@ -419,16 +421,16 @@ def tagilla_queue(hours: int = 24) -> str:
         import personas
         return personas.support(hours)
     except Exception as e:
-        return f"Tagilla could not answer: {e}"
+        return f"{_persona.name_of('tagilla')} could not answer: {e}"
 
 
 @server.tool(
     description="KNIGHT (software development): hand him a build task on one of the repositories in "
-                "his target registry. `target` picks which: 'viatica' (default) is the product; "
+                "his target registry. `target` picks which: the default is the product; "
                 "'moses' is the agent, the MCP server and Knight himself; 'moses-framework' is the "
                 "shareable half at github.com/bradwallen/Moses. Any other name is refused and the "
                 "refusal lists the real ones — use knight_targets if you are unsure. "
-                "WHERE THE WORK LANDS DEPENDS ON THE TARGET: on viatica a green gate pushes to "
+                "WHERE THE WORK LANDS DEPENDS ON THE TARGET: on the product a green gate pushes to "
                 "master and Customs ships it, so THAT ONE DEPLOYS; on moses and moses-framework a "
                 "green gate pushes a branch for a human to merge and nothing goes live, because "
                 "those repositories are the machinery that runs Knight. The gate is objective and "
@@ -437,7 +439,7 @@ def tagilla_queue(hours: int = 24) -> str:
                 "no access outside its own directory. Returns a job id immediately; the work runs "
                 "up to 60 minutes in the background, one job at a time, 8 per day. Brief him like a "
                 "senior developer: what to build and how to verify it. Knight posts his own report "
-                "to #viatica-dev when he finishes. "
+                "to the Knight channel when he finishes. "
                 "`acceptance` IS REQUIRED AND IT DOES NOT GO TO KNIGHT — it goes to Zryachiy, who "
                 "reviews the finished diff and BLOCKS THE PUSH if the work does not meet it. Write "
                 "what must be TRUE when this is done, as observable outcomes someone could check "
@@ -543,7 +545,7 @@ def knight_targets() -> str:
 @server.tool(
     description="KNIGHT: how a build job is going, or how it ended — status, elapsed time, the "
                 "branch, commit count, diff size, and Knight's own written report. Use the job id "
-                "from knight_start. Knight also posts this report to #viatica-dev when he finishes; "
+                "from knight_start. Knight also posts this report to the Knight channel when done; "
                 "this is the way to read it without leaving the conversation."
 )
 def knight_status(job_id: str) -> str:
@@ -577,7 +579,7 @@ def knight_switch(action: str = "status", reason: str = "") -> str:
 
 @server.tool(
     description="KNIGHT: FINISH a job that is waiting on a branch — merge it and make it live. "
-                "Only for targets that land on a branch (moses, moses-framework); viatica deploys "
+                "Only for targets that land on a branch (moses, moses-framework); the product deploys "
                 "itself. Call with no argument to LIST what is waiting and whether each one may "
                 "land. It refuses on its own if the review was not clean, if the review left a "
                 "note nobody has answered, if the checkout has uncommitted work, or if the branch "
@@ -633,7 +635,7 @@ def knight_jobs() -> str:
 
 
 @server.tool(
-    description="ZRYACHIY: have him use a Viatica feature the way customers would, in the disposable "
+    description=f"ZRYACHIY: have him use a feature of {_PRODUCT} as customers would, in the disposable "
                 "sandbox on Reserve. He drives a real browser as each kind of person: a paid traveler, "
                 "a free-plan traveler, an early-access tester, an admin and a visitor. He is judged "
                 "against acceptance criteria you write. Use it for a new or early-access feature "
@@ -642,7 +644,7 @@ def knight_jobs() -> str:
                 "restatement of the feature. It runs up to `minutes` (default 30) plus a few minutes "
                 "of setup, one at a time, on Brad's Pro subscription (the same allowance as Knight "
                 "and Brad's own sessions), so start one when asked, not on your own initiative. It "
-                "returns an id at once. Zryachiy posts his findings to #viatica-dev and back to this "
+                "returns an id at once. Zryachiy posts findings to the Knight channel and back to this "
                 "conversation when he is done. Nothing he does reaches a real customer: the sandbox "
                 "holds made-up people and no production secrets, and his browser can reach nothing "
                 "else."
@@ -672,7 +674,7 @@ def zryachiy_status(job_id: str = "") -> str:
     return _run([ZRYACHIY_BIN, "status"] + ([jid] if jid else []), limit=6000)
 
 
-@server.tool(description="BIRDEYE (ops): one handed-off job in detail, including live progress. "
+@server.tool(description=f"{_persona.name_of('birdeye').upper()} (ops): one handed-off job in detail, including live progress. "
                         "Get ids from birdeye_status.")
 def get_job(job_id: str) -> str:
     if not JOB_ID.match(job_id.strip()):
@@ -966,7 +968,7 @@ def _capture(body: str, project: str = "") -> str:
 @server.tool(description="Record an idea Brad wants to keep but not act on yet. Automatically "
                         "reports what the idea connects to in past work — this is the point of "
                         "capturing it, so do not suppress that part of the answer. Pass `project` "
-                        "(an id or name, e.g. 'viatica') when the idea belongs to one, and it is "
+                        "(an id or name, e.g. 'moses') when the idea belongs to one, and it is "
                         "also added to that project's candidate list, which the Projects page "
                         "shows separately from its milestones. Ideas are never counted as progress.")
 def add_idea(idea: str, project: str = "") -> str:

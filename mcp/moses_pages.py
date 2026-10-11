@@ -143,6 +143,7 @@ def roster() -> list[dict]:
     out = []
     for p in data.get("personas", []):
         out.append({
+            "id": p.get("id", ""),
             "name": p.get("name", p.get("id", "?")),
             "emoji": p.get("emoji", "").strip(":"),
             "kind": p.get("kind", ""),

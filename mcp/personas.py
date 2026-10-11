@@ -16,6 +16,9 @@ are financial and backlog figures: a plausible-looking wrong number is far worse
 
 from __future__ import annotations
 
+import sys as _sys, pathlib as _pl  # noqa: E401
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "agent" / "lib"))
+import persona as _persona  # noqa: E402 — persona display names come from the roster, by id
 import json
 import os
 import urllib.error
@@ -46,13 +49,13 @@ class CustomsError(RuntimeError):
 
 
 def _config() -> tuple[str, str]:
-    base = (os.environ.get("VIATICA_APP_URL") or "").strip().rstrip("/")
+    base = (os.environ.get("MOSES_APP_URL") or os.environ.get("VIATICA_APP_URL") or "").strip().rstrip("/")
     secret = (os.environ.get("CRON_SECRET") or "").strip()
     if not base or not secret:
-        missing = [n for n, v in (("VIATICA_APP_URL", base), ("CRON_SECRET", secret)) if not v]
+        missing = [n for n, v in (("MOSES_APP_URL", base), ("CRON_SECRET", secret)) if not v]
         raise CustomsError(
             f"{' and '.join(missing)} not set for this service — "
-            f"Big Pipe and Tagilla cannot reach Customs. Check the EnvironmentFile on moses-mcp."
+            f"{_persona.name_of('bigpipe')} and {_persona.name_of('tagilla')} cannot reach Customs. Check the EnvironmentFile on moses-mcp."
         )
     if not base.startswith(("http://", "https://")):
         base = "https://" + base
@@ -95,7 +98,7 @@ def fetch(persona: str, **params) -> dict:
 
 def cfo(period: str = "ytd") -> str:
     d = fetch("cfo", period=period)
-    out = ["*Big Pipe* — Viatica finance"]
+    out = [f"*{_persona.name_of('bigpipe')}* — Viatica finance"]
 
     if d.get("period") == "ytd":
         out.append(f"YTD {d.get('year')} as of {d.get('asOf')}")
@@ -125,7 +128,7 @@ def cfo(period: str = "ytd") -> str:
 
 def support(hours: int = 24) -> str:
     d = fetch("support", hours=hours)
-    out = [f"*Tagilla* — support, last {d.get('windowHours')}h"]
+    out = [f"*{_persona.name_of('tagilla')}* — support, last {d.get('windowHours')}h"]
     received = d.get("received", 0)
     if received == 0:
         out.append("   nothing came in — queue is quiet")

@@ -1,5 +1,5 @@
 [Unit]
-Description=Run Moses's tests daily, before Therapist reports at the 08:00 standup
+Description=Run Moses's tests daily, before the 08:00 standup's health report
 
 [Timer]
 # 07:30: the sweep takes a few minutes, and Therapist reads its result at 08:00. She says "not checked"

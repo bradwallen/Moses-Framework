@@ -44,6 +44,7 @@ broadcasting, so a second process under the same app would swallow some /birdeye
 import sys as _sys, pathlib as _pl  # noqa: E401
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent / "lib"))
 import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
+import persona as _persona  # noqa: E402 — persona display names come from the roster, by id
 import os
 import re
 import subprocess
@@ -85,8 +86,8 @@ BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 MEMORY_DIR = Path(os.environ.get("MOSES_MEMORY_DIR", str(Path.home() / ".claude" / "memory")))
 MOSES_NAME = _env.setting("MOSES_NAME", "Moses")
 MOSES_EMOJI = _env.setting("MOSES_EMOJI", ":scroll:")
-BIRDEYE_NAME = os.environ.get("BIRDEYE_NAME", "Birdeye")
-BIRDEYE_EMOJI = os.environ.get("BIRDEYE_EMOJI", ":eagle:")
+BIRDEYE_NAME = os.environ.get("BIRDEYE_NAME", _persona.name_of("birdeye"))
+BIRDEYE_EMOJI = os.environ.get("BIRDEYE_EMOJI", _persona.emoji_of("birdeye", ":eagle:"))
 
 # Who may lift the safeword. Anyone can stop Moses; only Brad restarts him — stopping must be
 # frictionless in the moment you need it, restarting is a deliberate act by the person who owns the
@@ -113,7 +114,7 @@ if missing:
 JOB_ID = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]+$")
 
 BIRDEYE_HELP = "\n".join([
-    "*Birdeye* — Reserve ops",
+    f"*{BIRDEYE_NAME}* — Reserve ops",
     "`/birdeye status` — full ops report (backup, quota, disks, what's in flight)",
     "`/birdeye backup` — last backup result only",
     "`/birdeye jobs` — every handed-off job: state and how long it's been going",
@@ -579,6 +580,23 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
             return
         history = recent(channel, thread_ts)
         allow_bots, why = pacing.may_reply_to_bot(history, BOT_USER_ID, BOT_ID)
+        # THE GAP IS A WAIT, NOT A REFUSAL (2026-10-10). Atlas answers in seconds, so dropping a
+        # message that lands inside the gap made Moses answer his 11:00 check-in once and then go
+        # quiet. Hold until the gap has passed and decide again on a fresh read of the thread; two
+        # messages held together fold into one reply at the burst claim below. Bounded: the gap is
+        # at most MIN_GAP_SECONDS, and three holds is more than one exchange can need.
+        # His OWN post echoes back as a bot message in the same second, always inside the gap: that
+        # one is still dropped at once, as before — holding it would park a thread for 30s to throw
+        # the message away (seen live the night this shipped).
+        holds = 0
+        mine = addressing.is_self(event, BOT_USER_ID, BOT_ID)
+        while not allow_bots and why == "cooldown" and holds < 3 and not mine:
+            wait = pacing.gap_left()
+            print(f"moses: bot reply held {wait:.0f}s for the gap in {channel}", flush=True)
+            _sleep(wait + 0.5)
+            holds += 1
+            history = recent(channel, thread_ts)
+            allow_bots, why = pacing.may_reply_to_bot(history, BOT_USER_ID, BOT_ID)
         if not allow_bots:
             # Only bow out if he was actually being TALKED TO. Announcing "I'll pick this up later"
             # at a message that never involved him is worse than the silence it is announcing —
@@ -887,6 +905,8 @@ def _ground(held: list[dict], say) -> None:
 
 
 SEEN_LOCK = threading.Lock()
+# The gap's wait, indirected so a test can let time pass without sleeping.
+_sleep = time.sleep
 
 
 # ── Proof of life for the MAILBOX, not the model ────────────────────────────────────────────────

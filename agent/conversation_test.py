@@ -939,6 +939,59 @@ check("TOOLWALL the stream parser records what the CLI handed over",
       (conversation._read_stream('{"type":"system","subtype":"init","tools":["Bash","mcp__moses__recall"],"mcp_servers":[]}\n'
                                  '{"type":"result","result":"ok"}') or {}).get("builtin_tools") == ["Bash"])
 
+print("\nTHE PRODUCT IS THE OPERATOR'S SETTING, NOT A NAME IN THE TEXT")
+
+# The prompt named the author's product in prose, so a stranger's Moses introduced itself as working on
+# Viatica. MOSES_PRODUCT_NAME now fills it — checked on the prompt the CLI is actually handed, by
+# catching the system_prompt _invoke passes to the runner rather than calling the helper alone.
+def _sent_system_prompt(directed: bool) -> str:
+    seen = {}
+    real_build = conversation.claude_runner.build_argv
+
+    class _Stop(Exception):
+        pass
+
+    def _capture(*a, **kw):
+        seen["system_prompt"] = kw.get("system_prompt", "")
+        raise _Stop()
+    conversation.claude_runner.build_argv = _capture
+    try:
+        _REAL_INVOKE("hello", directed=directed,
+                     allowed=",".join(conversation.claude_runner.profile(
+                         "moses-chat-directed" if directed else "moses-chat").approved()))
+    except _Stop:
+        pass
+    finally:
+        conversation.claude_runner.build_argv = real_build
+    return seen.get("system_prompt", "")
+
+
+_saved = {k: os.environ.get(k) for k in ("MOSES_PRODUCT_NAME", "MOSES_PRODUCT_DESCRIPTION")}
+os.environ["MOSES_PRODUCT_NAME"] = "Acme"
+os.environ["MOSES_PRODUCT_DESCRIPTION"] = "a sentinel product"
+try:
+    for _directed in (False, True):
+        _sent = _sent_system_prompt(_directed)
+        _label = "directed" if _directed else "undirected"
+        # Tool names keep their ids (viatica_incidents is an MCP tool's name, not prose) — strip them
+        # before asking whether the PRODUCT is still named anywhere.
+        _prose = re.sub(r"mcp__moses__\w+", "", _sent)
+        check(f"PRODUCT the {_label} prompt the CLI receives names the configured product",
+              "Acme (a sentinel product)" in _sent and _sent.count("Acme") >= 2)
+        check(f"PRODUCT and no longer names Viatica ({_label})", "viatica" not in _prose.lower())
+        check(f"PRODUCT no placeholder is left unfilled ({_label})",
+              "{PRODUCT" not in _sent and "{CAPABILITIES}" not in _sent)
+    os.environ.pop("MOSES_PRODUCT_DESCRIPTION")
+    os.environ.pop("MOSES_PRODUCT_NAME")
+    check("PRODUCT with nothing set it says 'the product', not the author's",
+          "the product" in conversation.system_prompt(True) and "Acme" not in conversation.system_prompt(True))
+finally:
+    for _k, _v in _saved.items():
+        if _v is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _v
+
 # COUNTED INSIDE THE PRINT — literally, this time. The previous version carried a comment saying
 # exactly that while assigning the count to a variable several lines ABOVE the print, so a section
 # appended in between was run, printed its own FAIL, and was still summarized as "0 failed". That is

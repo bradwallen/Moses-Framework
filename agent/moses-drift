@@ -29,6 +29,7 @@ from __future__ import annotations
 import sys as _sys, pathlib as _pl  # noqa: E401
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent / "lib"))
 import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
+import persona as _persona  # noqa: E402 — persona display names come from the roster, by id
 import datetime as _dt
 import json
 import os
@@ -516,9 +517,10 @@ def check_customs_personas() -> None:
     have kept passing while the thing it stands for was broken, which is exactly the failure being
     guarded against.
     """
-    if not (os.environ.get("VIATICA_APP_URL") or "").strip() or not (os.environ.get("CRON_SECRET") or "").strip():
+    app_url = os.environ.get("MOSES_APP_URL") or os.environ.get("VIATICA_APP_URL") or ""
+    if not app_url.strip() or not (os.environ.get("CRON_SECRET") or "").strip():
         blind("the Customs-backed persona tools",
-              "VIATICA_APP_URL / CRON_SECRET are not in this environment")
+              "MOSES_APP_URL (or VIATICA_APP_URL) / CRON_SECRET are not in this environment")
         return
     personas_py = SRC.parent / "mcp"
     if not (personas_py / "personas.py").is_file():
@@ -528,7 +530,7 @@ def check_customs_personas() -> None:
     try:
         import personas                                     # noqa: PLC0415 — optional, by design
         personas.fetch("support", hours=1)
-        agreed("Big Pipe and Tagilla can still reach Customs on demand")
+        agreed(f"{_persona.name_of('bigpipe')} and {_persona.name_of('tagilla')} can still reach Customs on demand")
     except Exception as e:                                  # noqa: BLE001 — any failure is the point
         drift("a persona tool cannot reach Customs",
               f"{type(e).__name__}: {str(e)[:200]}")

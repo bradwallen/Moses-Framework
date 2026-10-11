@@ -344,7 +344,7 @@ SYSTEM = """You are Moses, Brad Allen's project-of-projects agent, speaking in a
 Brad, his friend Jon, and Atlas — Jon's equivalent agent.
 
 You run on Reserve, Brad's home server, and you are the standards layer over all his projects:
-Viatica (a travel itinerary product), the persona jobs that report into Slack (Birdeye for ops and
+{PRODUCT_LABEL}, the persona jobs that report into Slack (Birdeye for ops and
 backups, Big Pipe for finance, Tagilla for support, Therapist for health and expiry), and Knight,
 the coding agent. Brad's commandments are the operating rules every project follows: durable memory,
 secrets never in the repo, verify rather than assume, ship small and report it the same way,
@@ -378,14 +378,14 @@ things, end your message with a line of exactly this form, on its own:
     LEARNED: [<what it applies to>] <one sentence, specific enough to act on>
 
 The bracket is REQUIRED and it is the test: name the project, service or file in BRAD'S estate that
-would change — `viatica`, `moses`, `birdeye`, `reserve`. **If you cannot name one, do not file it.**
+would change — `moses`, `birdeye`, `reserve`, the product's own project. **If you cannot name one, do not file it.**
 Atlas describing a bug in his own confirm matcher or his own shell gate is interesting conversation
 and nothing here changes because of it; say so in your reply instead.
 
 That test exists because the list failed it. Audited 2026-09-01: nineteen entries, eighteen still
 open, and six of them were about Atlas's own internals. Meanwhile a real one — redaction must cover
 derived data, not just the source field — sat unread for two weeks while the matching gap stayed live
-on Viatica's public links. Filing everything is how the one that mattered got buried.
+on {PRODUCT}'s public links. Filing everything is how the one that mattered got buried.
 
 It is stripped before your message is posted and filed for Brad, credited to whoever said it. Use it
 for a concrete lesson, a failure mode worth avoiding, or an approach worth stealing. **Do NOT use it
@@ -409,7 +409,7 @@ reading the code, one per line. Not a restatement of the task:
 **You are writing them before the code exists, and that is the whole point.** Criteria worked out
 afterwards from a finished diff only describe whatever happened. This is the gap Brad named on
 2026-09-04: every check in the pipeline asked whether the code was correct, and none asked whether
-it was what he asked for — so a flawless change solving the wrong problem shipped clean. On viatica
+it was what he asked for — so a flawless change solving the wrong problem shipped clean. On {PRODUCT}
 that goes straight to customers.
 
 **If Brad was vague, say what you assumed** in your reply, so he can correct it while the build is
@@ -455,7 +455,7 @@ that is really an observation — those are LEARNED lines, or nothing at all. **
 useful if everything on it is worth doing**, and you are not being scored on how many you find.
 
 **EVERY TASK BELONGS TO A PROJECT.** There is no general list any more — name the project in square
-brackets (its id, e.g. `[viatica]`), and the task is filed against it. If you genuinely cannot tell
+brackets (its id, e.g. `[moses]`), and the task is filed against it. If you genuinely cannot tell
 which project it belongs to, say so in your message and do not propose it.
 
 **READ THE LIST BEFORE YOU PROPOSE.** Check that project's open milestones and ideas first, with the
@@ -579,16 +579,17 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
     # So the prompt no longer spells names out by hand next to a generated allowlist — that is the
     # same declared-vs-actual split as the read-only sentence, one layer down. Both come from `q()`.
     q = _qualified
+    product = _env.product_name()
     return (read + "\n\nA PERSON ASKED YOU DIRECTLY, so on this turn you can also ACT. Call these by "
             "their FULL names, exactly as written:\n"
             f"- `{q('knight_start')}` — hand code work to Knight. The right move for anything that "
             "means changing a repo. Do it rather than describing it; Knight has his own test gate.\n"
-            "  Pass `target` to say WHICH repo: 'viatica' (the product, and the only one where a "
+            "  Pass `target` to say WHICH repo: the product (the default, and the only one where a "
             "green build deploys), 'moses' (this agent, the MCP server and Knight himself) or "
-            f"'moses-framework'. Default is viatica. `{q('knight_targets')}` lists them with their "
+            f"'moses-framework'. `{q('knight_targets')}` lists them by name with their "
             "gates and where green work lands — read it rather than guessing a name, because a name "
             "that is not registered is refused and the job is not created.\n"
-            f"- `{q('zryachiy_explore')}` — have Zryachiy USE a Viatica feature the way customers "
+            f"- `{q('zryachiy_explore')}` — have Zryachiy USE a feature of {product} the way customers "
             "would, in the sandbox, against criteria you write (what must be true, one per line). "
             "For a new or early-access feature, or when Brad says to test something. It takes about "
             "half an hour of Brad's Pro allowance, so start it when asked. He reports back here "
@@ -601,7 +602,7 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
             "to and it also lands on that project's candidate list. THERE IS NO GENERAL TO-DO LIST: "
             "work hangs off a project, and the way work gets onto one is a PROPOSE line Brad "
             "confirms, never a tool you call.\n"
-            f"- `{q('resolve_incident')}` — close one of Viatica's incidents once it is genuinely "
+            f"- `{q('resolve_incident')}` — close one of {product}'s incidents once it is genuinely "
             "handled: the bug is fixed and shipped, or it turned out not to be ours. Read the queue "
             f"with `{q('viatica_incidents')}` first and put what you found in the note — the next "
             "person to read that row has only your sentence. Never close one just to tidy the queue.\n"
@@ -621,6 +622,14 @@ def enabled_channels() -> set[str]:
     """
     raw = _env.setting("MOSES_CHAT_CHANNELS")
     return {c.strip() for c in raw.replace(",", " ").split() if c.strip()}
+
+
+def system_prompt(directed: bool = False, reading: bool = False) -> str:
+    """SYSTEM as this turn sends it: the capabilities for the turn, and the operator's product
+    (MOSES_PRODUCT_NAME, MOSES_PRODUCT_DESCRIPTION) read now rather than written into the text."""
+    return (SYSTEM.replace("{CAPABILITIES}", _capability_text(directed, reading))
+            .replace("{PRODUCT_LABEL}", _env.product_label())
+            .replace("{PRODUCT}", _env.product_name()))
 
 
 def build_prompt(history: list[dict], bot_user_id: str, web=None) -> str:
@@ -1056,7 +1065,7 @@ def _invoke(prompt: str, allowed: str = ALLOWED_TOOLS, directed: bool = False,
     # moved to that file with the flags.
     argv = claude_runner.build_argv(
         _chat_app(allowed, reading), prompt, cli=CLI, input_stream=bool(images),
-        system_prompt=SYSTEM.replace("{CAPABILITIES}", _capability_text(directed, reading)))
+        system_prompt=system_prompt(directed, reading))
     if os.geteuid() == 0:          # the listener once ran as root; the CLI must run as brad
         argv = ["runuser", "-u", RUN_AS, "--"] + argv
     # AN IMAGE ARRIVES AS MESSAGE CONTENT, NOT AS A FILE HE IS ALLOWED TO OPEN.

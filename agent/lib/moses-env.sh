@@ -54,6 +54,10 @@ MOSES_MEMORY_DIR=${MOSES_MEMORY_DIR:-$MOSES_HOME/.claude/memory}
 MOSES_STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
 export MOSES_ROOT MOSES_CONFIG_DIR MOSES_MEMORY_DIR MOSES_STATE
 
+# What the operator's product is called, for message text (moses_env.product_name() in Python, same
+# default). Not exported: a Python child reads the setting itself.
+MOSES_PRODUCT_NAME=${MOSES_PRODUCT_NAME:-the product}
+
 # The `claude` CLI — the same order as moses_env.claude_cli(): MOSES_CHAT_CLI, else the per-user install
 # at ~/.local/bin/claude if it is there, else whatever PATH finds, else that per-user path (so an error
 # names a real place to put it).

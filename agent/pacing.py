@@ -175,6 +175,22 @@ def may_reply_to_bot(history: list[dict], bot_user_id: str = "", bot_id: str = "
     return True, ""
 
 
+def gap_left(now: float | None = None) -> float:
+    """Seconds until the gap allows another bot-prompted post; 0 when it already does.
+
+    The listener WAITS this out rather than dropping the message (2026-10-10). Dropped, the gap was
+    the 2026-08-13 mute again: Atlas answers in 1–9 seconds, so every follow-up of his landed inside
+    it and Moses answered his 11:00 check-in exactly once, three days running. Held, the gap keeps
+    its job — no two bot-prompted posts closer than MIN_GAP_SECONDS — and nothing is ignored.
+    """
+    now = time.time() if now is None else now
+    try:
+        since = now - float(_load()["last_reactive_post"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    return max(0.0, MIN_GAP_SECONDS - since) if since >= 0 else 0.0
+
+
 def record_reply(now: float | None = None, *, reactive: bool) -> None:
     """Note that Moses posted.
 

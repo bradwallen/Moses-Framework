@@ -10,7 +10,7 @@
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
 DIR="$1"
-VIATICA="${ZRYACHIY_VIATICA:-}"   # the product checkout Zryachiy explores, from the operator's settings
+CHECKOUT="${ZRYACHIY_CHECKOUT:-${ZRYACHIY_VIATICA:-}}"   # the product checkout Zryachiy explores (ZRYACHIY_VIATICA is the old name, still read)
 OPTENV=$MOSES_CONFIG_DIR/knight.env
 now() { date +%Y-%m-%dT%H:%M:%S%z; }
 
@@ -48,7 +48,7 @@ if [ -n "${ZRYACHIY_FAKE_EXPLORE:-}" ]; then
     rc=$ZRYACHIY_FAKE_EXPLORE
 else
     # The ceiling covers the sandbox build and the boundary check as well as his own minutes.
-    ( cd "$VIATICA" && timeout --signal=TERM --kill-after=60 $(( (minutes + 25) * 60 )) \
+    ( cd "$CHECKOUT" && timeout --signal=TERM --kill-after=60 $(( (minutes + 25) * 60 )) \
         npm run explore -- --feature "$feature" --criteria-file "$DIR/criteria.txt" --minutes "$minutes" ) \
         > "$DIR/explore.log" 2>&1
     rc=$?

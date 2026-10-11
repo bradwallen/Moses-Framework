@@ -438,7 +438,7 @@ if [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ]; then
     app_url=""; app_sec=""
     if [ -r "$CUSTOMS_ENV" ]; then
         # shellcheck disable=SC1090
-        app_url=$(. "$CUSTOMS_ENV"; printf '%s' "${VIATICA_APP_URL:-}")
+        app_url=$(. "$CUSTOMS_ENV"; printf '%s' "${MOSES_APP_URL:-${VIATICA_APP_URL:-}}")
         app_sec=$(. "$CUSTOMS_ENV"; printf '%s' "${CRON_SECRET:-}")
     fi
 
@@ -479,7 +479,7 @@ if [ "$pushed" -eq 1 ] && [ "$KT_PUSH_MODE" = direct ]; then
         # that gets the whole mechanism switched off.
         if [ -z "$app_url" ] || [ -z "$app_sec" ]; then
             deploy_state=unverified
-            deploy_why="deployed, but Viatica credentials are not on this box so nothing checked the live site"
+            deploy_why="deployed, but the credentials for $MOSES_PRODUCT_NAME are not on this box so nothing checked the live site"
         else
             bad=0; last=""
             for _i in 1 2 3; do
@@ -613,7 +613,7 @@ if [ -n "$INCIDENT" ]; then
         CUSTOMS_ENV=$MOSES_CONFIG_DIR/customs.env
         if [ -r "$CUSTOMS_ENV" ]; then
             # shellcheck disable=SC1090
-            via_url=$(. "$CUSTOMS_ENV"; printf '%s' "${VIATICA_APP_URL:-}")
+            via_url=$(. "$CUSTOMS_ENV"; printf '%s' "${MOSES_APP_URL:-${VIATICA_APP_URL:-}}")
             via_sec=$(. "$CUSTOMS_ENV"; printf '%s' "${CRON_SECRET:-}")
             if [ -n "$via_url" ] && [ -n "$via_sec" ]; then
                 note="fixed by Knight in ${push_note%% *} on $BRANCH ($TARGET)"
@@ -630,7 +630,7 @@ if [ -n "$INCIDENT" ]; then
                     incident_note="COULD NOT close incident $INCIDENT — see gate.log"
                 fi
             else
-                incident_note="incident $INCIDENT left open — Viatica credentials not configured on this box"
+                incident_note="incident $INCIDENT left open — credentials for $MOSES_PRODUCT_NAME not configured on this box"
             fi
         else
             incident_note="incident $INCIDENT left open — $CUSTOMS_ENV unreadable"

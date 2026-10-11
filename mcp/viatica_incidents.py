@@ -18,6 +18,9 @@ TWO THINGS DELIBERATELY NOT DONE HERE:
 """
 from __future__ import annotations
 import json, os, urllib.error, urllib.request
+import sys as _sys, pathlib as _pl  # noqa: E401
+_sys.path.insert(0, str(_pl.Path(__file__).resolve().parent.parent / "agent" / "lib"))
+import moses_env as _env  # noqa: E402 — the operator's settings (the product's name)
 
 CONF = os.path.expanduser("~/.config/moses/customs.env")
 
@@ -45,8 +48,10 @@ def _conf() -> dict:
 def _call(path: str, method: str = "GET", body: dict | None = None, timeout: float = 15.0):
     """Returns (data, error). Never raises — a broken call must be reportable, not fatal."""
     c = _conf()
-    base, secret = c.get("VIATICA_APP_URL", "").rstrip("/"), c.get("CRON_SECRET", "")
-    missing = [n for n, v in (("VIATICA_APP_URL", base), ("CRON_SECRET", secret)) if not v]
+    # MOSES_APP_URL is the name now; VIATICA_APP_URL is still read, so an older file keeps working.
+    base = (c.get("MOSES_APP_URL") or c.get("VIATICA_APP_URL", "")).rstrip("/")
+    secret = c.get("CRON_SECRET", "")
+    missing = [n for n, v in (("MOSES_APP_URL", base), ("CRON_SECRET", secret)) if not v]
     if missing:
         return None, f"not configured: {', '.join(missing)} missing from {CONF}"
     data = json.dumps(body).encode() if body is not None else None
@@ -96,9 +101,9 @@ def queue(state: str = "open", limit: int = 20) -> str:
 
     rows = data.get("incidents") or []
     if not rows:
-        return "No open incidents. (Read live from Viatica just now, not from memory.)"
+        return f"No open incidents. (Read live from {_env.product_name()} just now, not from memory.)"
 
-    out = [f"{data.get('open', '?')} open incident(s) in Viatica:"]
+    out = [f"{data.get('open', '?')} open incident(s) in {_env.product_name()}:"]
     for i in rows:
         mark = "" if not i.get("resolvedAt") else f"  [CLOSED by {i.get('resolvedBy') or '?'}]"
         out.append(
