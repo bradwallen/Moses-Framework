@@ -6,7 +6,7 @@
 # WHAT CHANGES (Brad, 2026-08-11):
 #   1. A new CUSTOMS section, reported FIRST — "it'll be more critical once Viatica is live."
 #      Covers everything that expires or runs out: the app answering at all, TLS certificates, the
-#      viatica.travel registration, and the dependency canary on Customs (database, Stripe,
+#      app domain's registration, and the dependency canary on Customs (database, Stripe,
 #      Anthropic key AND prepaid credit, Resend sending domain, Maps).
 #   2. Signups move UP into Customs, where they belong — they are Viatica data, not Reserve ops.
 #   3. Backup, iDrive quota and disks move to the BOTTOM under a RESERVE heading.

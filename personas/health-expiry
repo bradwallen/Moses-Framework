@@ -139,7 +139,7 @@ except Exception:
     days=$(( ( $(date -d "$exp" +%s) - $(date +%s) ) / 86400 ))
     DOMAIN_DAYS=$days
     if [ "$days" -lt "$DOMAIN_WARN_DAYS" ]; then
-        issue "🔴 *viatica.travel expires in $days days* — renew it; a lapse takes the site, email and Moses"
+        issue "🔴 *$APP_DOMAIN expires in $days days* — renew it; a lapse takes the site, email and Moses"
     fi
 }
 
@@ -195,7 +195,7 @@ PY
 APP_OK=0; DEPS_OK=0; CERT_MIN=99999; DOMAIN_DAYS=""
 
 check_app
-check_cert "viatica.travel" "viatica.travel"
+[ -n "$APP_DOMAIN" ] && check_cert "$APP_DOMAIN" "$APP_DOMAIN"
 [ -n "$VIATICA_APP_URL" ] && check_cert "Railway" "$VIATICA_APP_URL"
 check_domain
 check_deps

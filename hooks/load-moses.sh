@@ -72,7 +72,7 @@ for p in d.get('personas', []):
   # Brad, 2026-08-22: "You build something, it gets documented SOMEWHERE that then gets CHECKED by
   # you, Moses, Knight, everybody before any of you does anything."
   #
-  # That day a web service on his own domain (moses-dashboard, projects.viatica.travel) turned out to
+  # That day a web service on his own domain (moses-dashboard, projects.example.com) turned out to
   # be in no architecture document at all. It had been built days earlier. Nothing caught it because
   # every check validated claims the docs MADE — `arch_check.py` says so in its own output — and a
   # component in no doc is invisible to all of them.

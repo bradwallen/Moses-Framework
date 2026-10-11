@@ -70,9 +70,9 @@ if [ "$MODE" = "--selftest" ]; then
         [ -n "$cat" ] || continue
         case "$cat" in
           slack-ids)         probe='OWNER_ID = "U0BKN5JT3PC"' ;;
-          private-ips)       probe='http://100.87.21.18:8765/mcp' ;;
+          private-ips)       probe='http://100.64.0.1:8765/mcp' ;;
           home-paths)        probe='KNIGHT_HOME=/home/someone/knight' ;;
-          personal-domains)  probe='https://viatica.travel' ;;
+          personal-domains)  probe='https://viatica.example' ;;
           personal-accounts) probe='git@github.com:bradwallen/Moses.git' ;;
           app-urls)          probe='https://my-thing-production.up.railway.app/' ;;
           persona-names)     probe='username:"Birdeye"' ;;
