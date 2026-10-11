@@ -4,6 +4,7 @@
 #   tools/check-portability.sh              count what is still personal, exit 0 (ADVISORY)
 #   tools/check-portability.sh --strict     exit 1 if anything is found (once the count hits zero)
 #   tools/check-portability.sh --show CAT   list every occurrence in one category
+#   tools/check-portability.sh --counts     one "category<TAB>count-in-code" line each, for the sync's ratchet
 #
 # WHY THIS EXISTS. The framework and its author's instance are the SAME TREE — his setup is this
 # repo plus his config, never a fork, because the moment there are two copies upstream rots. That
@@ -146,9 +147,11 @@ if [ "$SCANNED" -lt 5 ]; then
 fi
 
 TOTAL=0; PROSE=0
+if [ "$MODE" != "--counts" ]; then
 printf '\n  Portability — what still belongs to one person\n'
 printf '  scanned %d tracked files as %s\n' "$SCANNED" "$(id -un)"
 printf '  %s\n\n' "$(printf '─%.0s' $(seq 1 62))"
+fi
 
 while IFS=$'\t' read -r cat pat advice; do
   [ -n "$cat" ] || continue
@@ -196,6 +199,8 @@ while IFS=$'\t' read -r cat pat advice; do
 
   TOTAL=$((TOTAL + n))
   PROSE=$((PROSE + prose))
+  # The ratchet in moses-framework-sync reads these. Only code counts, as everywhere else here.
+  if [ "$MODE" = "--counts" ]; then printf '%s\t%d\n' "$cat" "$n"; continue; fi
   if [ "$n" -eq 0 ]; then
     printf '  %-18s %s' "$cat" "clean ✓"
     [ "$prose" -gt 0 ] && printf '   (%d in comments/tests — left alone on purpose)' "$prose"
@@ -214,6 +219,7 @@ while IFS=$'\t' read -r cat pat advice; do
   fi
 done <<< "$CHECKS"
 
+[ "$MODE" = "--counts" ] && exit 0
 printf '\n  %s\n' "$(printf '─%.0s' $(seq 1 62))"
 if [ "$TOTAL" -eq 0 ]; then
   printf '  PORTABLE — nothing personal left in the engine.\n'
