@@ -54,6 +54,18 @@ exit 0
 """
 
 
+CHECKER = """#!/usr/bin/env bash
+# Stand-in with tools/check-portability.sh's contract: --selftest exits non-zero when broken, --counts
+# prints category<TAB>count. Here one category: lines naming PERSONA_LITERAL in tracked files.
+cd "$(git rev-parse --show-toplevel)"
+case "$1" in
+  --selftest) [ -e tools/SELFTEST_BROKEN ] && exit 1; exit 0 ;;
+  --counts) n=$(git ls-files | grep -v '^tools/' | xargs -r grep -h PERSONA_LITERAL 2>/dev/null | grep -v '^#' | wc -l)
+            printf 'persona-names\t%d\n' "$n" ;;
+esac
+"""
+
+
 def world(tmp: Path, extra_map: str = "") -> tuple[Path, Path]:
     """An instance tree (with this checkout's sync script and map rules) and a framework checkout."""
     inst = new_repo(tmp / "inst")
@@ -70,6 +82,9 @@ def world(tmp: Path, extra_map: str = "") -> tuple[Path, Path]:
     (fw / "tools").mkdir()
     (fw / "tools" / "scan-secrets.sh").write_text(SCANNER)
     (fw / "tools" / "scan-secrets.sh").chmod(0o755)
+    (fw / "tools" / "check-portability.sh").write_text(CHECKER)
+    (fw / "tools" / "check-portability.sh").chmod(0o755)
+    (fw / "tools" / "portability-baseline").write_text("# limits\npersona-names\t0\n")
     (fw / "README.md").write_text("framework's own\n")
     (fw / "agent").mkdir()
     (fw / "agent" / "gone.py").write_text("stale\n")
@@ -230,6 +245,50 @@ with tempfile.TemporaryDirectory() as t:
     r = run(inst, fw)
     check("with no rules file, the sync still runs and SAYS nothing is being checked",
           r.returncode == 0 and "neither rewritten nor checked" in r.stderr, r.stderr)
+
+
+print("\nthe portability ratchet — a sync may only make the framework more portable")
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t))
+    (inst / "agent" / "named.py").write_text('NAME = "PERSONA_LITERAL"\n')
+    commit_all(inst)
+    r = run(inst, fw)
+    check("a sync that RAISES a category is refused (exit 2), naming it and both counts",
+          r.returncode == 2 and "persona-names: 0 → 1" in r.stderr, r.stderr)
+    check("…and nothing from that run is left behind",
+          not (fw / "agent" / "named.py").exists() and not git(fw, "status", "--porcelain").strip(),
+          git(fw, "status", "--porcelain"))
+
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t))
+    (fw / "tools" / "portability-baseline").write_text("# limits\npersona-names\t2\n")
+    (fw / "agent" / "m1.py").write_text('A = "PERSONA_LITERAL"\nB = "PERSONA_LITERAL"\n')
+    commit_all(fw)
+    (inst / "agent" / "m1.py").write_text('A = "PERSONA_LITERAL"\nB = roster_name("ops")\n')
+    commit_all(inst)
+    r = run(inst, fw)
+    base = (fw / "tools" / "portability-baseline").read_text()
+    check("a sync that LOWERS a category succeeds and says so", r.returncode == 0 and "lowered" in r.stdout,
+          r.stdout + r.stderr)
+    check("…the baseline drops to the new count, comments kept", "persona-names\t1" in base and "# limits" in base, base)
+    check("…and the lowered baseline is staged with the rest",
+          "tools/portability-baseline" in git(fw, "diff", "--cached", "--name-only"))
+
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t))
+    (fw / "tools" / "SELFTEST_BROKEN").write_text("x\n")
+    commit_all(fw)
+    r = run(inst, fw)
+    check("a checker whose self-test fails stops the sync — its counts mean nothing (exit 2)",
+          r.returncode == 2 and "self-test" in r.stderr, r.stderr)
+
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t))
+    (fw / "tools" / "portability-baseline").unlink()
+    commit_all(fw)
+    r = run(inst, fw)
+    check("no baseline stops the sync and SAYS it could not measure (exit 2)",
+          r.returncode == 2 and "could not run" in r.stderr, r.stderr)
 
 
 print("\nmoses_env — the settings every entry point reads")

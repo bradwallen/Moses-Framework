@@ -29,6 +29,13 @@ Every <real> is then FORBIDDEN in the whole framework checkout, not only in what
 trace left anywhere — a framework-owned file, a spelling the rule did not catch — stops the sync by
 file and line. A shipped file is compared AFTER rewriting, so --check still means "byte for byte".
 
+PORTABILITY ONLY GOES DOWN (2026-10-10). The 2026-09-03 cleanup that had persona names read from the
+roster was undone by the first byte-for-byte sync on 2026-09-21: this tree had never been cleaned, so
+its literals were copied straight back, and the advisory checker said nothing because nobody ran it.
+Now every sync runs the framework's own `tools/check-portability.sh --counts` against
+`tools/portability-baseline`: a category that would go UP stops the sync by name; one that went down
+lowers its line, so the cleanup can happen a little at a time and never quietly reverse.
+
 It does not commit. What changed is left in the framework's working tree to be read, and the
 framework's pre-commit hook scans it again on the way in.
 
@@ -170,6 +177,37 @@ def leaks(fw: Path, files: list[str], forbid) -> list[str]:
     return found
 
 
+def ratchet(fw: Path) -> tuple[list[str], str | None]:
+    """(what went up, the tightened baseline or None). Dies if it cannot measure: a ratchet that could
+    not look must not let a sync through looking like one that looked."""
+    checker, base = fw / "tools" / "check-portability.sh", fw / "tools" / "portability-baseline"
+    if not os.access(checker, os.X_OK) or not base.is_file():
+        return ["(could not run: tools/check-portability.sh or tools/portability-baseline is missing)"], None
+    st = subprocess.run([str(checker), "--selftest"], cwd=fw, capture_output=True, text=True)
+    if st.returncode != 0:
+        return ["(could not run: the portability checker's own self-test fails, so its counts mean nothing)"], None
+    r = subprocess.run([str(checker), "--counts"], cwd=fw, capture_output=True, text=True)
+    now = {}
+    for line in r.stdout.splitlines():
+        cat, _, n = line.partition("\t")
+        if n.strip().isdigit():
+            now[cat.strip()] = int(n)
+    if r.returncode != 0 or not now:
+        return [f"(could not run: the checker gave no counts — exit {r.returncode}: {r.stderr.strip()[:200]})"], None
+    lines, limits = base.read_text().splitlines(), {}
+    for line in lines:
+        cat, _, n = line.partition("\t")
+        if not line.startswith("#") and n.strip().isdigit():
+            limits[cat.strip()] = int(n)
+    raised = [f"{c}: {limits[c]} → {now[c]} in code" for c in now if c in limits and now[c] > limits[c]]
+    if raised:
+        return raised, None
+    out = [l for l in lines if l.startswith("#") or not l.strip()]
+    out += [f"{c}\t{min(n, limits.get(c, n))}" for c, n in now.items()]
+    new = "\n".join(out) + "\n"
+    return [], (new if new != base.read_text() else None)
+
+
 def same(a: Path, b: Path, rewrites) -> bool:
     return b.is_file() and scrubbed(a, rewrites) == b.read_bytes() and (os.access(a, os.X_OK) == os.access(b, os.X_OK))
 
@@ -280,6 +318,18 @@ def main() -> None:
             print("\n".join(f"  {x}" for x in left), file=sys.stderr)
             die(f"the framework would still name this operator in {len(left)} place(s) — add a rule to "
                 f"{SCRUB.name}, or fix a framework-owned file by hand; nothing was kept")
+        raised, tightened = ratchet(fw)
+        if raised:
+            undo()
+            print("\n".join(f"  {x}" for x in raised), file=sys.stderr)
+            die("this sync would make the framework LESS portable — clean those up in this tree (the "
+                "framework is a copy of it), or run tools/check-portability.sh --show <category> to see "
+                "them; nothing was kept")
+        if tightened:
+            (fw / "tools" / "portability-baseline").write_text(tightened)
+            subprocess.run(["git", "-C", str(fw), "add", "--", "tools/portability-baseline"], check=True)
+            touched.append("tools/portability-baseline")
+            print("portability went down — tools/portability-baseline lowered to match")
         scan = subprocess.run([str(scanner)], cwd=fw, capture_output=True, text=True)
         if scan.returncode != 0:
             undo()
