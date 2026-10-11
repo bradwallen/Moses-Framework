@@ -27,6 +27,7 @@ set -uo pipefail
 # files. That is precisely the failure this project's second principle is about: a check that could
 # not look must never render as a clean verdict. Caught because the answer was obviously wrong;
 # a subtler version would have been believed.
+SELF="$(readlink -f "$0")"   # the self-test re-runs THIS copy, not whichever one is installed
 cd "$(git rev-parse --show-toplevel 2>/dev/null || dirname "$0")" || exit 1
 
 MODE="${1:-advisory}"
@@ -124,6 +125,18 @@ FIXTURE
         printf '    %-18s BROKEN — a bare literal counted %s, want 1\n' "classifier" "$_c2"; bad=1
     fi
 
+    # An extensionless Python script, through the real counting path in a throwaway repo: its
+    # docstring is prose, its literal is code.
+    _r="$_t/repo"; mkdir -p "$_r" && git -C "$_r" init -q && (cd "$_r" && \
+      printf '#!/usr/bin/env python3\n"""Docstring naming Birdeye."""\nNAME = "Birdeye"\n' > tool && \
+      for i in 1 2 3 4 5; do printf 'x = %d\n' "$i" > "f$i.py"; done && git add -A)
+    _c3=$(cd "$_r" && "$SELF" --counts 2>/dev/null | awk -F'\t' '$1=="persona-names"{print $2}')
+    if [ "$_c3" = 1 ]; then
+        printf '    %-18s an extensionless Python script: docstring exempt, literal counted\n' "classifier"
+    else
+        printf '    %-18s BROKEN — extensionless Python counted %s, want 1\n' "classifier" "${_c3:-nothing}"; bad=1
+    fi
+
     # And a line that must trip nothing, so a pattern cannot become a wildcard.
     innocent='def reply(history, bot_user_id, channel, reactive=False):'
     while IFS=$'\t' read -r cat pat _; do
@@ -173,7 +186,10 @@ while IFS=$'\t' read -r cat pat advice; do
     # persona-name total read 36 "in code" when about eight were actionable literals, and it did
     # not move when the names underneath actually changed. `tools/prose-lines.py` marks docstring
     # line numbers via the AST; a string in VALUE position stays code, which is the whole point.
-    case "$f" in
+    # A Python script with no .py extension (moses-drift, moses-selftest) is still Python: its
+    # docstrings are prose. Missing that counted them as code — the 2026-09-03 miscount, one layer over.
+    fk="$f"; case "$f" in *.*) ;; *) head -c 64 "$f" 2>/dev/null | head -1 | grep -qE '^#!.*python' && fk="$f.py" ;; esac
+    case "$fk" in
       */tests/*|*_test.py) c=0; pc=$(grep -cE "$pat" "$f" 2>/dev/null) || pc=0 ;;
       *.py) tot=$(grep -cE "$pat" "$f" 2>/dev/null) || tot=0
             pl=$(python3 "$(dirname "$0")/prose-lines.py" "$f" 2>/dev/null | tr '\n' '|' | sed 's/|$//')
