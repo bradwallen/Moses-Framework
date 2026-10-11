@@ -1353,6 +1353,19 @@ def reply(history: list[dict], bot_user_id: str, channel: str,
                 # asking "moses status"; Atlas pointed out it was not his box (2026-09-14).
                 return ("text", "I haven't checked a live source for that, so I won't answer it from "
                                 "memory. Ask me to look it up and I will.", spent)
+            # A QUESTION PUT TO HIM BY NAME GETS AN ANSWER (2026-10-11). Atlas's daily "Hey Moses,
+            # anything new?" got PASS on 10/9 and 10/11: nothing new read as nothing worth the room.
+            # PASS is for talk that isn't for him. Asked once more, like the state gate above; a
+            # second PASS stands, because a guard that forces words into his mouth is worse.
+            if (directed and attempt == 1 and "?" in last_said
+                    and parse_action(data.get("result") or "")[0] == "pass"):
+                print("moses: passed on a question put to him by name — asking once more", flush=True)
+                this_prompt = (
+                    "SYSTEM CORRECTION: the last message asks YOU a question, by name. PASS is for talk "
+                    "that is not for you, and this is. Answer it briefly. 'Nothing new since last "
+                    "night' is a fine answer; don't repeat what you already told them.\n\n" + prompt
+                )
+                continue
             break
         _log_failure(data, attempt)
         # AUTH FAILS DIFFERENTLY. It cannot heal in eight seconds and it will not heal on its own at

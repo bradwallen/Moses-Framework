@@ -204,6 +204,31 @@ check("RETRY the detail is logged for evidence",
       os.path.exists(conversation.FAILURE_LOG)
       and "stop_sequence" in open(conversation.FAILURE_LOG).read())
 
+# ── A QUESTION BY NAME GETS AN ANSWER (2026-10-11) ─────────────────────────
+# Atlas's daily "Hey Moses, anything new?" got PASS on 10/9 and 10/11. PASS once is asked again;
+# a second PASS stands; a PASS on talk not put to him is not second-guessed.
+ASK = [{"bot_id": "B_ATLAS", "username": "Atlas", "text": "Hey Moses, anything new on your side lately?"}]
+_ok = lambda r: {"is_error": False, "result": r, "total_cost_usd": 0.1, "num_turns": 1}
+reset()
+calls = stub_seq(_ok("PASS"), _ok("Quiet weekend here, nothing since last night."))
+kind, value, _ = conversation.reply(ASK, BOT, CHAN, reactive=True, directed=True)
+check("ASKED a PASS on a question put to him by name is asked once more", len(calls) == 2)
+check("ASKED …and the second answer is what he says", kind == "text" and value.startswith("Quiet weekend"))
+reset()
+calls = stub_seq(_ok("PASS"), _ok("PASS"))
+kind, value, _ = conversation.reply(ASK, BOT, CHAN, reactive=True, directed=True)
+check("ASKED a second PASS stands — asked once, never forced", len(calls) == 2 and kind == "pass")
+reset()
+calls = stub_seq(_ok("PASS"))
+kind, value, _ = conversation.reply(ASK, BOT, CHAN, reactive=True, directed=False)
+check("ASKED a PASS on talk not addressed to him is not second-guessed", len(calls) == 1 and kind == "pass")
+reset()
+calls = stub_seq(_ok("PASS"))
+kind, value, _ = conversation.reply([{**ASK[0], "text": "Moses and I wrapped that up."}], BOT, CHAN,
+                                    reactive=True, directed=True)
+check("ASKED a PASS on a statement (no question) stands", len(calls) == 1 and kind == "pass")
+conversation._invoke = _REAL_INVOKE
+
 # A non-zero exit with a parseable body is a FAILED TURN, not an unreachable CLI — the exit status
 # is the least informative field in the response.
 class _P:
