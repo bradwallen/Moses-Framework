@@ -21,7 +21,7 @@ import json, os, urllib.error, urllib.request
 
 CONF = os.path.expanduser("~/.config/moses/customs.env")
 
-# REQUIRED, not cosmetic. Cloudflare's managed bot rules sit in front of viatica.travel and answer
+# REQUIRED, not cosmetic. Cloudflare's managed bot rules sit in front of example.org and answer
 # Python's default "Python-urllib/3.x" with a 403 — which reads exactly like an auth failure but
 # never reaches Viatica's code, because ours returns 401. Naming ourselves gets through and makes the
 # caller identifiable in Cloudflare's logs.

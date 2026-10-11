@@ -6,7 +6,7 @@ the thing Moses edits can never disagree.
 
 Runs as a systemd USER unit on localhost — no privilege to deploy, and nothing but the tunnel on the
 same machine can reach it. Public access is Cloudflare's job: a tunnel route plus an Access policy,
-exactly like code.viatica.travel.
+exactly like code.example.org.
 
 Stdlib only, on purpose. This is a page about six projects; a dependency here would be a thing to
 keep patched forever in exchange for nothing.

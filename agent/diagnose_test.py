@@ -98,12 +98,12 @@ check("silent failure: counts as a failure", "exit **7** (failed)" in cov, True)
 check("silent failure: not flagged away as unknown", "⚠️" in cov, False)
 
 # Invoked against staging — and printing nothing, so only the invocation can tell.
-out, cov = diagnose._run(["true", "https://staging.viatica.travel/"], label="direct HTTP check", target=V)
+out, cov = diagnose._run(["true", "https://staging.example.org/"], label="direct HTTP check", target=V)
 check("wrong target: flagged as a mismatch from the invocation", "scope MISMATCH: registered for" in cov, True)
-check("wrong target: says where it was invoked", "invoked against **https://staging.viatica.travel/**" in cov, True)
+check("wrong target: says where it was invoked", "invoked against **https://staging.example.org/**" in cov, True)
 
 # Output is a cross-check: a URL configured inside the check that points elsewhere is still caught.
-cov = diagnose.coverage(["/usr/local/bin/birdeye-customs"], "UP https://staging.viatica.travel/", 0,
+cov = diagnose.coverage(["/usr/local/bin/birdeye-customs"], "UP https://staging.example.org/", 0,
                         "birdeye-customs", V)
 check("cross-check: output naming only another site is flagged", "but its output names only" in cov, True)
 cov = diagnose.coverage(["/usr/local/bin/birdeye-customs"], f"UP {V}api/health", 0, "birdeye-customs", V)
@@ -121,7 +121,7 @@ cov = diagnose.coverage(["/usr/bin/uptime"], "up 3 days", 0)
 check("unregistered check: flagged, not passed", "registered for no target" in cov, True)
 
 check("a trailing slash is the same site",
-      "⚠️" in diagnose.coverage(["x", "https://viatica.travel"], "", 0, "c", V), False)
+      "⚠️" in diagnose.coverage(["x", "https://example.org"], "", 0, "c", V), False)
 
 # The registry agrees with itself: every probe, fed a healthy run, reads back its own target. A probe
 # whose argv and target drift apart would be flagged on every real alarm, so it fails here first.

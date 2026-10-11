@@ -148,6 +148,90 @@ with tempfile.TemporaryDirectory() as t:
           r.returncode == 2 and "not a destination path" in r.stderr, r.stderr)
 
 
+print("\nframework.scrub — the operator's names never reach the framework")
+SCRUB_MAP = "framework.scrub  private  this operator's names\n"
+SCRUB_RULES = ("# test rules\n"
+               "text    10.9.8.7            100.64.0.1\n"
+               "text    one.realname.test   dashboard.example.com\n"
+               "domain  realname.test       example.com\n")
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t), extra_map=SCRUB_MAP)
+    (inst / "framework.scrub").write_text(SCRUB_RULES)
+    (inst / "agent" / "hosts.py").write_text(
+        'API = "https://api.realname.test/v1"\nAPEX = "RealName.Test"\n'
+        'ONE = "one.realname.test"\nIP = "10.9.8.7"\nOTHER = "notrealname.test"\n')
+    commit_all(inst)
+    r = run(inst, fw)
+    out = (fw / "agent" / "hosts.py").read_text() if (fw / "agent" / "hosts.py").exists() else ""
+    check("a sync with names to rewrite succeeds", r.returncode == 0, r.stderr)
+    check("a subdomain keeps its label on the generic domain", 'API = "https://api.example.com/v1"' in out, out)
+    check("the apex is rewritten whatever its case", 'APEX = "example.com"' in out, out)
+    check("a text rule wins over its domain's rule", 'ONE = "dashboard.example.com"' in out, out)
+    check("an exact string is rewritten", 'IP = "100.64.0.1"' in out, out)
+    check("a different domain that merely ends the same is left alone", 'OTHER = "notrealname.test"' in out, out)
+    check("the operator's own copy keeps its real names",
+          "api.realname.test" in (inst / "agent" / "hosts.py").read_text())
+    check("the rules file itself is not copied", not (fw / "framework.scrub").exists())
+    commit_all(fw)
+    r = run(inst, fw, "--check")
+    check("after a rewrite, --check still says in step (it compares the rewritten bytes)",
+          r.returncode == 0, r.stdout + r.stderr)
+
+    # A framework-owned file naming the operator: the sync does not rewrite those, so it must refuse.
+    (fw / "README.md").write_text("Reach it at portal.realname.test\n")
+    commit_all(fw)
+    r = run(inst, fw, "--check")
+    check("--check names a framework-owned file that names the operator (exit 1), by file and line",
+          r.returncode == 1 and "README.md:1" in r.stdout, r.stdout + r.stderr)
+    (inst / "agent" / "m2.py").write_text("x = 'changed'\n")
+    commit_all(inst)
+    r = run(inst, fw)
+    check("…and a sync refuses before copying anything (exit 2)",
+          r.returncode == 2 and "README.md:1" in r.stderr and (fw / "agent" / "m2.py").read_text() == "x = 2\n",
+          r.stderr)
+
+with tempfile.TemporaryDirectory() as t:
+    # Watch the post-copy guard fail on its own: a rule that cannot rewrite what it forbids (the real
+    # name split by markup) leaves a trace, and the whole run is undone.
+    inst, fw = world(Path(t), extra_map=SCRUB_MAP)
+    (inst / "framework.scrub").write_text("text  secret-host-7  generic-host\n")
+    (inst / "agent" / "m4.py").write_text("H = 'SECRET-HOST-7'\n")   # caught: rules ignore case
+    commit_all(inst)
+    r = run(inst, fw)
+    check("a name in another case is still rewritten", r.returncode == 0 and "generic-host" in
+          (fw / "agent" / "m4.py").read_text(), r.stderr)
+    commit_all(fw)
+    (inst / "framework.scrub").write_text("text  secret-host-7  generic-host\ndomain  realname.test  example.com\n")
+    (inst / "agent" / "m5.py").write_text("H = 'secret-host-7'\n")
+    commit_all(inst)
+    # Break the rewrite in a copy of the script, so the forbidden scan is the only thing left standing.
+    broken = (inst / "agent" / "moses-framework-sync").read_text().replace(
+        "        text = pat.sub(generic, text)\n", "        pass\n")
+    assert broken != (inst / "agent" / "moses-framework-sync").read_text(), "the rewrite line moved — update this test"
+    (inst / "agent" / "moses-framework-sync").write_text(broken)
+    commit_all(inst)
+    r = run(inst, fw)
+    check("with the rewrite disabled, the forbidden scan stops the sync, by file and line (exit 2)",
+          r.returncode == 2 and "agent/m5.py:1" in r.stderr, r.stderr)
+    check("…and nothing from that run is left behind",
+          (fw / "agent" / "m5.py").read_text() == "x = 5\n" and not git(fw, "status", "--porcelain").strip(),
+          git(fw, "status", "--porcelain"))
+
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t), extra_map=SCRUB_MAP)
+    (inst / "framework.scrub").write_text("domain  realname.test  realname.test.example.com\n")
+    commit_all(inst)
+    r = run(inst, fw, "--check")
+    check("a generic name that still contains the real one is refused", r.returncode == 2 and "still contains" in r.stderr,
+          r.stderr)
+
+with tempfile.TemporaryDirectory() as t:
+    inst, fw = world(Path(t))
+    r = run(inst, fw)
+    check("with no rules file, the sync still runs and SAYS nothing is being checked",
+          r.returncode == 0 and "neither rewritten nor checked" in r.stderr, r.stderr)
+
+
 print("\nmoses_env — the settings every entry point reads")
 PROBE = """
 import os, sys, json

@@ -37,7 +37,7 @@ CASES: list[tuple[str, dict, str, str]] = [
     ("Bash", {"command": "claude -p 'summarize this'"}, "deny", "claude CLI spends off-budget"),
     ("Bash", {"command": "ant beta:sessions create"}, "deny", "ant CLI spends off-budget"),
     ("WebFetch", {"url": "https://api.anthropic.com/v1/models"}, "deny", "API via WebFetch"),
-    ("WebFetch", {"url": "https://viatica.travel/itinerary/generate"},
+    ("WebFetch", {"url": "https://example.org/itinerary/generate"},
      "deny", "Viatica AI route — costs money, disturbs itinerary parsing"),
     ("Bash", {"command": "curl -X POST $APP/api/ingest"}, "deny", "Viatica ingest invokes Claude"),
 

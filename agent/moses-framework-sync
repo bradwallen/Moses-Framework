@@ -17,6 +17,18 @@ THREE REFUSALS, all before anything is written:
   * a shipped file the framework's own secret scanner rejects. The scanner is the framework's, not a
     copy of it here, so the two can never disagree about what a secret looks like.
 
+OPERATOR NAMES ARE REWRITTEN ON THE WAY OUT (2026-10-10). Brad: "hostnames are cleaned out and made
+generic. It's a framework for someone else to use and they'll choose their own hostnames." The
+operator's own tree keeps its real names — its docs have to say where things actually live — so the
+rewrite happens here, from `framework.scrub` (private, next to framework.map):
+
+    domain  <real-domain>  <generic-domain>    the domain and every subdomain of it
+    text    <real>         <generic>           an exact string: an address, an id, a machine name
+
+Every <real> is then FORBIDDEN in the whole framework checkout, not only in what this run copied: a
+trace left anywhere — a framework-owned file, a spelling the rule did not catch — stops the sync by
+file and line. A shipped file is compared AFTER rewriting, so --check still means "byte for byte".
+
 It does not commit. What changed is left in the framework's working tree to be read, and the
 framework's pre-commit hook scans it again on the way in.
 
@@ -28,6 +40,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -35,6 +48,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 MAP = REPO / "framework.map"
+SCRUB = REPO / "framework.scrub"
 # Directories the framework takes from this tree. Anything in them that this tree does not ship is
 # removed by a sync; everything outside them (README, LICENSE, docs, config examples, tools, hooks,
 # installers, the role-named personas) is the framework's own and never touched.
@@ -94,8 +108,70 @@ def classify(files: list[str], rules) -> tuple[dict[str, str], list[str], list[s
     return ships, private, unmatched
 
 
-def same(a: Path, b: Path) -> bool:
-    return b.is_file() and a.read_bytes() == b.read_bytes() and (os.access(a, os.X_OK) == os.access(b, os.X_OK))
+def load_scrub() -> tuple[list[tuple[re.Pattern, str]], list[tuple[str, re.Pattern]]]:
+    """(rewrites, forbidden) from framework.scrub. Text rules run first, longest first, so a specific
+    name (one host) can be given its own generic name before its domain's rule rewrites the rest."""
+    if not SCRUB.is_file():
+        print(f"moses-framework-sync: no {SCRUB.name} — this operator's names are neither rewritten nor "
+              f"checked for", file=sys.stderr)
+        return [], []
+    texts, domains, forbid = [], [], []
+    for n, line in enumerate(SCRUB.read_text().splitlines(), 1):
+        line = line.split(" #", 1)[0].strip() if not line.lstrip().startswith("#") else ""
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) != 3 or parts[0] not in ("domain", "text"):
+            die(f"{SCRUB.name} line {n}: expected 'domain <real> <generic>' or 'text <real> <generic>'")
+        kind, real, generic = parts
+        if real.lower() in generic.lower():
+            die(f"{SCRUB.name} line {n}: the generic name '{generic}' still contains '{real}'")
+        if kind == "domain":
+            # Any labels in front are kept: api.<real> becomes api.<generic>. The lookarounds stop
+            # notreal.com matching real.com.
+            pat = re.compile(r"(?<![A-Za-z0-9-])((?:[A-Za-z0-9-]+\.)*)" + re.escape(real) + r"(?![A-Za-z0-9-])",
+                             re.IGNORECASE)
+            domains.append((pat, r"\g<1>" + generic))
+            # Forbidden with the same boundaries, so notreal.com is not a leak of real.com.
+            forbid.append((real, re.compile(r"(?<![A-Za-z0-9-])" + re.escape(real) + r"(?![A-Za-z0-9-])",
+                                            re.IGNORECASE)))
+        else:
+            texts.append((len(real), re.compile(re.escape(real), re.IGNORECASE), generic.replace("\\", "\\\\")))
+            forbid.append((real, re.compile(re.escape(real), re.IGNORECASE)))
+    texts.sort(key=lambda t: -t[0])
+    return [(p, g) for _, p, g in texts] + domains, forbid
+
+
+def scrubbed(path: Path, rewrites) -> bytes:
+    data = path.read_bytes()
+    if not rewrites:
+        return data
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data   # binary: nothing to rewrite, and the forbidden scan reads it as bytes anyway
+    for pat, generic in rewrites:
+        text = pat.sub(generic, text)
+    return text.encode("utf-8")
+
+
+def leaks(fw: Path, files: list[str], forbid) -> list[str]:
+    """Every file:line in the framework checkout that still names something the operator listed."""
+    found = []
+    for f in files:
+        p = fw / f
+        if not p.is_file():
+            continue
+        text = p.read_bytes().decode("utf-8", errors="replace")
+        for n, line in enumerate(text.splitlines(), 1):
+            for real, pat in forbid:
+                if pat.search(line):
+                    found.append(f"{f}:{n}  ({real})")
+    return found
+
+
+def same(a: Path, b: Path, rewrites) -> bool:
+    return b.is_file() and scrubbed(a, rewrites) == b.read_bytes() and (os.access(a, os.X_OK) == os.access(b, os.X_OK))
 
 
 def main() -> None:
@@ -121,12 +197,21 @@ def main() -> None:
             print(f"  {f}", file=sys.stderr)
         sys.exit(2)
 
+    rewrites, forbid = load_scrub()
     dests = {d: s for s, d in ships.items()}
     fw_files = tracked(fw)
-    changed = [d for s, d in ships.items() if not same(REPO / s, fw / d)]
+    changed = [d for s, d in ships.items() if not same(REPO / s, fw / d, rewrites)]
     stale = [f for f in fw_files if f.startswith(OWNED_DIRS) and f not in dests]
 
     if a.check:
+        # Only the framework's OWN files can leak here — a shipped file is judged after rewriting.
+        owned = [f for f in fw_files if f not in dests]
+        left = leaks(fw, owned, forbid)
+        if left:
+            print(f"framework names this operator in {len(left)} place(s) a sync does not rewrite — fix them there:")
+            for x in left:
+                print(f"  {x}")
+            sys.exit(1)
         if changed or stale:
             print(f"framework is behind: {len(changed)} file(s) to copy, {len(stale)} to remove "
                   f"({len(ships)} ship, {len(private)} private)")
@@ -145,6 +230,12 @@ def main() -> None:
     if dirty.stdout.strip():
         die(f"{fw} has uncommitted changes — commit or discard them first; a sync would bury them")
 
+    left = leaks(fw, [f for f in fw_files if f not in dests], forbid)
+    if left:
+        print("\n".join(f"  {x}" for x in left), file=sys.stderr)
+        die(f"the framework's own files name this operator in {len(left)} place(s) — a sync does not "
+            f"rewrite those; fix them there first. Nothing was copied")
+
     scanner = fw / "tools" / "scan-secrets.sh"
     if not os.access(scanner, os.X_OK):
         die(f"{scanner} is missing — refusing to copy anything the framework cannot scan")
@@ -152,7 +243,8 @@ def main() -> None:
     for d in changed:
         src, dst = REPO / dests[d], fw / d
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
+        dst.write_bytes(scrubbed(src, rewrites))
+        shutil.copymode(src, dst)
     for d in stale:
         (fw / d).unlink()
     # Stage exactly what this run wrote, so the framework's scanner reads it the way the hook will.
@@ -182,6 +274,12 @@ def main() -> None:
             undo()
             die("the framework's .gitignore excludes shipped file(s): " + ", ".join(missing) +
                 " — add an exception there, or mark them private here; nothing was kept")
+        left = leaks(fw, tracked(fw) + [d for d in changed if d not in fw_files], forbid)
+        if left:
+            undo()
+            print("\n".join(f"  {x}" for x in left), file=sys.stderr)
+            die(f"the framework would still name this operator in {len(left)} place(s) — add a rule to "
+                f"{SCRUB.name}, or fix a framework-owned file by hand; nothing was kept")
         scan = subprocess.run([str(scanner)], cwd=fw, capture_output=True, text=True)
         if scan.returncode != 0:
             undo()

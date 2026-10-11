@@ -12,11 +12,11 @@ three ways.
 ## 1. System overview — where everything runs
 
 ```
-  BRAD                                RESERVE (bamaserv, 10.0.0.185 / tailscale 100.87.21.18)
+  BRAD                                RESERVE (devbox, 192.168.1.10 / tailscale 100.64.0.1)
   ────                                ──────────────────────────────────────────────────────
                                       ┌──────────────────────────────────────────────────┐
   Claude app  ──── MCP ─────┐         │  moses-mcp.service        (user unit, brad)       │
-  (iOS/desktop)             │         │    100.87.21.18:8765   profile=full   26 tools    │
+  (iOS/desktop)             │         │    100.64.0.1:8765   profile=full   26 tools    │
    pays for the thinking    │         │                                                   │
                             │         │  moses-mcp-public.service (user unit, brad)       │
   Slack ──── Socket Mode ───┼─────────┼─▶  127.0.0.1:8766      profile=full               │
@@ -32,15 +32,15 @@ three ways.
                             │         │                                                   │
                             │         │  moses-dashboard.service  (user unit, brad)       │
   Browser ──── HTTPS ───────┼─────────┼─▶  127.0.0.1:8791   read-only web dashboard      │
-   projects.bradwallen.com  │         │    /home/brad/Projects/moses/mcp/dashboard_server.py       │
-   projects.viatica.travel  │         │                                                   │
-    (both live)             │         │  3dcarstuff-dashboard.service (user unit, brad)   │
-  Browser ──── HTTPS ───────┼─────────┼─▶  100.87.21.18:8001  business dashboard          │
-   bcm.bradwallen.com       │         │    expenses, revenue, Schedule C categories       │
+   projects.example.com  │         │    /home/brad/Projects/moses/mcp/dashboard_server.py       │
+                            │         │                                                   │
+                            │         │  3dcarstuff-dashboard.service (user unit, brad)   │
+  Browser ──── HTTPS ───────┼─────────┼─▶  100.64.0.1:8001  business dashboard          │
+   dashboard.example.com       │         │    expenses, revenue, Schedule C categories       │
                             │         │                                                   │
                             │         │  code-server              (user)                  │
-  Browser ──── HTTPS ───────┼─────────┼─▶  100.87.21.18:8080                              │
-   code.bradwallen.com      │         │                                                   │
+  Browser ──── HTTPS ───────┼─────────┼─▶  100.64.0.1:8080                              │
+   code.example.com      │         │                                                   │
                             │         │                                                   │
                             │         │  burtbot.service   (user unit — INSTALLED, NOT    │
                             │         │    STARTED: its Discord token must be rotated,    │
@@ -56,10 +56,10 @@ three ways.
                             │
                             │         CLOUDFLARE                    VIATICA (Railway, "Customs")
                             │         ──────────                    ───────────────────────────
-                            └────────▶ moses.bradwallen.com/mcp     /api/cron/cfo     (Big Pipe)
+                            └────────▶ moses.example.com/mcp     /api/cron/cfo     (Big Pipe)
                                         │  MCP portal + Access      /api/cron/support (Tagilla)
                                         ▼                             ▲
-                                       moses-origin.viatica.travel    │
+                                       moses-origin.example.com    │
                                         │  tunnel + service token     │
                                         ▼                             │
                                        127.0.0.1:8766 ────────────────┘
@@ -109,7 +109,7 @@ about to move into `~/Projects`.
 
 ---
 
-## 1b. The dashboard — projects.viatica.travel
+## 1b. The dashboard — projects.example.com
 
 Read-only web view of the same state Moses answers from. **A THIRD CODEBASE**, and that surprised
 everyone on 2026-08-22: Knight was asked to fix a nav bug on it, cloned the Viatica repo, and
@@ -117,7 +117,7 @@ correctly reported that `/projects` does not exist there. It lives beside the MC
 either product repo.
 
 ```
-  Browser ──▶ projects.bradwallen.com / projects.viatica.travel ──▶ cloudflared ──▶ 127.0.0.1:8791
+  Browser ──▶ projects.example.com ──▶ cloudflared ──▶ 127.0.0.1:8791
                                                             │
                                           moses-dashboard.service (user unit, brad)
                                           /home/brad/Projects/moses/mcp/dashboard_server.py
@@ -248,42 +248,49 @@ from "no duplicates".
   the app reasons over the result and answers Brad
 ```
 
-## 2b. Two domains, on purpose — the bradwallen.com migration
+## 2b. Two domains, on purpose — the example.com migration
 
 **Written 2026-09-03, the day the estate stopped living on the product's domain.**
 
-Moses, the dashboards and code-server had all been published under `viatica.travel`. That is the
-domain customers reach the product on, and none of these are the product. Brad: *"get bradwallen.com
+Moses, the dashboards and code-server had all been published under `example.org`. That is the
+domain customers reach the product on, and none of these are the product. Brad: *"get example.com
 behind Cloudflare so that we can use that domain for the BCM Dashboard as well as all the
 Moses/Project stuff."*
 
 ```
                      ONE TUNNEL, NAMED "Reserve"
-                     3a916b4f-2b4b-4768-9d07-800bf12436a1
-                     connector: bamaserv
+                     00000000-0000-0000-0000-000000000000
+                     connector: devbox
                                   │
        ┌──────────────────────────┼──────────────────────────┐
        │                          │                          │
-   bradwallen.com            viatica.travel            (catch-all)
-   ── the estate ──          ── being retired ──        http_status:404
-       │                          │
-   bcm ─────▶ 100.87.21.18:8001   projects ─▶ localhost:8791
-   projects ▶ localhost:8791      code ─────▶ 100.87.21.18:8080
-   code ────▶ 100.87.21.18:8080   moses-origin ▶ 127.0.0.1:8766
-   moses ───▶ NOT YET                 │
-                                 moses.bradwallen.com = MCP PORTAL, no ingress rule
+   example.com                                       (catch-all)
+   ── the estate ──                                      http_status:404
+       │
+   bcm ──────────▶ 100.64.0.1:8001
+   projects ─────▶ localhost:8791
+   code ─────────▶ 100.64.0.1:8080
+   moses-origin ─▶ 127.0.0.1:8766
+   example.com, www ▶ 127.0.0.1:8793
+   moses.example.com = MCP PORTAL, no ingress rule
 ```
 
-**ADDITIVE, NEVER A CUT-OVER.** Both sets answer simultaneously. Nothing on `viatica.travel` is
+**ADDITIVE, NEVER A CUT-OVER.** Both sets answer simultaneously. Nothing on `example.org` is
 retired until its replacement is proven working, so there is no window in which a service is neither
-in one place nor the other. The `viatica.travel` rows come out only when `moses` moves.
+in one place nor the other. The `example.org` rows come out only when `moses` moves.
+
+**All example.org names were retired 2026-10-10** (`code.`, `projects.`, `moses-origin.`: route,
+Access app and DNS record each). Retiring `moses-origin.example.org` took Moses MCP down for about
+half an hour, because the MCP **server** record still pointed at it — the portal had moved on 9/23,
+the server had not. The server's URL is fixed at creation, so it was deleted and re-created against
+`moses-origin.example.com`. Lesson: a Cloudflare-side object can be a caller too.
 
 **The Moses pair is two objects, not one**, and that is the whole reason it was left until last:
 
 | object | what it is |
 |---|---|
-| `moses.bradwallen.com` | an **MCP Portal** Access application. **No tunnel ingress rule at all.** |
-| `moses-origin.viatica.travel` | the self-hosted origin behind the tunnel, on a **service token** |
+| `moses.example.com` | an **MCP Portal** Access application. **No tunnel ingress rule at all.** |
+| `moses-origin.example.com` | the self-hosted origin behind the tunnel, on a **service token** |
 
 The portal is what the Claude app connects to. Moving it means creating both, repointing the
 connector URL in the app, and updating every script that hardcodes the old name — so it takes Moses
@@ -291,7 +298,7 @@ off Brad's phone if it is done carelessly.
 
 **Access lists were copied from the live policies, not from memory:** `bcm` is Brad only (it renders
 the business's expenses, revenue and Schedule C figures), `projects` is Brad and Jon, `code` is Brad
-only. Session duration standardised at 730h; `projects.viatica.travel` alone had been 24h with
+only. Session duration standardised at 730h; `projects.example.org` alone had been 24h with
 nothing indicating that was deliberate.
 
 **Two verification traps live here, both hit on 2026-09-03** — see
@@ -308,7 +315,7 @@ nothing indicating that was deliberate.
 
 **LABS IS GONE.** The Raspberry Pi was retired and its card wiped on 2026-09-03. BurtBot and the
 3DCarStuff dashboard were moved to Reserve first; the Gmail ingest that fed that database garbage was
-deliberately left behind. Nothing in this estate should reach for `10.0.0.110` or `100.67.190.7`
+deliberately left behind. Nothing in this estate should reach for `192.168.1.20` or `100.64.0.2`
 again — see [[project_labs_decommission_audit]].
 
 **Three Access applications, three different questions.** Confusing them cost an afternoon:
@@ -316,8 +323,8 @@ again — see [[project_labs_decommission_audit]].
 | Application | Type | Policy | Answers |
 |---|---|---|---|
 | `Moses` → `moses` | MCP | `Moses-MCP` (Emails) | who may USE the server's tools |
-| `Moses` → `moses.bradwallen.com` | MCP Portal | `Moses-MCP` (Emails) | who may reach the portal |
-| `moses-origin` → `moses-origin.viatica.travel` | Self-hosted | `Moses MCP origin` (**Service Auth** + service token) | who may reach the tunnel origin |
+| `Moses` → `moses.example.com` | MCP Portal | `Moses-MCP` (Emails) | who may reach the portal |
+| `moses-origin (example.com)` → `moses-origin.example.com` | Self-hosted | `Moses MCP origin` (**Service Auth** + service token) | who may reach the tunnel origin |
 
 A service token needs Action `Service Auth`, never `Allow` — an Emails rule can never match a machine.
 

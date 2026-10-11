@@ -367,7 +367,7 @@ def check_prompt_matches_tools() -> None:
 # "A component nobody documented is invisible to it — no checker can find those." That sentence was
 # written, was true, and named the exact hole nobody then closed.
 #
-# 2026-08-22: `moses-dashboard` — a web service on projects.viatica.travel — appeared in no
+# 2026-08-22: `moses-dashboard` — a web service on projects.example.org — appeared in no
 # architecture document at all. It was built days earlier, and the omission survived because
 # everything we had asked "are the written things still true" and nothing asked "is anything here
 # unwritten". Brad: "You build something, it gets documented SOMEWHERE that then gets CHECKED by

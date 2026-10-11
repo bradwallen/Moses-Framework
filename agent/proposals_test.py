@@ -203,7 +203,7 @@ DUP_B = ("Write a Viatica go-live checklist covering every Stripe dashboard sett
          "Hostinger parking to Railway, and verify the three unexercised referral Stripe calls "
          "against the live account during that run.")
 DUP_C = ("Write a go-live checklist covering the Viatica cutover — every Stripe dashboard setting "
-         "that must be re-created in live mode, the viatica.travel DNS switch from Hostinger to "
+         "that must be re-created in live mode, the example.org DNS switch from Hostinger to "
          "Railway, and verification of the three unexercised referral Stripe calls against the "
          "live account.")
 UNRELATED = ("Extend the probe coverage assertion so each check emits its identity and scope "

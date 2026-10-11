@@ -5,7 +5,7 @@
 #   moses-hardware --print    collect and print it, write nothing
 #
 # LABS IS GONE. The Pi was retired and its card wiped on 2026-09-03, so it is no longer a host here —
-# the collector used to SSH to 100.67.190.7 every five minutes and would now do nothing but time out.
+# the collector used to SSH to 100.64.0.2 every five minutes and would now do nothing but time out.
 #
 # WHY A COLLECTOR AND NOT A PAGE. The dashboard auto-refreshes, and reading disks and uptime shells
 # out; doing that inside a page render makes every view wait on it. The page reads a file; this

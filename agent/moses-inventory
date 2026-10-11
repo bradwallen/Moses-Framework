@@ -116,7 +116,7 @@ if command -v tailscale >/dev/null 2>&1; then
   while read -r ip host _; do
     [ -n "${ip:-}" ] || continue
     case "$ip" in 100.*) ;; *) continue ;; esac
-    # Skip this machine — "can bamaserv ssh to bamaserv" is not a fact worth reporting.
+    # Skip this machine — "can devbox ssh to devbox" is not a fact worth reporting.
     [ "$host" = "$(hostname)" ] && continue
     if timeout 6 ssh -o BatchMode=yes -o ConnectTimeout=4 "brad@$ip" true 2>/dev/null; then
       emit "- \`$host\` (\`$ip\`) — SSH reachable as brad"

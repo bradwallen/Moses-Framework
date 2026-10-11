@@ -30,7 +30,7 @@ TIMEOUT = 25
 # same Accept — answers 200 with a curl, browser or custom User-Agent and 403 with the default one.
 # It is the UA string alone.
 #
-# This started when the domain moved to viatica.travel on 20 August and put these calls behind
+# This started when the domain moved to example.org on 20 August and put these calls behind
 # Cloudflare; the old Railway host is not behind it. So Big Pipe and Tagilla had both been answering
 # "Customs answered HTTP 403" to every on-demand question for six days — including every question
 # about money — while their SCHEDULED reports stayed green, because those go through curl by a
@@ -38,7 +38,7 @@ TIMEOUT = 25
 #
 # Identify honestly rather than pretending to be a browser: a real name is what we would want to see
 # in our own logs, and if it is ever blocked deliberately that should be a decision someone can make.
-USER_AGENT = "Moses-MCP/1.0 (+https://viatica.travel; Reserve)"
+USER_AGENT = "Moses-MCP/1.0 (+https://example.org; Reserve)"
 
 
 class CustomsError(RuntimeError):

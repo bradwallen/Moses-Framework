@@ -102,7 +102,7 @@ def redact(text: str) -> str:
 # TARGET is what the probe is registered to look at, written the way scope() reads the invocation: a URL,
 # a unit, the paths it was given, the tool whose own state it reports, or `host <name>`.
 HOST = socket.gethostname()
-VIATICA = "https://viatica.travel/"
+VIATICA = "https://example.org/"
 
 PROBES: list[tuple[tuple[str, ...], str, list[str], str, str]] = [
     (("knight", "push", "remote", "build"),

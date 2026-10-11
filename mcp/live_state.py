@@ -45,7 +45,7 @@ def fetch(timeout: float = 8.0) -> dict | None:
         return None
     try:
         # A User-Agent is REQUIRED, not cosmetic. Cloudflare's managed bot rules sit in front of
-        # viatica.travel and answer Python's default "Python-urllib/3.x" with a 403 — which looks
+        # example.org and answer Python's default "Python-urllib/3.x" with a 403 — which looks
         # exactly like an auth failure but never reaches our code (ours returns 401). Naming
         # ourselves both gets through and makes the caller identifiable in Cloudflare's logs.
         req = urllib.request.Request(
