@@ -610,7 +610,18 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
             "op='ops' to see what is on the list. Anything not on it is refused by name; that is not "
             "a failure, it is the boundary.\n\n"
             "Do not say you cannot do something without trying the tool. If a call is refused, say "
-            "exactly what was refused and what it said.")
+            "exactly what was refused and what it said." + _local_actions_text())
+
+
+def _local_actions_text() -> str:
+    acts = local_actions()
+    if not acts:
+        return ""
+    return ("\n\nTHE OPERATOR'S OWN ACTIONS. These are not tools: ask for one with a line on its own, "
+            "`DO: <name> <argument>`, and code runs it after your reply is posted and reports back here. "
+            "Use one whenever what a person said means it, however they put it; nobody has to say the "
+            "name. Keep the rest of your reply to a line saying it has started, and never do the "
+            "action's work yourself in prose.\n" + "\n".join(f"- `{n}`: {d}" for n, d in acts))
 
 
 def enabled_channels() -> set[str]:
@@ -716,6 +727,33 @@ def extract_proposals(text: str) -> tuple[str, list[tuple[str, str]]]:
     if not found:
         return (text or "").strip(), []
     return PROPOSE_LINE.sub("", text or "").strip(), [(p, t) for p, t in found if t]
+
+
+# ── The operator's own actions (agent/local_commands.py), offered by name in conversation ─────────
+# Brad, 2026-10-12, after a keyword command failed to hear a plain-language request for it: *"I just
+# want to chat with him like chatting with any other AI. Using key words … completely erases the
+# magic of talking naturally."* So the operator's commands are not only keywords: each one he declares
+# is described to Moses on a turn a person directed, Moses decides from plain language that it is
+# what was meant, and asks for it with a `DO: <name> <argument>` line. The listener lifts the line out
+# and runs the operator's code. The judgement is the model's; the work is never the model's prose.
+DO_LINE = re.compile(r"^\s*DO:\s*([\w-]+)[ \t]*(.*?)\s*$", re.I | re.M)
+
+
+def local_actions() -> list[tuple[str, str]]:
+    """(name, when to use it) for each action the operator declared; [] in a framework install."""
+    try:
+        import local_commands                                   # noqa: PLC0415  (private, optional)
+        return [(str(n), str(d)) for n, d in (getattr(local_commands, "actions", lambda: [])() or [])]
+    except Exception:                                           # noqa: BLE001
+        return []
+
+
+def extract_actions(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split a reply into (message, [(action, argument)]). Own line, starts the line, like PROPOSE."""
+    found = [(m.group(1).lower(), m.group(2).strip()) for m in DO_LINE.finditer(text or "")]
+    if not found:
+        return (text or "").strip(), []
+    return DO_LINE.sub("", text or "").strip(), found
 
 
 def extract_learning(text: str) -> tuple[str, list[str]]:

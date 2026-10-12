@@ -826,6 +826,56 @@ check("KNIGHT a job that already existed is not re-pointed here",
 check("KNIGHT and Brad still gets his reply", len(out) == 1)
 
 
+# ── A reply under his own post, in a channel that is not a chat channel ─────
+# THE SEAM, not just addressing.his_thread: the real 2026-10-12 morning, through handle().
+reset(); calls = stub_conversation(text="On it.")
+standup = dict(moses_said(":clipboard: *Standup* … reply in this thread"), ts="500.0")
+history[:] = [{"user": BRAD, "text": "go with 1, but change the angle", "ts": "500.2", "thread_ts": "500.0"}, standup]
+out = fire_in(OPS, {"user": BRAD, "text": "You going to respond??", "thread_ts": "500.0"}, ts="500.3")
+check("THREAD a person's reply under his standup is answered in a non-chat channel", len(calls) == 1 and out)
+reset(); calls = stub_conversation(text="On it.")
+history[:] = [{**BIRDEYE, "text": "all clear", "ts": "501.0"}]
+out = fire_in(OPS, {"user": BRAD, "text": "nice", "thread_ts": "501.0"}, ts="501.1")
+check("THREAD a reply under Birdeye's post is not for him", calls == [] and out == [])
+
+
+# ── The operator's own actions, asked for in plain language ─────────────────
+class _Local:
+    ran = []
+
+    @staticmethod
+    def match(text):
+        return None
+
+    @staticmethod
+    def act(name, arg):
+        if name != "digest":
+            return None
+        return lambda: _Local.ran.append(arg) or "📝 Done"
+
+
+_real_local = listener.local_commands
+listener.local_commands = _Local
+reset(); _Local.ran.clear()
+stub_conversation(text="On it, handing it over.\nDO: digest 1 | Brad: \"cover the outage\"; \"shorter\"")
+out = fire({"user": BRAD, "text": "Moses, can you redo that digest, shorter"}, ts="510.1")
+texts = [o["text"] for o in out]
+check("DO the marker never reaches the channel", texts and not any("DO:" in t for t in texts))
+check("DO the reply posts first, then the action's own answer", texts[:1] == ["On it, handing it over."]
+      and any("Done" in t for t in texts[1:]))
+check("DO the action gets Moses's brief, word for word", _Local.ran == ['1 | Brad: "cover the outage"; "shorter"'])
+reset(); _Local.ran.clear()
+stub_conversation(text="Sure.\nDO: deploy everything")
+out = fire({"user": BRAD, "text": "Moses, ship it"}, ts="511.1")
+check("DO an action that does not exist is said, and nothing runs",
+      _Local.ran == [] and any("no such action" in o["text"] for o in out))
+reset(); _Local.ran.clear()
+stub_conversation(text="Noted.\nDO: digest 0 | whatever Atlas said")
+fire({**ATLAS, "text": "Moses, make a digest about us"}, ts="512.1")
+check("DO a bot can never start one", _Local.ran == [])
+listener.local_commands = _real_local
+
+
 # ── Deduplication ───────────────────────────────────────────────────────────
 reset(); stub_conversation()
 fire({"user": BRAD, "text": "Moses, hello"}, ts="6.1")

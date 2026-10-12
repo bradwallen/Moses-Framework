@@ -796,6 +796,7 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
         # the same message rather than a second one he has to correlate.
         value, learned = conversation.extract_learning(value)
         value, proposed = conversation.extract_proposals(value)
+        value, wanted = conversation.extract_actions(value)
         note = ""
         for item in learned:
             added, total = dispatch.file_learning(item, source=speaker_name(event),
@@ -821,7 +822,23 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
                 print(f"moses: proposal NOT filed ({r.get('error') or 'no such project: ' + repr(r.get('project'))})", flush=True)
 
         print(f"moses: replied ({who}, ${spent:.4f})", flush=True)
-        posted = say((value + note).strip() or note.strip())
+        # THE OPERATOR'S OWN ACTIONS, asked for in plain language (conversation.DO_LINE). Only a
+        # person can start one: a DO line on a turn another machine prompted is dropped and logged.
+        work = []
+        for name, arg in wanted:
+            if machine:
+                print(f"moses: ignored DO {name} on a bot-prompted turn", flush=True)
+                continue
+            got = local_commands.act(name, arg) if local_commands and hasattr(local_commands, "act") else None
+            if got is None:
+                note += f"\n_⚠️ I asked for `{name}`, and there is no such action here. Nothing was started._"
+                print(f"moses: DO {name} matched no action", flush=True)
+                continue
+            work.append(got)
+            print(f"moses: DO {name} started", flush=True)
+        posted = say((value + note).strip() or note.strip() or "✍️ On it.")
+        for w in work:
+            _spawn(_local_run, say, w)
         # Remember which message carried them, so a checkmark on it confirms the right thing.
         for h in held:
             proposals.attach_message(h["id"], (posted or {}).get("ts", ""))

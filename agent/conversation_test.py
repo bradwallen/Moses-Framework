@@ -1022,6 +1022,21 @@ finally:
 # appended in between was run, printed its own FAIL, and was still summarized as "0 failed". That is
 # the third outing for this bug and the second time the comment describing the fix outlived the fix.
 # Now there is no intermediate name to append past.
+# ── The operator's own actions (DO lines) ────────────────────────────────────
+import conversation as _C  # noqa: E402
+msg, acts = _C.extract_actions("On it.\nDO: digest 1 | Brad: \"why\"\nthanks")
+check("DO lifted out of the message, the rest kept", "DO:" not in msg and "On it." in msg and "thanks" in msg)
+check("DO name and argument parsed", acts == [("digest", '1 | Brad: "why"')])
+check("DO a sentence merely mentioning it is prose", _C.extract_actions("I could DO: digest later")[1] == [])
+_saved = _C.local_actions
+_C.local_actions = lambda: [("digest", "make the digest")]
+check("DO declared actions are described on a turn a person directed", "`digest`: make the digest" in _C.system_prompt(directed=True))
+check("DO but never on a bot-prompted turn", "`digest`" not in _C.system_prompt(directed=False))
+check("DO nor on a turn that reads the web", "`digest`" not in _C.system_prompt(directed=True, reading=True))
+_C.local_actions = lambda: []
+check("DO a framework install with no actions says nothing about them", "OPERATOR'S OWN ACTIONS" not in _C.system_prompt(directed=True))
+_C.local_actions = _saved
+
 print(f"\n  {sum(1 for _, ok in results if ok)} passed, "
       f"{sum(1 for _, ok in results if not ok)} failed")
 sys.exit(1 if any(not ok for _, ok in results) else 0)
