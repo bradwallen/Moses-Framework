@@ -643,6 +643,11 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
                       or addressing.engaged_recently(channel)) and (
                 channel in conversation.enabled_channels()
                 or addressing.addressed_by_human_recently(history, BOT_USER_ID, BOT_ID))
+            # A PERSON replying under one of his posts is talking to him, in any channel: the standup
+            # asks for a reply in its thread, and on 2026-10-12 it could not hear one. People only;
+            # a bot in his thread still goes through pacing above.
+            if not follow and not machine:
+                follow = addressing.his_thread(history, thread_ts, BOT_USER_ID, BOT_ID)
             if follow:
                 text, followup = raw, True
 

@@ -196,6 +196,23 @@ def addressed_by_human_recently(history: list[dict], bot_user_id: str = "", bot_
     return False
 
 
+def his_thread(history: list[dict], thread_ts: str, bot_user_id: str = "", bot_id: str = "") -> bool:
+    """Is this thread hanging off one of HIS posts? Then a person replying in it is talking to him.
+
+    Replying under someone's post is how Slack says "to you", and nobody adds the name on top. Measured
+    2026-10-12 in the standup channel: the standup asked for a reply in its thread, Brad replied there
+    with what he wanted, then "You going to respond??", and both were dropped without a log line. That
+    channel is not a chat channel and nobody had said "Moses" yet, so only "Moses, wtf" got through,
+    2¾ minutes later. The standup asked for a reply and could not hear one.
+
+    Reads the thread's root out of `history` (conversations.replies always returns the parent first, so
+    `recent()` has it). A message outside a thread is never his thread: the channel rules decide those.
+    """
+    if not thread_ts:
+        return False
+    return any(m.get("ts") == thread_ts and is_self(m, bot_user_id, bot_id) for m in history)
+
+
 # ── Named at all, anywhere ───────────────────────────────────────────────────
 # Brad, 2026-09-02: *"the rules of engagement for Moses is pretty strict and because Jon and I talk
 # like normal humans, Moses needs to REASON when to jump in vs some pattern matching of how his name

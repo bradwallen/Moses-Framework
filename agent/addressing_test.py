@@ -197,6 +197,36 @@ def main() -> int:
             failed += 1
 
 
+    # ── A reply under HIS post is for him, name or not ────────────────────────
+    # The real thread from 2026-10-12: the standup asked for a reply, and Brad's two replies in
+    # its thread were dropped until he wrote "Moses, wtf". recent() returns newest-first, root last.
+    from addressing import his_thread
+
+    def at(ts, msg):
+        return dict(msg, ts=ts)
+
+    standup = at("1791810027.374059", m(":clipboard: *Standup* … _Reply `1`, `2` or `3` in this thread._"))
+    THREAD_CASES = [
+        ("REGRESSION a reply under his standup is for him",
+         [at("2", h("You going to respond??")), at("1", h("go with 1, but change the angle")), standup],
+         "1791810027.374059", True),
+        ("a thread under someone else's post is not his",
+         [at("2", h("nice")), at("1791810002.568639", {"username": "Birdeye", "bot_id": BOT_ID, "text": "all clear"})],
+         "1791810002.568639", False),
+        ("a thread under a person's post is not his, even if he spoke in it",
+         [at("3", h("ok")), at("2", m("answer")), at("1", h("Moses, a question"))], "1", False),
+        ("a message outside any thread is never his thread",
+         [standup], "", False),
+    ]
+    for label, history, ts, expected in THREAD_CASES:
+        got = his_thread(history, ts, BOT_USER, BOT_ID)
+        if got == expected:
+            print(f"  PASS  {label}")
+            passed += 1
+        else:
+            print(f"  FAIL  {label} — expected {expected}, got {got}")
+            failed += 1
+
     # ── Named, but not addressed: the model decides, not the regex ────────────
     # Brad, 2026-09-02, after Moses sat out "Atlas and Moses, did you know…" twice in two days. The
     # matchers answer a grammatical question well; they cannot answer "is this for me".
