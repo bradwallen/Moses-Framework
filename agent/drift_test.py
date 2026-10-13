@@ -309,5 +309,43 @@ finally:
     drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
 
 
+# ── Can Moses answer? (2026-10-13: down all night, and the standup said nothing) ──────────────────
+print("\nthe standup says when Moses cannot answer, and since when")
+import datetime as _dtn  # noqa: E402
+with _tf.TemporaryDirectory() as _d:
+    _was = (drift.LIVENESS, drift.LIVENESS_LOG)
+    drift.LIVENESS, drift.LIVENESS_LOG = Path(_d) / "liveness.json", Path(_d) / "liveness.jsonl"
+    _now = _dtn.datetime.now().replace(microsecond=0)
+    _iso = lambda m: (_now - _dtn.timedelta(minutes=m)).isoformat()   # noqa: E731
+    _down = {"verdict": "down", "reason": "login expired — Moses cannot answer anyone until someone re-authenticates"}
+
+    def _run(state, log=()):
+        drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+        if state is not None:
+            drift.LIVENESS.write_text(_json.dumps(state))
+        elif drift.LIVENESS.exists():
+            drift.LIVENESS.unlink()
+        drift.LIVENESS_LOG.write_text("".join(_json.dumps(r) + "\n" for r in log))
+        drift.check_moses_answers()
+        return list(drift.DRIFT), list(drift.BLIND), list(drift.AGREED)
+
+    d, b, a = _run({**_down, "at": _iso(10)}, [{"verdict": "healthy", "at": _iso(800)},
+                                               {"verdict": "down", "at": _iso(760)}, {"verdict": "down", "at": _iso(10)}])
+    check("REGRESSION a Moses who cannot answer is drift, so the standup prints it", len(d) == 1 and "cannot answer" in d[0][0], d)
+    check("it says since when: the first failure after the last healthy probe",
+          d and _iso(760).replace("T", " ")[:16] in d[0][1], d)
+    check("and why", d and "login expired" in d[0][1], d)
+    d, b, a = _run({"verdict": "healthy", "at": _iso(5)})
+    check("a healthy, recent probe agrees", not d and not b and a, (d, b, a))
+    d, b, a = _run({"verdict": "healthy", "at": _iso(200)})
+    check("a probe that has not run in over 90 minutes is COULD NOT CHECK, never healthy", not d and b and not a, (d, b, a))
+    d, b, a = _run(None)
+    check("no probe record at all is COULD NOT CHECK", not d and b and "never run" in b[0][1], (d, b))
+    d, b, a = _run({"verdict": "degraded", "reason": "529", "at": _iso(3)}, [{"verdict": "degraded", "at": _iso(3)}])
+    check("degraded is drift too: he is not answering", len(d) == 1, d)
+    drift.LIVENESS, drift.LIVENESS_LOG = _was
+    drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+
+
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

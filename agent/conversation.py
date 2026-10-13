@@ -845,7 +845,12 @@ def looks_like_auth_failure(data: dict) -> bool:
     Unrecoverable without a person, which is exactly why it must not be retried and must not be
     reported in the same words as a capacity blip.
     """
-    return bool(_AUTH_TROUBLE.search(str(data.get("result_head") or "")))
+    # BOTH SHAPES. `result_head` is what the failure log writes; the CLI's own answer, which is what
+    # reply() actually holds, calls it `result`. Reading only the first meant this never matched a live
+    # turn from the day it shipped (2026-08-31) to the day it mattered (2026-10-13): Moses retried an
+    # expired login and told Atlas "I couldn't finish that thought" five times. Same rule as
+    # looks_like_provider_trouble below.
+    return bool(_AUTH_TROUBLE.search(str(data.get("result_head") or data.get("result") or "")))
 
 
 def credential_facts() -> dict:
@@ -889,6 +894,29 @@ def looks_like_provider_trouble(data: dict) -> bool:
     """
     head = str(data.get("result_head") or data.get("result") or "")
     return bool(_PROVIDER_TROUBLE.search(head))
+
+
+def failure_line(data: dict) -> str:
+    """One sentence saying why a turn failed twice: the kind of failure, and its first line of detail.
+
+    Never a payload: anything that looks serialized is dropped, and the detail is capped.
+    """
+    head = str(data.get("result_head") or data.get("result") or "").strip()
+    first = head.splitlines()[0].strip() if head else ""
+    if first.startswith(("{", "[")) or '":' in first:
+        first = ""
+    first = first[:160]
+    sub = str(data.get("subtype") or "")
+    if looks_like_provider_trouble(data):
+        return (":warning: Claude's API is overloaded or unreachable right now (failed twice"
+                + (f": {first}" if first else "") + "). Nothing is wrong on my side; ask me again in a minute.")
+    if sub == "error_max_turns":
+        return (":warning: I hit my limit on steps for one turn before I had an answer. Ask me something "
+                "narrower, or tell me to keep going.")
+    if first:
+        return f":warning: My run failed twice: {first}"
+    why = sub or str(data.get("stop_reason") or "") or "no error text came back"
+    return f":warning: My run failed twice and gave no error text ({why}). That's on me, not you; the full record is in chat-failures.jsonl."
 
 
 def _log_turn(data: dict, *, channel: str, reactive: bool, attempt: int) -> None:
@@ -1420,11 +1448,10 @@ def reply(history: list[dict], bot_user_id: str, channel: str,
                   f"({str(data.get('result_head') or '')[:90]})", flush=True)
             time.sleep(PROVIDER_BACKOFF_S)
         if attempt == 2:
-            # NEVER show the payload. Brad saw a wall of raw JSON in a channel with Jon and Atlas
-            # because the old code put `str(e)` in the message. The detail belongs in a log he can
-            # go and read; the channel gets a sentence.
-            return "text", (":warning: I couldn't finish that thought — the run errored twice. "
-                            "The detail is in my log."), spent
+            # SAY WHAT FAILED, never "I couldn't finish that thought". Brad, 2026-10-13, after it went to
+            # Atlas five times: "a useless response". Still never the payload (a wall of raw JSON in a
+            # channel with Jon and Atlas is why the sentence was vague to begin with): a reason, in a line.
+            return "text", failure_line(data), spent
 
     # SAY WHAT ACTUALLY WENT WRONG. This is the whole cost of the bug: Moses reported "No such tool
     # available: mcp__moses__knight_start", Brad read it as a capability he did not have, and tried

@@ -199,7 +199,8 @@ check("RETRY it does not loop past two attempts", len(calls) == 2)
 check("RETRY a persistent failure still charges both", abs(spent - 0.674) < 1e-6)
 check("RETRY the raw payload NEVER reaches Slack",
       out and "is_error" not in out and "{" not in out and "session_id" not in out)
-check("RETRY the message is a sentence, not a dump", out and "couldn't finish that thought" in out)
+check("RETRY the message is a sentence, not a dump, and says what kind of failure",
+      out and out.startswith(":warning:") and "failed twice" in out and "couldn't finish that thought" not in out)
 check("RETRY the detail is logged for evidence",
       os.path.exists(conversation.FAILURE_LOG)
       and "stop_sequence" in open(conversation.FAILURE_LOG).read())
@@ -884,6 +885,44 @@ for innocent in ("The 401 route returns unauthorized for signed-out users, which
                  "I refreshed the itinerary and it looks right."):
     check("AUTH does not fire on ordinary text about auth",
           not conversation.looks_like_auth_failure({"result_head": innocent}))
+
+# THE SEAM, through reply(): the CLI's own answer, in the shape it really arrives in (`result`, not the
+# log's `result_head`). Every check above fed the log's shape, so all of them passed while the live
+# path never once recognized an expired login (2026-10-13: five "couldn't finish that thought" to Atlas).
+_auth_calls = []
+_saved_invoke = conversation._invoke
+conversation._invoke = lambda *a, **k: (_auth_calls.append(1) or
+    {"is_error": True, "result": REAL, "total_cost_usd": 0, "num_turns": 1, "subtype": "success"})
+try:
+    _kind, _said, _ = conversation.reply([{"user": "U_BRAD", "text": "Moses, you there?"}], "U_MOSES",
+                                         "C_SOMEWHERE", reactive=False, directed=True)
+finally:
+    conversation._invoke = _saved_invoke
+check("SEAM a live expired login is named as one, not 'couldn't finish that thought'",
+      "login" in _said.lower() and "couldn't finish" not in _said)
+check("SEAM an expired login is not retried (it cannot heal)", len(_auth_calls) == 1)
+check("SEAM the raw CLI shape is recognized", conversation.looks_like_auth_failure({"result": REAL}))
+
+# ── A failed turn says WHAT failed (Brad, 2026-10-13: "couldn't finish that thought" is useless) ──
+_fl = conversation.failure_line
+check("FAIL never says the useless sentence",
+      all("couldn't finish that thought" not in _fl(d) for d in (
+          {"result": "API Error: Repeated 529 Overloaded errors."}, {"subtype": "error_max_turns"},
+          {"result": "Prompt is too long"}, {}, {"result": '{"type":"error","error":{"message":"x"}}'})))
+check("FAIL an overloaded API is named as the API's, not ours",
+      "overloaded" in _fl({"result": "API Error: Repeated 529 Overloaded errors."}).lower())
+check("FAIL a turn that ran out of steps says so", "limit on steps" in _fl({"subtype": "error_max_turns", "is_error": True}))
+check("FAIL anything else gives its first line of real detail", "Prompt is too long" in _fl({"result": "Prompt is too long\nmore"}))
+check("FAIL a JSON payload is never pasted into the channel",
+      '"type"' not in _fl({"result": '{"type":"error","error":{"message":"x"}}'}))
+check("FAIL with no text at all it still says which kind of failure", "error_during_execution" in _fl({"subtype": "error_during_execution"}))
+_saved_invoke2 = conversation._invoke
+conversation._invoke = lambda *a, **k: {"is_error": True, "result": "Prompt is too long", "total_cost_usd": 0, "num_turns": 1}
+try:
+    _k2, _said2, _ = conversation.reply([{"user": "U_BRAD", "text": "Moses, hi"}], "U_MOSES", "C_X", reactive=False, directed=True)
+finally:
+    conversation._invoke = _saved_invoke2
+check("FAIL through reply(): the channel reads the real reason", "Prompt is too long" in _said2 and "couldn't finish" not in _said2)
 
 check("FORENSICS reports timestamps and never token material", (lambda f: (
         isinstance(f, dict)

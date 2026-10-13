@@ -788,7 +788,57 @@ def check_framework_in_step() -> None:
         agreed("every framework commit is on its remote")
 
 
+# CAN HE ANSWER AT ALL? 2026-10-13: Moses's login expired at 20:22. moses-liveness caught it and posted
+# ONE alarm to #ops that evening, and the 08:00 standup said nothing; Brad found out from Atlas, who
+# watched five failed replies. "Moses is declared conversational and is not answering" is the plainest
+# drift there is, and the standup prints drift. Read from the probe's own record, not re-probed here: a
+# real model call belongs to moses-liveness, and the standup must never wait on one.
+LIVENESS = _env.STATE / "liveness.json"
+LIVENESS_LOG = _env.STATE / "liveness.jsonl"
+LIVENESS_STALE_S = 90 * 60        # three missed 30-minute probes, the dead-man's own limit
+
+
+def _down_since(verdict: str) -> str:
+    """When the current run of non-healthy verdicts began, from the probe's log; "" if unknown."""
+    try:
+        rows = [json.loads(ln) for ln in LIVENESS_LOG.read_text().splitlines() if ln.strip()]
+    except (OSError, ValueError):
+        return ""
+    start = ""
+    for r in rows:
+        if r.get("verdict") == "healthy":
+            start = ""
+        elif not start:
+            start = str(r.get("at") or "")
+    return start
+
+
+def check_moses_answers() -> None:
+    try:
+        st = json.loads(LIVENESS.read_text())
+    except FileNotFoundError:
+        return blind("whether Moses can answer", f"no probe record at {LIVENESS}: moses-liveness has never run")
+    except (OSError, ValueError) as e:
+        return blind("whether Moses can answer", f"the probe record is unreadable: {type(e).__name__}")
+    at = str(st.get("at") or "")
+    try:
+        age = (_dt.datetime.now() - _dt.datetime.fromisoformat(at)).total_seconds()
+    except ValueError:
+        return blind("whether Moses can answer", f"the probe record has no usable time ({at!r})")
+    if age > LIVENESS_STALE_S:
+        return blind("whether Moses can answer", f"the last probe was {int(age // 60)} minutes ago ({at}); "
+                     "nobody is checking, which is not the same as healthy")
+    verdict = str(st.get("verdict") or "")
+    if verdict == "healthy":
+        return agreed(f"Moses answered his last probe ({at})")
+    since = _down_since(verdict) or at
+    drift("Moses cannot answer anyone right now",
+          f"{verdict}: {st.get('reason') or 'no reason recorded'} (since {since.replace('T', ' ')[:16]}; "
+          f"last probe {at.replace('T', ' ')[11:16]})")
+
+
 CHECKS = {
+    "answers": check_moses_answers,
     "units": check_duplicate_units,
     "deployed": check_deployed_matches_source,
     "status": check_declared_status,
