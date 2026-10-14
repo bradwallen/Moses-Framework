@@ -9,7 +9,7 @@ description: When to use sub-agents to finish faster and when not to, how to bri
 
 ## Delegate when
 - **Two or more pieces of work are independent.** Split by file, never by topic, and name each agent's files and its off-limits lines. Parallel work is the only real wall-clock win.
-- **A broad read-only sweep** where you need the conclusion, not the file dumps (many files, several naming conventions, "where is X used"). Use `moses:scout`. The dumps stay out of the main context, so every later turn re-sends less.
+- **A broad read-only sweep** where you need the conclusion, not the file dumps (many files, several naming conventions, "where is X used"). Use `moses:explore`. The dumps stay out of the main context, so every later turn re-sends less.
 - **Output is long and only its summary matters:** a log dig, a full test run, a dependency audit.
 - **A review.** A fresh context sees what yours has stopped seeing. Use `moses:reviewer`.
 

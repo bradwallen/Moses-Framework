@@ -141,7 +141,7 @@ reaches your own coding sessions, and it works without the Slack agent:
   refuse a reply that hands you a command or a console without saying what was already checked.
 - **Skills** carry the procedures: `ship-and-report`, `architecture-diagrams`, `diligence`,
   `memory-hygiene`, `watch-it-fail`, and `delegate` (when sub-agents are faster, and when not).
-- **Agents:** `moses:scout` (read-only sweeps), `moses:builder` (one worktree each),
+- **Agents:** `moses:explore` (read-only sweeps), `moses:builder` (one worktree each),
   `moses:reviewer` (fresh-eyes review).
 
 To install it by hand, or on a machine that only needs this part:

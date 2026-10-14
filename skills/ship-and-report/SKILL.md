@@ -11,7 +11,7 @@ description: Commandment IV as a procedure — how to ship a change small and re
 1. **Verify the behavior, not the declaration.** Run the test, load the page, hit the endpoint. "The tests passed" and "the thing works" are different claims; make the one you can stand behind.
 2. **Stage explicit paths.** Never `git add -A` or `git add .`; name each file so nothing unrelated rides along.
 3. **Anything a customer can see is not shipped until support can answer for it.** If the change rewords a control, adds a feature or removes friction, update the help content, the support agent's knowledge and the release notes in the same change.
-4. **Push to the project's dev deployment** when it has one, so the operator can watch it build. Pushing to anything outside this machine is still governed by commandment IX.
+4. **Push to the project's dev deployment** when it has one, so the operator can watch it build. Pushing to anything outside this machine is still governed by commandment IX. **In a sandbox where a pipeline pushes for you** (a builder agent, a CI runner): commit on your branch with real messages and stop; the pipeline runs the gate and ships it.
 
 ## The report
 Every summary has the same shape, in this order:
