@@ -59,6 +59,18 @@ merged() { git -C "$1/repo" log --oneline main | grep -qF "second"; }
 
 echo "knight-land"
 
+# ── A branch Knight pushed to the target's REMOTE, not this checkout (2026-10-14) ──────────────
+# moses-framework pushes to GitHub, and knight-land only ever looked locally, so nothing there could
+# land. Here the branch exists only in a bare "origin"; landing must fetch it and merge it.
+w=$(new_world remote-only)
+git init -q --bare "$w/origin.git"
+git -C "$w/repo" remote add origin "$w/origin.git"
+git -C "$w/repo" push -q origin feature/x 2>/dev/null
+git -C "$w/repo" branch -q -D feature/x
+out=$(land "$w" job1)
+merged "$w" && ok "a branch that exists only on the push remote is fetched and lands" \
+             || bad "a branch that exists only on the push remote is fetched and lands" "$out"
+
 # ── The case it was built for ────────────────────────────────────────────────
 w=$(new_world clean)
 out=$(land "$w" job1)

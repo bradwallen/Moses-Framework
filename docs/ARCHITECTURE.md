@@ -698,7 +698,8 @@ swallowing real failures looks exactly like a quiet week.
         a profile that grants anything needs a written reason of 20+ characters, or nothing imports
         a BUILD profile (builder, reviewer, explorer, scout, diagnosis) gets the ten commandments
           via --append-system-prompt, from the framework's hooks/inject-commandments.sh
-          ($MOSES_FRAMEWORK, else ../moses-framework); can't load them → the job refuses to start
+          ($MOSES_FRAMEWORK, else ../moses-framework); can't load them → the job refuses to start;
+          MOSES_BUILD_JOB leaves out the "spawn sub-agents" line (no sub-agent tool here)
                    │
                    ▼
       claude -p … ──▶ result ──▶ classify():  ok · DEGRADED · failed
@@ -946,9 +947,10 @@ commandments from the runner instead (§ the runner, above).
 ```
   SessionStart       load-moses.sh              roster, drift, ledger, memory-index pointer
    (and compaction)  inject-commandments.sh     the ten, derived from project_moses.md, plus the
-                                                delegation trigger (independent subtasks)
+                                                delegation trigger (independent subtasks → spawn)
   SubagentStart      inject-now.sh              a sub-agent sees none of the above, so it gets
-                     inject-commandments.sh     the clock, the ten and the trigger itself
+                     inject-commandments.sh     the clock and the ten itself; NOT the trigger
+                                                (agents spawning agents multiply cost)
   UserPromptSubmit   inject-now.sh              the real clock (sessions stay open for days)
    (every prompt)    inject-commandments.sh     one line: the ten are in context, and where
                      inject-relevant-notes.sh   memory notes + this repo's docs/ sections whose

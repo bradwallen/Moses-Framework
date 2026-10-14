@@ -83,7 +83,15 @@ landable() {
     local KT_PUSH_MODE="" KT_SOURCE="" KT_BRANCH=""; . "$env"
     [ "$KT_PUSH_MODE" = "branch" ] || { echo "target '$target' lands with push mode '$KT_PUSH_MODE', so there is no branch to merge"; return; }
     [ -d "$KT_SOURCE/.git" ] || { echo "no repository at $KT_SOURCE"; return; }
-    git -C "$KT_SOURCE" rev-parse --verify "$branch" >/dev/null 2>&1 || { echo "branch '$branch' is not in $KT_SOURCE"; return; }
+    # A target with a remote gets Knight's branch THERE, not in this checkout (knight-run pushes to
+    # KT_PUSH_REMOTE, else the checkout's origin). Until 2026-10-14 this only looked locally, so no
+    # job on moses-framework, which pushes to GitHub, could ever land. Fetch it from where it went.
+    if ! git -C "$KT_SOURCE" rev-parse --verify -q "refs/heads/$branch" >/dev/null 2>&1; then
+        local KT_PUSH_REMOTE=""; . "$env"
+        local remote=${KT_PUSH_REMOTE:-$(git -C "$KT_SOURCE" remote get-url origin 2>/dev/null)}
+        [ -n "$remote" ] && git -C "$KT_SOURCE" fetch -q "$remote" "refs/heads/$branch:refs/heads/$branch" >/dev/null 2>&1
+    fi
+    git -C "$KT_SOURCE" rev-parse --verify "$branch" >/dev/null 2>&1 || { echo "branch '$branch' is not in $KT_SOURCE or its push remote"; return; }
     if git -C "$KT_SOURCE" merge-base --is-ancestor "$branch" "${KT_BRANCH:-main}" 2>/dev/null; then
         echo "already merged into ${KT_BRANCH:-main}"; return
     fi

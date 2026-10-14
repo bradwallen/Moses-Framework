@@ -70,7 +70,9 @@ COMMANDMENTS_HOOK = FRAMEWORK / "hooks" / "inject-commandments.sh"
 
 @lru_cache(maxsize=1)
 def commandments_text() -> str:
-    env = dict(os.environ, MOSES_MEMORY_DIR=str(_env.MEMORY),
+    # MOSES_BUILD_JOB: these jobs have no sub-agent tool, so the hook leaves out its "spawn
+    # sub-agents" line, which would only produce refused calls here.
+    env = dict(os.environ, MOSES_MEMORY_DIR=str(_env.MEMORY), MOSES_BUILD_JOB="1",
                MOSES_OPERATOR=_env.setting("MOSES_OWNER_NAME") or "the operator")
     try:
         r = subprocess.run(["bash", str(COMMANDMENTS_HOOK)], input='{"hook_event_name":"SessionStart"}',
