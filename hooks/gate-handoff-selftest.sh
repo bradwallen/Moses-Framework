@@ -102,6 +102,57 @@ out=$(second "$TMP/1.jsonl")
 if [ -z "$out" ]; then say "  PASS  loop cap: the third attempt is let through (allow)"; pass=$((pass+1)); else say "  FAIL  loop cap"; fail=$((fail+1)); failures="$failures
   - the gate blocked a third time in one turn; it can wedge a session"; fi
 
+# A REAL revision, shaped the way the transcript records it: the block's reason arrives as a "user"
+# event marked isMeta. The first version of the cap treated that as a new turn and blocked seven
+# times live (2026-10-14) while every fixture here passed, because none contained a feedback event.
+meta() {  # meta <file> <tools-before-block> <first reply> <revision>
+  python3 - "$@" <<'EOF_META'
+import json, sys
+out, before, first, second = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
+tu = lambda n: [{"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}} for i in range(n)]
+ev = [
+    {"type": "user", "message": {"content": [{"type": "text", "text": "do the thing"}]}},
+    {"type": "assistant", "message": {"content": tu(before) + [{"type": "text", "text": first}]}},
+    {"type": "user", "isMeta": True, "message": {"content": [{"type": "text", "text": "Stop hook feedback:\nSTOP"}]}},
+    {"type": "assistant", "message": {"content": [{"type": "text", "text": second}]}},
+]
+open(out, "w").write("\n".join(json.dumps(e) for e in ev) + "\n")
+EOF_META
+}
+DIL='**Before you touch anything**
+- checked: read the deploy script; it reads RULE_ID from the env
+- could not check: the dashboard needs a login I do not have'
+ASK='Go to the Cloudflare dashboard settings and click save on the new rule.'
+
+meta "$TMP/30.jsonl" 3 "$ASK" "$ASK
+
+$DIL"
+check "revision adds diligence; checks made BEFORE the block count" allow "$TMP/30.jsonl"
+
+meta "$TMP/31.jsonl" 0 "$ASK" "I cannot verify the rule from here, so I am not asking you to do anything yet."
+check "revision drops the ask; the dropped ask is not held against it" allow "$TMP/31.jsonl"
+
+meta "$TMP/32.jsonl" 0 "$ASK" "$ASK
+
+$DIL"
+# A live transcript GROWS: every block adds a feedback event and a new attempt. Append them between
+# calls, or a turn key that moves with the feedback would look stable here and pass.
+grow() {
+  python3 - "$1" "$ASK
+
+$DIL" <<'EOF_GROW'
+import json, sys
+with open(sys.argv[1], "a") as fh:
+    fh.write(json.dumps({"type": "user", "isMeta": True, "message": {"content": [{"type": "text", "text": "Stop hook feedback:\nSTOP"}]}}) + "\n")
+    fh.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": sys.argv[2]}]}}) + "\n")
+EOF_GROW
+}
+out=$(second "$TMP/32.jsonl"); grow "$TMP/32.jsonl"
+out2=$(second "$TMP/32.jsonl"); grow "$TMP/32.jsonl"
+out3=$(second "$TMP/32.jsonl")
+if [ -n "$out" ] && [ -n "$out2" ] && [ -z "$out3" ]; then say "  PASS  cap holds across real feedback events (block, block, allow)"; pass=$((pass+1)); else say "  FAIL  cap across feedback"; fail=$((fail+1)); failures="$failures
+  - the cap did not hold on a transcript with a real feedback event"; fi
+
 # The exact reply that walked through on 2026-10-14: a handoff with "checked: nothing", zero tools.
 fixture "$TMP/28.jsonl" 0 'Go to the Cloudflare dashboard settings and click save on the new rule.
 

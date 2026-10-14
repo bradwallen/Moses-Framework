@@ -115,7 +115,10 @@ except Exception:
     allow()
 
 def is_real_user_turn(ev):
-    if ev.get("type") != "user":
+    # Hook feedback (a Stop block's reason) is recorded as a "user" event marked isMeta. Counting it
+    # as a new turn reset the turn at every block: the tool calls made before it were forgotten, and
+    # the per-turn cap never reached 2. Seen live 2026-10-14: seven blocks in one turn.
+    if ev.get("type") != "user" or ev.get("isMeta"):
         return False
     content = (ev.get("message") or {}).get("content")
     if isinstance(content, str):
@@ -129,16 +132,24 @@ for i, ev in enumerate(events):
     if is_real_user_turn(ev):
         start = i + 1
 
+# The ATTEMPT is what came after the last block's feedback. Its text is what gets judged: a revision
+# that drops the ask must not be blocked for the ask it dropped. Tool calls count across the whole
+# turn, because checks made before a block are still checks.
+attempt = start
+for i in range(start, len(events)):
+    if events[i].get("type") == "user" and events[i].get("isMeta"):
+        attempt = i + 1
+
 TURN = f"{payload.get('session_id') or path}:{start}"
 
 texts, tool_calls = [], 0
-for ev in events[start:]:
+for i, ev in enumerate(events[start:], start):
     if ev.get("type") != "assistant":
         continue
     for c in (ev.get("message") or {}).get("content") or []:
         if not isinstance(c, dict):
             continue
-        if c.get("type") == "text" and c.get("text", "").strip():
+        if c.get("type") == "text" and c.get("text", "").strip() and i >= attempt:
             texts.append(c["text"])
         elif c.get("type") == "tool_use":
             tool_calls += 1
