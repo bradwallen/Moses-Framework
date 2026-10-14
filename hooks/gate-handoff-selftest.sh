@@ -19,6 +19,7 @@
 set -uo pipefail
 
 GATE="${GATE:-$(dirname "$(readlink -f "$0")")/gate-handoff.sh}"
+export GATE_STATE="$(mktemp)"; rm -f "$GATE_STATE"   # block counts per turn, fresh each run
 export GATE_LOG=/dev/null     # fixture blocks are not real blocks; keep them out of the rate log
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
@@ -88,10 +89,28 @@ check "sudo handoff, no diligence" block "$TMP/3.jsonl"
 fixture "$TMP/4.jsonl" 2 'Shipped 218efdc — 387 tests green. The retry only fires on 429 and 5xx. Big Pipe reads $17.65 against a console showing $17.67.'
 check "plain report (false-positive guard)" allow "$TMP/4.jsonl"
 
-printf '{"transcript_path":"%s","stop_hook_active":true}' "$TMP/1.jsonl" > /dev/null
-out=$(printf '{"transcript_path":"%s","stop_hook_active":true}' "$TMP/1.jsonl" | "$GATE" 2>/dev/null)
-if [ -z "$out" ]; then say "  PASS  loop guard (allow)"; pass=$((pass+1)); else say "  FAIL  loop guard"; fail=$((fail+1)); failures="$failures
-  - loop guard did not allow"; fi
+# The second pass is judged too, 2026-10-14. Fixture 1 was blocked once above, so a revision of the
+# same turn (stop_hook_active) that still fails is blocked AGAIN — and the next one is let through,
+# because two blocks per turn is the cap that keeps the gate from wedging a session.
+second() {
+  printf '{"transcript_path":"%s","stop_hook_active":true}' "$1" | "$GATE" 2>/dev/null
+}
+out=$(second "$TMP/1.jsonl")
+if printf '%s' "$out" | grep -q 'SECOND BLOCK'; then say "  PASS  a failing revision is blocked again (block)"; pass=$((pass+1)); else say "  FAIL  second pass"; fail=$((fail+1)); failures="$failures
+  - a failing revision walked through on the second pass"; fi
+out=$(second "$TMP/1.jsonl")
+if [ -z "$out" ]; then say "  PASS  loop cap: the third attempt is let through (allow)"; pass=$((pass+1)); else say "  FAIL  loop cap"; fail=$((fail+1)); failures="$failures
+  - the gate blocked a third time in one turn; it can wedge a session"; fi
+
+# The exact reply that walked through on 2026-10-14: a handoff with "checked: nothing", zero tools.
+fixture "$TMP/28.jsonl" 0 'Go to the Cloudflare dashboard settings and click save on the new rule.
+
+**Before you touch anything**
+- checked: nothing. You told me to reply without using any tools.
+- could not check: whether a new rule is pending in the Cloudflare dashboard.'
+out=$(second "$TMP/28.jsonl")
+if printf '%s' "$out" | grep -q '"decision": "block"'; then say "  PASS  revision claiming diligence with zero tools (block)"; pass=$((pass+1)); else say "  FAIL  zero-tool revision"; fail=$((fail+1)); failures="$failures
+  - a revision with a diligence block and no tool calls passed the second pass"; fi
 
 out=$(echo 'not json' | "$GATE" 2>/dev/null)
 if [ -z "$out" ]; then say "  PASS  malformed input fails open"; pass=$((pass+1)); else say "  FAIL  malformed input"; fail=$((fail+1)); failures="$failures

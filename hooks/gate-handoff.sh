@@ -39,7 +39,44 @@ LOG = os.environ.get("GATE_LOG") or os.path.expanduser("~/.local/state/moses/han
 def allow():
     sys.exit(0)
 
+# ── The second pass, 2026-10-14 ───────────────────────────────────────────────────────────────
+# This used to allow ANY reply once stop_hook_active was set, to avoid a loop. That made the gate a
+# one-shot: seen live on 2026-10-14, a blocked handoff came back with a diligence block reading
+# "checked: nothing" and zero tool calls, and walked through. Now the revision is judged by the same
+# rules, and the loop is bounded here instead: at most MAX_BLOCKS blocks per turn, then it lets the
+# reply through and logs "cap:<code>", so a gate that keeps losing is visible rather than wedging.
+STATE = os.environ.get("GATE_STATE") or os.path.expanduser("~/.local/state/moses/gate-turns.json")
+MAX_BLOCKS = 2
+TURN = None   # set once the transcript is read: which turn of which session this is
+
+def _turn_count(bump):
+    try:
+        seen = json.load(open(STATE))
+    except Exception:
+        seen = {}
+    n = seen.get(TURN, 0)
+    if bump:
+        seen[TURN] = n + 1
+        seen = dict(list(seen.items())[-50:])   # only recent turns matter
+        try:
+            os.makedirs(os.path.dirname(STATE), exist_ok=True)
+            with open(STATE, "w") as fh:
+                json.dump(seen, fh)
+        except Exception:
+            pass
+    return n
+
 def block(code, reason):
+    if TURN is not None:
+        n = _turn_count(bump=False)
+        if n >= MAX_BLOCKS:
+            code = "cap:" + code
+            reason = None
+        else:
+            _turn_count(bump=True)
+            if n:
+                reason = ("SECOND BLOCK THIS TURN — the revision still fails the same check. A "
+                          "diligence block with nothing behind it is not a fix.\n\n" + reason)
     # Count it. Without this there is no way to tell a falling failure rate from a model that has
     # simply learned which sentence gets through.
     try:
@@ -48,16 +85,14 @@ def block(code, reason):
             fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')}\t{code}\n")
     except Exception:
         pass
+    if reason is None:
+        allow()
     print(json.dumps({"decision": "block", "reason": reason}))
     sys.exit(0)
 
 try:
     payload = json.loads(sys.argv[1]) if sys.argv[1].strip() else {}
 except Exception:
-    allow()
-
-# Never loop: if this hook already blocked once this turn, let the revision through.
-if payload.get("stop_hook_active"):
     allow()
 
 path = payload.get("transcript_path") or ""
@@ -93,6 +128,8 @@ start = 0
 for i, ev in enumerate(events):
     if is_real_user_turn(ev):
         start = i + 1
+
+TURN = f"{payload.get('session_id') or path}:{start}"
 
 texts, tool_calls = [], 0
 for ev in events[start:]:
