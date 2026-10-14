@@ -343,6 +343,19 @@ out = fire({"user": BRAD, "text": "Moses, thoughts"}, ts="8.2")
 check("REACT an emoji Slack rejects falls back to saying it, not to silence",
       len(out) == 1 and ":not_a_real_emoji:" in out[0]["text"])
 
+# Words AND a REACT line: both happen, and the marker never reaches the channel (2026-10-14, twice).
+reset(); stub_conversation(kind="text", value="Filed.\n\nREACT: white_check_mark")
+out = fire({"user": BRAD, "text": "Moses, confirm"}, ts="8.4")
+check("REACT beside prose posts the words without the marker",
+      len(out) == 1 and out[0]["text"].startswith("Filed.") and "REACT" not in out[0]["text"])
+check("REACT beside prose also reacts to the right message",
+      len(reacted) == 1 and reacted[0]["ts"] == "8.4" and reacted[0]["name"] == "white_check_mark")
+
+reset(); stub_conversation(kind="text", value="Noted.\nREACT: not_a_real_emoji")
+out = fire({"user": BRAD, "text": "Moses, ok"}, ts="8.5")
+check("REACT beside prose with a rejected emoji still says it, never the raw marker",
+      any(":not_a_real_emoji:" in m["text"] for m in out) and not any("REACT" in m["text"] for m in out))
+
 reset(); stub_conversation(kind="pass", value="")
 out = fire({"user": BRAD, "text": "Moses, nothing to add here"}, ts="8.3")
 check("PASS staying quiet posts nothing and reacts to nothing", out == [] and reacted == [])

@@ -81,7 +81,14 @@ check("an error result, even one that SAYS grounded",
       scout.check("a task long enough", REPO)["verdict"] == scout.COULD_NOT_CHECK)
 
 print("\nit is aimed at the right code, and only ever reads it")
-check("a known target resolves to its checkout", scout.target_source("moses") is not None)
+# A target written HERE, not the operator's own: target files are private and never ship, so a check
+# that named "moses" failed in every copy but the author's (2026-10-14, the framework's gate was red).
+_saved_targets = scout.TARGETS
+scout.TARGETS = Path(tempfile.mkdtemp())
+(scout.TARGETS / "demo.env").write_text(f"KT_SOURCE={Path(__file__).resolve().parent}\n")
+check("a known target resolves to its checkout",
+      scout.target_source("demo") == Path(__file__).resolve().parent)
+scout.TARGETS = _saved_targets
 check("an unknown target is not a code project", scout.check_target("anything at all", "no-such-target") is None)
 prof = scout.claude_runner.profile("moses-scout")
 check("the scout is offered only Read, Grep and Glob", sorted(prof.offered()) == ["Glob", "Grep", "Read"], prof.offered())

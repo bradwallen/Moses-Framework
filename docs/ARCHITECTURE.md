@@ -25,7 +25,7 @@ three ways.
                             │         │    the ONLY listener. Ran as root until 2026-09-02;│
                             │         │    now runs the SOURCE directly — no /opt copy,    │
                             │         │    deploy is `systemctl --user restart moses`.     │
-  Terminal ──── ssh ────────┼─────────┼─▶  Slack listener — NO MODEL, deterministic only  │
+  Terminal ──── ssh ────────┼─────────┼─▶  Slack listener — claude CLI where allowed      │
    moses CLI                │         │                                                   │
                             │         │  birdeye / birdeye-report (root)                  │
                             │         │    ops reporting + long-job handoff               │

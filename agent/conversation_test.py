@@ -1067,6 +1067,18 @@ msg, acts = _C.extract_actions("On it.\nDO: digest 1 | Brad: \"why\"\nthanks")
 check("DO lifted out of the message, the rest kept", "DO:" not in msg and "On it." in msg and "thanks" in msg)
 check("DO name and argument parsed", acts == [("digest", '1 | Brad: "why"')])
 check("DO a sentence merely mentioning it is prose", _C.extract_actions("I could DO: digest later")[1] == [])
+
+# ── A REACT line beside prose: say it AND react (2026-10-14, posted as text twice that day) ──────
+msg, re_ = _C.extract_reaction("Filed.\n\nREACT: white_check_mark")
+check("REACT beside prose: the marker is lifted out, the words kept", msg == "Filed." and re_ == ["white_check_mark"])
+msg, re_ = _C.extract_reaction("Noted — that's the better list.\n\nREACT: :+1:")
+check("REACT beside prose accepts :colons: and +1", msg == "Noted — that's the better list." and re_ == ["+1"])
+check("REACT in the middle of a sentence is prose, not a reaction",
+      _C.extract_reaction("I'd just REACT: +1 to that")[1] == [])
+check("the exact text from Slack no longer reaches the channel with its marker",
+      "REACT" not in _C.extract_reaction("he better list.\n\nREACT: +1")[0])
+check("a pure REACT is still a pure reaction (parse_action is unchanged)",
+      _C.parse_action("REACT: +1") == ("react", "+1"))
 _saved = _C.local_actions
 _C.local_actions = lambda: [("digest", "make the digest")]
 check("DO declared actions are described on a turn a person directed", "`digest`: make the digest" in _C.system_prompt(directed=True))

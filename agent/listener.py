@@ -765,6 +765,15 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
 
     who = "bot" if machine else "human"
 
+    # A REACT line beside prose means "say this, and react" (conversation.extract_reaction). Only the
+    # marker and nothing else becomes a pure reaction; anything else keeps its words and gains the
+    # reaction after they post.
+    also_react: list[str] = []
+    if kind == "text":
+        value, also_react = conversation.extract_reaction(value)
+        if also_react and not value:
+            kind, value, also_react = "react", also_react[0], also_react[1:]
+
     if kind == "react":
         # A reaction instead of a sentence, when a whole message would be clutter. If Slack rejects
         # the emoji name, fall back to posting it rather than losing the reply entirely — a failed
@@ -837,6 +846,11 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
             work.append(got)
             print(f"moses: DO {name} started", flush=True)
         posted = say((value + note).strip() or note.strip() or "✍️ On it.")
+        for name in also_react:
+            if react(channel, event.get("ts") or "", name):
+                print(f"moses: also reacted :{name}:", flush=True)
+            else:
+                say(f":{name}:")
         for w in work:
             _spawn(_local_run, say, w)
         # Remember which message carried them, so a checkmark on it confirms the right thing.
@@ -985,8 +999,11 @@ def main() -> None:
     sm = SocketModeClient(app_token=APP_TOKEN, web_client=web)
     sm.socket_mode_request_listeners.append(lambda c, r: handle(r, c))
     files = len(list(MEMORY_DIR.glob("*.md"))) if MEMORY_DIR.is_dir() else 0
-    print(f"moses: connecting as {BOT_USER_ID} (no model — deterministic only, {files} memory "
-          f"files, answering to 'Moses …', @Moses and /birdeye)…", flush=True)
+    # Not "no model": he reasons through the claude CLI in the channels allowed to (see the note on
+    # the reply above, which made the same false claim to Brad). The log said it until 2026-10-14.
+    print(f"moses: connecting as {BOT_USER_ID} (thinks through the claude CLI where allowed, "
+          f"deterministic elsewhere; {files} memory files, answering to 'Moses …', @Moses and "
+          f"/birdeye)…", flush=True)
     sm.connect()
     threading.Thread(target=_heartbeat_loop, args=(sm,), daemon=True, name="heartbeat").start()
     threading.Event().wait()

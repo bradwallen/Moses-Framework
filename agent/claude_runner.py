@@ -60,7 +60,11 @@ MIN_REASON = 20
 # CORE, NOT DECORATION: a job flagged `commandments` that cannot get them REFUSES to start. A builder
 # running without the rules is the failure this exists to end, and "could not load" must not read as
 # "loaded".
-FRAMEWORK = Path(_env.setting("MOSES_FRAMEWORK") or _env.ROOT.parent / "moses-framework")
+# The framework checkout: set explicitly, else THIS checkout when it carries the hooks itself (the
+# framework repo, or any copy of it), else the sibling ../moses-framework beside an instance tree.
+FRAMEWORK = Path(_env.setting("MOSES_FRAMEWORK")
+                 or (_env.ROOT if (_env.ROOT / "hooks" / "inject-commandments.sh").is_file()
+                     else _env.ROOT.parent / "moses-framework"))
 COMMANDMENTS_HOOK = FRAMEWORK / "hooks" / "inject-commandments.sh"
 
 

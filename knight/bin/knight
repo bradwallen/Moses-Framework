@@ -71,7 +71,11 @@ die() { echo "knight: $*" >&2; exit 1; }
 #
 # CORE, NOT DECORATION: a heading that is gone stops the job before it starts. A renamed section must
 # not quietly turn into a brief without the rules.
-FRAMEWORK=${MOSES_FRAMEWORK:-$(dirname "$MOSES_ROOT")/moses-framework}
+# Set explicitly, else this checkout when it carries the skills itself (the framework repo), else
+# the sibling ../moses-framework beside an instance tree.
+if [ -n "${MOSES_FRAMEWORK:-}" ]; then FRAMEWORK=$MOSES_FRAMEWORK
+elif [ -d "$MOSES_ROOT/skills" ]; then FRAMEWORK=$MOSES_ROOT
+else FRAMEWORK=$(dirname "$MOSES_ROOT")/moses-framework; fi
 framework_section() {  # framework_section <skill> <heading> → that section, or fail
     local body
     body=$(awk -v h="## $2" '$0 == h { grab = 1; next } grab && /^## / { exit } grab { print }' \

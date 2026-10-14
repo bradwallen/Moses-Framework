@@ -158,7 +158,10 @@ _saved_path = list(_sys.path)
 # the successful call above, so the import kept working and the test failed — correctly. Making a
 # thing unreachable means removing every route to it, not just the one you were thinking of.
 proposals.MCP_DIR = "/nonexistent-mcp-dir"
-_sys.path[:] = [d for d in _sys.path if "moses/mcp" not in d]
+# Matched by the directory itself, not a spelling of it: "moses/mcp" never matched a checkout called
+# moses-framework, so this test failed in every copy but the author's (2026-10-14).
+_mcp_real = os.path.realpath(_saved_dir)
+_sys.path[:] = [d for d in _sys.path if os.path.realpath(d or ".") != _mcp_real]
 _stashed = _sys.modules.pop("projects", None)
 try:
     homeless = proposals.add("A task proposed while the registry is missing", "C_CHAT",

@@ -756,6 +756,23 @@ def extract_actions(text: str) -> tuple[str, list[tuple[str, str]]]:
     return DO_LINE.sub("", text or "").strip(), found
 
 
+REACT_LINE = re.compile(r"^[ \t]*REACT:[ \t]*:?([A-Za-z0-9_+\-]{1,60}):?[.!]?[ \t]*$\n?", re.I | re.M)
+
+
+def extract_reaction(text: str) -> tuple[str, list[str]]:
+    """Split a reply into (message, [emoji]) when a REACT marker sits on its OWN line beside prose.
+
+    parse_action only treats a reply as a reaction when it is NOTHING but the marker. The model also
+    writes "Filed." and then `REACT: white_check_mark` on the next line, meaning both: say this, and
+    react. Twice on 2026-10-14 that posted the marker into the channel as text. Same strictness as
+    LEARNED and DO: own line, starts the line, so prose that mentions reacting is left alone.
+    """
+    names = [m.group(1).lower() for m in REACT_LINE.finditer(text or "")]
+    if not names:
+        return (text or "").strip(), []
+    return REACT_LINE.sub("", text or "").strip(), list(dict.fromkeys(names))
+
+
 def extract_learning(text: str) -> tuple[str, list[str]]:
     """Split a reply into (message, things-learned).
 
