@@ -945,9 +945,10 @@ commandments from the runner instead (§ the runner, above).
 
 ```
   SessionStart       load-moses.sh              roster, drift, ledger, memory-index pointer
-   (and compaction)  inject-commandments.sh     the ten, derived from project_moses.md
+   (and compaction)  inject-commandments.sh     the ten, derived from project_moses.md, plus the
+                                                delegation trigger (independent subtasks)
   SubagentStart      inject-now.sh              a sub-agent sees none of the above, so it gets
-                     inject-commandments.sh     the clock and the ten itself
+                     inject-commandments.sh     the clock, the ten and the trigger itself
   UserPromptSubmit   inject-now.sh              the real clock (sessions stay open for days)
    (every prompt)    inject-commandments.sh     one line: the ten are in context, and where
                      inject-relevant-notes.sh   memory notes + this repo's docs/ sections whose
