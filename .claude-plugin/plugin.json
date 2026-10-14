@@ -1,7 +1,7 @@
 {
   "name": "moses",
   "displayName": "Moses",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "The ten commandments, delivered by hooks to every session and sub-agent, plus the procedures and agents that carry them out",
   "author": {
     "name": "Brad Allen"

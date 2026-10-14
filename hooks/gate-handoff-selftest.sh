@@ -307,12 +307,19 @@ import json,sys
 try: print(json.load(sys.stdin)['hookSpecificOutput']['additionalContext'])
 except Exception: print('')" 2>/dev/null
 }
-for case in "SessionStart:COMMANDMENTS.md" "SubagentStart:COMMANDMENTS.md" "SessionStart:unparseable.md"; do
-  event=${case%%:*}; src=$TMP/noskill/docs/${case#*:}
-  label="trigger injected on $event, no skill loaded (${case#*:})"
-  ctx=$(injected "$event" "$src")
-  if printf '%s' "$ctx" | grep -qF "$TRIGGER" && printf '%s' "$ctx" | grep -qF "$CAVEAT"; then say "  PASS  $label"; pass=$((pass+1)); else say "  FAIL  $label"; fail=$((fail+1)); failures="$failures
-  - the delegation trigger is missing from the $event context (${case#*:})"; fi
+# Present where spawning is right (a main session), ABSENT where it is not: a sub-agent (agents
+# spawning agents) and a build job (no sub-agent tool; MOSES_BUILD_JOB is set by the runner). The
+# money/credentials/production line must be in all of them.
+for case in "SessionStart:COMMANDMENTS.md:yes:" "SessionStart:unparseable.md:yes:" \
+            "SubagentStart:COMMANDMENTS.md:no:" "SessionStart:COMMANDMENTS.md:no:1"; do
+  IFS=: read -r event file want build <<<"$case"
+  src=$TMP/noskill/docs/$file
+  ctx=$(MOSES_BUILD_JOB="$build" injected "$event" "$src")
+  where=$event; [ -n "$build" ] && where="a build job"
+  has=no; printf '%s' "$ctx" | grep -qF "$TRIGGER" && has=yes
+  label="trigger $( [ "$want" = yes ] && echo injected || echo withheld ) for $where, no skill loaded ($file)"
+  if [ "$has" = "$want" ] && printf '%s' "$ctx" | grep -qF "$CAVEAT"; then say "  PASS  $label"; pass=$((pass+1)); else say "  FAIL  $label"; fail=$((fail+1)); failures="$failures
+  - $label: trigger present=$has, wanted $want (and the money/credentials line must always be there)"; fi
 done
 
 say "  $pass passed, $fail failed"

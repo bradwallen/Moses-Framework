@@ -136,9 +136,19 @@ fi
 # The whether-to-delegate trigger, 2026-10-14. It used to live in the delegate skill, which a session
 # only loads once it is already thinking about delegating, so the sessions that most needed the rule
 # never saw it. Appended after either form, so the full-text fallback carries it too.
+#
+# ONLY WHERE SPAWNING IS THE RIGHT MOVE: a main session. A sub-agent told to spawn invites agents
+# spawning agents (three levels deep by default), multiplying cost for no reviewer; a build job
+# (MOSES_BUILD_JOB, set by the runner) has no sub-agent tool at all, so the line would only produce
+# refused calls. The money/credentials/production line holds everywhere, so it always rides along.
+if [ "$EVENT_NAME" = "SessionStart" ] && [ -z "${MOSES_BUILD_JOB:-}" ]; then
+    payload="$payload
+
+If a task contains independent subtasks that can proceed without each other's results, spawn sub-agents for them rather than doing them in sequence. $OPERATOR has authorized this without being asked first; the delegate skill covers how."
+fi
 payload="$payload
 
-If a task contains independent subtasks that can proceed without each other's results, spawn sub-agents for them rather than doing them in sequence. Money, credentials and production work stay in front of $OPERATOR, not delegated."
+Money, credentials and production work stay in front of $OPERATOR, not delegated."
 
 python3 -c '
 import json, sys
