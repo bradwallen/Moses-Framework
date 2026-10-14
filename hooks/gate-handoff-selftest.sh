@@ -282,6 +282,39 @@ check "rule: run this command" block "$TMP/26.jsonl"
 fixture "$TMP/27.jsonl" 2 'Can you confirm the deploy finished?'
 check "rule: can you confirm" block "$TMP/27.jsonl"
 
+say
+# ── The delegation trigger, 2026-10-14 ─────────────────────────────────────
+# Whether to delegate moved out of the delegate skill and into the always-on hook text, so a session
+# that never loads the skill still gets it. The hook runs from a copy with no skills/ directory at all,
+# for both events that inject the list, and again on the full-text fallback (a file the short form
+# cannot be derived from).
+say "Delegation trigger — fixtures"
+say
+TRIGGER="independent subtasks that can proceed without each other's results, spawn sub-agents"
+CAVEAT="Money, credentials and production work stay in front of"
+HOOKS=$(dirname "$(readlink -f "$0")")
+mkdir -p "$TMP/noskill/hooks" "$TMP/noskill/docs"
+cp "$HOOKS/inject-commandments.sh" "$TMP/noskill/hooks/"
+cp "$HOOKS/../docs/COMMANDMENTS.md" "$TMP/noskill/docs/"
+printf '# Rules\n\n%s\n' "$(printf 'Not a numbered rule. %.0s' $(seq 40))" > "$TMP/noskill/docs/unparseable.md"
+
+# injected <event> <commandments-file> — the additionalContext the hook hands the model.
+injected() {
+  printf '{"hook_event_name":"%s"}' "$1" \
+    | CLAUDE_PLUGIN_OPTION_COMMANDMENTS_FILE="$2" bash "$TMP/noskill/hooks/inject-commandments.sh" 2>/dev/null \
+    | python3 -c "
+import json,sys
+try: print(json.load(sys.stdin)['hookSpecificOutput']['additionalContext'])
+except Exception: print('')" 2>/dev/null
+}
+for case in "SessionStart:COMMANDMENTS.md" "SubagentStart:COMMANDMENTS.md" "SessionStart:unparseable.md"; do
+  event=${case%%:*}; src=$TMP/noskill/docs/${case#*:}
+  label="trigger injected on $event, no skill loaded (${case#*:})"
+  ctx=$(injected "$event" "$src")
+  if printf '%s' "$ctx" | grep -qF "$TRIGGER" && printf '%s' "$ctx" | grep -qF "$CAVEAT"; then say "  PASS  $label"; pass=$((pass+1)); else say "  FAIL  $label"; fail=$((fail+1)); failures="$failures
+  - the delegation trigger is missing from the $event context (${case#*:})"; fi
+done
+
 say "  $pass passed, $fail failed"
 if [ "$fail" -gt 0 ]; then
   # The timer is quiet on success and loud on failure — a weekly "all fine" trains you to ignore it.

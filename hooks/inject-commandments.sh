@@ -133,6 +133,13 @@ index, not the library."
     mode="short"
 fi
 
+# The whether-to-delegate trigger, 2026-10-14. It used to live in the delegate skill, which a session
+# only loads once it is already thinking about delegating, so the sessions that most needed the rule
+# never saw it. Appended after either form, so the full-text fallback carries it too.
+payload="$payload
+
+If a task contains independent subtasks that can proceed without each other's results, spawn sub-agents for them rather than doing them in sequence. Money, credentials and production work stay in front of $OPERATOR, not delegated."
+
 python3 -c '
 import json, sys
 body = sys.stdin.read().strip()

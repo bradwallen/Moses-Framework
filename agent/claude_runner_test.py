@@ -134,6 +134,15 @@ for _app in sorted(BUILDS):
     check(f"{_app} gets all ten rules in its system prompt",
           all(re.search(rf"(?m)^{n}\. ", _rules[0]) for n in range(1, 11)))
 check("chat does not (its replies are not builds)", values(sample("moses-chat"), "--append-system-prompt") is None)
+# These jobs load no skills, so the delegation trigger reaches them only through the hook text. Read
+# THIS checkout's hook: MOSES_FRAMEWORK may point the runner at another tree.
+_hook, R.COMMANDMENTS_HOOK = R.COMMANDMENTS_HOOK, REPO / "hooks" / "inject-commandments.sh"
+R.commandments_text.cache_clear()
+check("...and the delegation trigger rides with them, no skill loaded",
+      "independent subtasks that can proceed without each other's results, spawn sub-agents"
+      in (values(sample("knight-builder"), "--append-system-prompt") or [""])[0])
+R.COMMANDMENTS_HOOK = _hook
+R.commandments_text.cache_clear()
 # Watch it fail: with no framework to read the rules from, a build job must REFUSE, not run without them.
 _hook, R.COMMANDMENTS_HOOK = R.COMMANDMENTS_HOOK, R.Path("/nonexistent/inject-commandments.sh")
 R.commandments_text.cache_clear()
