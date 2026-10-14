@@ -40,7 +40,7 @@ import sys
 import time
 from pathlib import Path
 
-MEMORY = Path(os.environ.get("RELEVANT_NOTES_MEMORY") or os.environ.get("MOSES_MEMORY_DIR") or Path.home() / ".claude" / "memory")
+MEMORY = Path(os.environ.get("RELEVANT_NOTES_MEMORY") or os.environ.get("MOSES_MEMORY_DIR") or os.environ.get("CLAUDE_PLUGIN_OPTION_MEMORY_DIR") or Path.home() / ".claude" / "memory")
 LOG = Path(os.environ.get("RELEVANT_NOTES_LOG", Path.home() / ".local/state/moses/relevant-notes.log"))
 
 MAX_NOTES = 3

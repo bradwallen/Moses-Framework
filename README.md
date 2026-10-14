@@ -131,6 +131,32 @@ Then put your Slack tokens in `~/.config/moses/slack.env` and your ids and chann
 systemctl --user enable --now moses
 ```
 
+### The Claude Code plugin
+
+`bootstrap.sh` also installs this checkout as a Claude Code plugin, `moses`. It is the part that
+reaches your own coding sessions, and it works without the Slack agent:
+
+- **Hooks** deliver the ten commandments at session start, after every compaction, and to every
+  sub-agent; stamp the real time on every prompt; list the memory notes that match a prompt; and
+  refuse a reply that hands you a command or a console without saying what was already checked.
+- **Skills** carry the procedures: `ship-and-report`, `architecture-diagrams`, `diligence`,
+  `memory-hygiene`, `watch-it-fail`, and `delegate` (when sub-agents are faster, and when not).
+- **Agents:** `moses:scout` (read-only sweeps), `moses:builder` (one worktree each),
+  `moses:reviewer` (fresh-eyes review).
+
+To install it by hand, or on a machine that only needs this part:
+
+```bash
+claude plugin marketplace add ~/moses
+```
+
+```bash
+claude plugin install moses@moses-framework
+```
+
+`claude plugin configure moses@moses-framework` sets your name, a house style, and where your own
+commandments and memory live. Left blank, it reads the rules from `docs/COMMANDMENTS.md`.
+
 ### It deliberately does not want root
 
 The service binds no port and touches only your files, so it runs as **you**, under a systemd user
@@ -148,7 +174,7 @@ that genuinely install into `/usr/local/bin`, and they are separate scripts you 
 | `knight/` the builder, the reviewer, the explorer | `~/.config/moses/*.env` — tokens and settings |
 | `mcp/` the MCP server and the dashboard | `~/.config/moses/roster.json`, `estate.md` |
 | `personas/`, `install/` the reporting jobs | `~/.local/state/moses` — ledgers, proposals, verdicts |
-| `hooks/` Claude Code hooks · `config/*.example` · `tools/` | `knight/targets/` — the repositories Knight may touch |
+| `hooks/`, `skills/`, `agents/` the Claude Code plugin · `config/*.example` · `tools/` | `knight/targets/` — the repositories Knight may touch |
 
 **Your data stays yours.** The corpus is where Moses keeps what he knows about *your* projects —
 decisions, money, infrastructure, people. This repository ships the shape of a corpus and never its

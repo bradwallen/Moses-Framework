@@ -1,0 +1,14 @@
+{
+  "name": "moses-framework",
+  "description": "Moses: engineering principles for a Claude Code dev pipeline, enforced by hooks",
+  "owner": {
+    "name": "Brad Allen"
+  },
+  "plugins": [
+    {
+      "name": "moses",
+      "source": "./",
+      "description": "The ten commandments, delivered by hooks to every session and sub-agent, plus the procedures and agents that carry them out"
+    }
+  ]
+}

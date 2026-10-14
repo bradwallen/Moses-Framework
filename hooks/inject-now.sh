@@ -14,14 +14,18 @@
 
 set -uo pipefail
 
+EVENT=$(python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("hook_event_name","") or "UserPromptSubmit")
+except Exception: print("UserPromptSubmit")' 2>/dev/null)
+# A sub-agent gets the clock too (SubagentStart): it starts with none of the session's context.
 now=$(date '+%A, %B %-d, %Y at %-I:%M %p %Z')
 
 python3 -c '
 import json, sys
-now = sys.argv[1]
+now, event = sys.argv[1], sys.argv[2]
 print(json.dumps({
     "hookSpecificOutput": {
-        "hookEventName": "UserPromptSubmit",
+        "hookEventName": event,
         "additionalContext": (
             "Current date and time: " + now + ". "
             "This session may have been open for days with long gaps between turns, so earlier "
@@ -31,4 +35,4 @@ print(json.dumps({
         ),
     },
     "suppressOutput": True,
-}))' "$now" 2>/dev/null || true
+}))' "$now" "${EVENT:-UserPromptSubmit}" 2>/dev/null || true

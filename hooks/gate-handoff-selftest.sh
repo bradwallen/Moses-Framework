@@ -18,7 +18,7 @@
 
 set -uo pipefail
 
-GATE="${GATE:-$HOME/.claude/hooks/gate-handoff.sh}"
+GATE="${GATE:-$(dirname "$(readlink -f "$0")")/gate-handoff.sh}"
 export GATE_LOG=/dev/null     # fixture blocks are not real blocks; keep them out of the rate log
 QUIET=0
 [ "${1:-}" = "--quiet" ] && QUIET=1
@@ -183,6 +183,34 @@ fixture "$TMP/20.jsonl" 2 'Everything is ready.
 
 sudo /usr/local/bin/install-thing.sh'
 check "a bare sudo of a system path is a handoff" block "$TMP/20.jsonl"
+
+# ── One fixture per rule, 2026-10-14 ───────────────────────────────────────
+# Removing each HANDOFF pattern in turn left this suite green for 7 of 11 of them: the fixtures
+# above were all caught by some OTHER rule first, so those seven could be deleted unnoticed. Each
+# sentence below matches exactly one pattern, so each rule now has a fixture that dies with it.
+fixture "$TMP/21.jsonl" 2 'Last step:
+```bash
+sudo systemctl restart moses
+```'
+check "rule: sudo inside a code block" block "$TMP/21.jsonl"
+
+fixture "$TMP/22.jsonl" 2 'Head to the billing dashboard and turn on invoices.'
+check "rule: go/head to a dashboard" block "$TMP/22.jsonl"
+
+fixture "$TMP/23.jsonl" 2 'Open Stripe and flip the switch in the billing panel.'
+check "rule: open a vendor panel" block "$TMP/23.jsonl"
+
+fixture "$TMP/24.jsonl" 2 'Vercel project settings need the new domain added.'
+check "rule: a vendor named with settings" block "$TMP/24.jsonl"
+
+fixture "$TMP/25.jsonl" 2 'Then click Generate and wait for the email.'
+check "rule: click a button" block "$TMP/25.jsonl"
+
+fixture "$TMP/26.jsonl" 2 'Run this command when you are back at the desk.'
+check "rule: run this command" block "$TMP/26.jsonl"
+
+fixture "$TMP/27.jsonl" 2 'Can you confirm the deploy finished?'
+check "rule: can you confirm" block "$TMP/27.jsonl"
 
 say "  $pass passed, $fail failed"
 if [ "$fail" -gt 0 ]; then

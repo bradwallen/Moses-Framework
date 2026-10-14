@@ -90,6 +90,24 @@ for d in "$HOME/.config/moses" "$HOME/.local/state/moses" "$HOME/.claude/memory"
 done
 [ "$CHECK" = 0 ] && chmod 700 "$HOME/.config/moses"
 
+step "Claude Code plugin"
+# The commandments reach every Claude Code session, and every sub-agent, through the hooks in this
+# plugin. Installed from THIS checkout, so the hooks that run are the ones you can read here.
+if claude plugin list 2>/dev/null | grep -q 'moses@moses-framework'; then
+  say "moses plugin" "already installed"
+else
+  claude plugin marketplace list 2>/dev/null | grep -q 'moses-framework' \
+    || do_or_show claude plugin marketplace add "$ROOT"
+  do_or_show claude plugin install moses@moses-framework
+fi
+if [ "$CHECK" = 0 ]; then
+  # Proven, not assumed: the gate must block a bare handoff and pass a plain report.
+  hooks/gate-handoff-selftest.sh --quiet \
+    && say "handoff gate self-test" "passes" \
+    || { say "handoff gate self-test" "FAILED — do not trust the gate"; FAIL=1; }
+  say "plugin options" "set your name: claude plugin configure moses@moses-framework"
+fi
+
 step "Configuration"
 CFG="$HOME/.config/moses/moses.env"
 if [ -f "$CFG" ]; then

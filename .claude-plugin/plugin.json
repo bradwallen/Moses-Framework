@@ -1,0 +1,53 @@
+{
+  "name": "moses",
+  "displayName": "Moses",
+  "version": "0.1.0",
+  "description": "The ten commandments, delivered by hooks to every session and sub-agent, plus the procedures and agents that carry them out",
+  "author": {
+    "name": "Brad Allen"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "commandments",
+    "engineering-principles",
+    "hooks",
+    "agents"
+  ],
+  "agents": [
+    "./agents/scout.md",
+    "./agents/builder.md",
+    "./agents/reviewer.md"
+  ],
+  "userConfig": {
+    "operator_name": {
+      "type": "string",
+      "title": "Your name",
+      "description": "Who the commandments belong to, and who the handoff gate protects. Leave blank for \"the operator\".",
+      "default": ""
+    },
+    "house_style": {
+      "type": "string",
+      "title": "House style",
+      "description": "A convention that rides along with the rules, such as \"US English everywhere — color, behavior, center.\" Leave blank for none.",
+      "default": ""
+    },
+    "commandments_file": {
+      "type": "string",
+      "title": "Your commandments file",
+      "description": "Absolute path to your own copy of the rules. Blank uses <memory>/project_moses.md if it exists, else the framework's docs/COMMANDMENTS.md.",
+      "default": ""
+    },
+    "memory_dir": {
+      "type": "string",
+      "title": "Memory directory",
+      "description": "Absolute path to the memory corpus. Blank means ~/.claude/memory.",
+      "default": ""
+    },
+    "moses_home": {
+      "type": "string",
+      "title": "Moses checkout",
+      "description": "Absolute path to the running Moses tree, for the drift check at session start. Blank means ~/Projects/moses.",
+      "default": ""
+    }
+  }
+}

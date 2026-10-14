@@ -33,6 +33,7 @@ import json, os, re, sys, time
 
 # The self-test points this at /dev/null: its fixtures are not real blocks, and counting them made
 # every Monday's test run look like four real refusals.
+OPERATOR = os.environ.get("CLAUDE_PLUGIN_OPTION_OPERATOR_NAME") or os.environ.get("MOSES_OPERATOR") or "the operator"
 LOG = os.environ.get("GATE_LOG") or os.path.expanduser("~/.local/state/moses/handoff-blocks.log")
 
 def allow():
@@ -177,8 +178,8 @@ has_marker = bool(re.search(MARKER, "\n".join(texts)))
 # An ask followed by six more tool calls scrolls off screen and was effectively never sent.
 if handoff_earlier and not handoff_final:
     block("ask-not-final",
-          "STOP — you asked Brad to do something and then kept working, so the ask is buried "
-          "above later output and he will not see it.\n\n"
+          "STOP — you asked " + OPERATOR + " to do something and then kept working, so the ask is "
+          "buried above later output and they will not see it.\n\n"
           "Put the ask at the END of the turn and stop there. Do the tool work first, then ask, "
           "then end. One ask per message, nothing after it.")
 
@@ -188,7 +189,7 @@ if not handoff_final:
 # ── 1. A handoff must state the diligence ───────────────────────────────────
 if not has_marker:
     block("no-diligence",
-          "STOP — this response asks Brad to run a command or open a console, and it does not state "
+          "STOP — this response asks " + OPERATOR + " to run a command or open a console, and it does not state "
           "what you already verified yourself.\n\n"
           "Before sending, actually do the checks you can do from here: read the script instead of "
           "recalling how it behaves, grep the tooling for which files it reads, curl the endpoint, "
@@ -197,8 +198,8 @@ if not has_marker:
           "Then add a section headed exactly:\n\n"
           "**Before you touch anything**\n"
           "- checked: <what you ran or read, and what it showed>\n"
-          "- could not check: <what needs him, and precisely why you cannot do it yourself>\n\n"
-          "If everything is checkable from here, do it and drop the handoff entirely. Handing him a "
+          "- could not check: <what needs them, and precisely why you cannot do it yourself>\n\n"
+          "If everything is checkable from here, do it and drop the handoff entirely. Handing them a "
           "task you could have finished is the failure this gate exists to prevent.")
 
 # ── 2. The claim needs work behind it ───────────────────────────────────────
