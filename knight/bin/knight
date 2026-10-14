@@ -60,6 +60,33 @@ source "$KNIGHT_HOME/guards.env"
 mkdir -p "$JOBS"
 
 die() { echo "knight: $*" >&2; exit 1; }
+
+# ── The framework's procedures, in the briefs (2026-10-14) ──────────────────
+# The Moses plugin's skills are the procedures every Claude Code session building for Brad follows.
+# Knight and Zryachiy run with none of Brad's settings, so they never load the plugin, and their
+# briefs had grown their own copies of the same rules. Now each brief pulls the relevant SECTIONS of
+# those skills by heading: one text, read in two places, never retyped. Only the principles come
+# across — each brief keeps its own output format (Knight's four Slack lines, Zryachiy's verdict
+# lines), because code reads those and the skills' report shapes would break it.
+#
+# CORE, NOT DECORATION: a heading that is gone stops the job before it starts. A renamed section must
+# not quietly turn into a brief without the rules.
+FRAMEWORK=${MOSES_FRAMEWORK:-$(dirname "$MOSES_ROOT")/moses-framework}
+framework_section() {  # framework_section <skill> <heading> → that section, or fail
+    local body
+    body=$(awk -v h="## $2" '$0 == h { grab = 1; next } grab && /^## / { exit } grab { print }' \
+        "$FRAMEWORK/skills/$1/SKILL.md" 2>/dev/null)
+    [ -n "$(printf '%s' "$body" | tr -d '[:space:]')" ] || return 1
+    printf '### %s: %s\n%s\n\n' "$1" "$2" "$body"
+}
+build_procedures() {
+    framework_section ship-and-report "Before it ships" \
+      && framework_section watch-it-fail "The procedure" \
+      && framework_section architecture-diagrams "When to touch it"
+}
+review_procedures() {
+    framework_section watch-it-fail "When reviewing"
+}
 now() { date +%Y-%m-%dT%H:%M:%S%z; }
 
 # Slack is optional and off by default. The bot token lives in /etc/birdeye/birdeye.env (root-only)
@@ -300,6 +327,10 @@ check without reading the diff. Not a restatement of the task — the observable
 
     ensure_repo
 
+    local fw_build fw_review
+    fw_build=$(build_procedures) && fw_review=$(review_procedures) \
+      || die "could not read the framework's procedures from $FRAMEWORK/skills — Knight does not build without them (set MOSES_FRAMEWORK to the framework checkout)"
+
     local id dir slug branch
     id="$(date +%Y%m%d-%H%M%S)-$$"
     dir="$JOBS/$id"; mkdir -p "$dir"
@@ -431,9 +462,13 @@ IF YOU CANNOT FINISH: commit what genuinely works and say plainly what is incomp
 half-finished change honestly described is useful. A confident claim that something works when it
 does not is the one outcome to avoid, because he will act on your report without checking the code.
 
-TASK:
 SPEC
-        printf '%s\n' "$task"
+        printf 'THE FRAMEWORK'"'"'S PROCEDURES. These sections come from the Moses framework, word for word: the\n'
+        printf 'same text every Claude Code session building for Brad follows. They hold alongside the\n'
+        printf 'commandments in your system prompt. Where one conflicts with this brief, THE BRIEF WINS: you\n'
+        printf 'never push or merge (the runner does), and your report is the four lines above, nothing else.\n\n'
+        printf '%s\n\n' "$fw_build"
+        printf 'TASK:\n%s\n' "$task"
     } > "$dir/brief.txt"
 
     # ── The reviewer's brief — written here, read by the runner, never by the builder ──────────
@@ -508,6 +543,10 @@ closed one costs the whole point of the ledger.
 If you cannot review it — the diff is unreadable, or too large to judge — say so with a CONFIRMED
 line naming that as the reason. A review that could not run must never read as a review that passed.
 REVIEWSPEC
+        printf '\nTHE FRAMEWORK'"'"'S REVIEW RULES, word for word from the Moses framework, alongside the\n'
+        printf 'commandments in your system prompt. The OUTPUT FORMAT above wins over how they say to report:\n'
+        printf 'a surface you could not review becomes a MISSED or PLAUSIBLE line, never prose, and\n'
+        printf 'nothing else goes on the page.\n\n%s\n' "$fw_review"
         printf '\nACCEPTANCE CRITERIA — what must be true for this change to be done:\n%s\n' \
             "$(cat "$dir/acceptance.txt" 2>/dev/null)"
         printf '\nThe job directory is: %s\n' "$dir"

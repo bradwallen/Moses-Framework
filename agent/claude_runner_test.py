@@ -12,6 +12,7 @@ import ast
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -124,6 +125,22 @@ check("the reviewer may be given its job folder",
       values(R.build_argv("zryachiy-reviewer", "x", add_dirs=["/tmp/job"]), "--add-dir") == ["/tmp/job"])
 check("anyone may refuse more", "ExtraDeny" in (values(R.build_argv("moses-chat", "x", deny=["ExtraDeny"]),
                                                        "--disallowedTools") or []))
+
+print("\nevery job that builds carries the commandments (2026-10-14)")
+BUILDS = {"knight-builder", "zryachiy-reviewer", "zryachiy-explorer", "moses-scout", "moses-diagnosis"}
+check("exactly the build pipeline is flagged", {a for a in R.APPS if R.profile(a).commandments} == BUILDS)
+for _app in sorted(BUILDS):
+    _rules = values(sample(_app), "--append-system-prompt") or [""]
+    check(f"{_app} gets all ten rules in its system prompt",
+          all(re.search(rf"(?m)^{n}\. ", _rules[0]) for n in range(1, 11)))
+check("chat does not (its replies are not builds)", values(sample("moses-chat"), "--append-system-prompt") is None)
+# Watch it fail: with no framework to read the rules from, a build job must REFUSE, not run without them.
+_hook, R.COMMANDMENTS_HOOK = R.COMMANDMENTS_HOOK, R.Path("/nonexistent/inject-commandments.sh")
+R.commandments_text.cache_clear()
+check("no framework, no build: the builder refuses to start", refused(lambda: R.build_argv("knight-builder", "x")))
+check("...and chat, which carries no rules, still starts", not refused(lambda: sample("moses-chat")))
+R.COMMANDMENTS_HOOK = _hook
+R.commandments_text.cache_clear()
 
 print("\na grant must say why, or the runner does not load")
 check("a short reason is refused", refused(lambda: R.check_reasons({"x": ("too short", None)})))

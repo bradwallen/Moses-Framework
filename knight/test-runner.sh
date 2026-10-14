@@ -411,7 +411,28 @@ if bid=$(KNIGHT_FAKE_AGENT=1 start_job "$KNIGHT" start --target zzz-incident --a
     else
         bad "the incident id did not reach the job record"
     fi
+    # The framework's procedures reach both briefs (2026-10-14). Asserted on a brief a real `knight
+    # start` wrote, by the headings the briefs are built from, so renaming a skill section fails here.
+    if grep -qx '### ship-and-report: Before it ships' "$brief" && grep -qx '### watch-it-fail: The procedure' "$brief" \
+       && grep -qx '### architecture-diagrams: When to touch it' "$brief"; then
+        ok "Knight's brief carries the framework's build procedures"
+    else
+        bad "Knight's brief is missing a framework procedure section"
+    fi
+    if grep -qx '### watch-it-fail: When reviewing' "$JOBS/$bid/review-brief.txt"; then
+        ok "Zryachiy's brief carries the framework's review rules"
+    else
+        bad "Zryachiy's brief is missing the framework's review rules"
+    fi
     "$KNIGHT" cancel "$bid" >/dev/null 2>&1
+    # Watch it fail: no framework, no job. It must refuse for THAT reason, not some other one.
+    nofw=$(MOSES_FRAMEWORK=/nonexistent KNIGHT_FAKE_AGENT=1 "$KNIGHT" start --target zzz-incident \
+              --acceptance "x" "a job with no framework to read" 2>&1)
+    if printf '%s' "$nofw" | grep -q "framework's procedures"; then
+        ok "with no framework to read, Knight refuses to start the job"
+    else
+        bad "Knight started (or failed for another reason) without the framework: $(printf '%s' "$nofw" | head -1)"
+    fi
 else
     bad "could not start a job with --incident"
 fi

@@ -36,16 +36,48 @@ from __future__ import annotations
 import sys as _sys, pathlib as _pl  # noqa: E401
 _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent / "lib"))
 import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
+import json
 import os
 import re
 import subprocess
 from dataclasses import dataclass
 from functools import lru_cache
+from pathlib import Path
 
 CLI = _env.claude_cli()
 GUARDS = os.environ.get("KNIGHT_GUARDS", str(_env.ROOT / "knight/guards.env"))
 NO_MCP = '{"mcpServers":{}}'
 MIN_REASON = 20
+
+
+# ── The commandments, for every job that builds ─────────────────────────────
+# Brad, 2026-10-14: "No matter how I ask for a feature to be built for a product, the framework should
+# be adhered to." Claude Code sessions get the rules from the Moses plugin's hooks; these jobs run with
+# --setting-sources "" (none of Brad's settings, so none of his plugins), and until today Knight,
+# Zryachiy, the scout and the diagnosis worked with NONE of them. So the runner adds them itself, from
+# the SAME script the plugin runs: one derivation of the rules, never a second copy.
+#
+# CORE, NOT DECORATION: a job flagged `commandments` that cannot get them REFUSES to start. A builder
+# running without the rules is the failure this exists to end, and "could not load" must not read as
+# "loaded".
+FRAMEWORK = Path(_env.setting("MOSES_FRAMEWORK") or _env.ROOT.parent / "moses-framework")
+COMMANDMENTS_HOOK = FRAMEWORK / "hooks" / "inject-commandments.sh"
+
+
+@lru_cache(maxsize=1)
+def commandments_text() -> str:
+    env = dict(os.environ, MOSES_MEMORY_DIR=str(_env.MEMORY),
+               MOSES_OPERATOR=_env.setting("MOSES_OWNER_NAME") or "the operator")
+    try:
+        r = subprocess.run(["bash", str(COMMANDMENTS_HOOK)], input='{"hook_event_name":"SessionStart"}',
+                           capture_output=True, text=True, timeout=15, env=env)
+        text = json.loads(r.stdout)["hookSpecificOutput"]["additionalContext"]
+    except Exception as e:
+        raise ProfileError(f"could not load the commandments from {COMMANDMENTS_HOOK} ({e}); a build job "
+                           f"does not run without them — set MOSES_FRAMEWORK to the framework checkout")
+    if not re.search(r"(?m)^10\. ", text):
+        raise ProfileError(f"{COMMANDMENTS_HOOK} returned text without all ten rules; refusing to run without them")
+    return text
 
 
 class ProfileError(Exception):
@@ -71,6 +103,7 @@ class Profile:
     takes_dirs: bool = False         # the caller may add --add-dir paths
     approve_ceiling: str = ""        # a regex every per-call MCP approval must match (the explorer only)
     never_approve: tuple[str, ...] = ()  # tool names refused even inside the ceiling
+    commandments: bool = False       # the ten rules ride along in the system prompt (see commandments_text)
 
     def offered(self) -> list[str]:
         return list(self.builtins) + (["Bash"] if self.bash else [])
@@ -113,7 +146,7 @@ def _diagnosis() -> Profile:
     import diagnose as D
     return Profile("moses-diagnosis", model=D.MODEL, effort=D.EFFORT,
                    deny=tuple(t for t in D.NO_TOOLS.split(",") if t),
-                   exclude_dynamic_prompt=True, takes_system_prompt=True)
+                   exclude_dynamic_prompt=True, takes_system_prompt=True, commandments=True)
 
 
 @lru_cache(maxsize=1)
@@ -164,7 +197,7 @@ def _knight_builder() -> Profile:
     # No --add-dir, ever: his sandbox is his own clone, which has no remote (guards.env, top).
     return Profile("knight-builder", model=g["KNIGHT_MODEL"], effort=g["KNIGHT_EFFORT"],
                    builtins=builtins, bash=bash, deny=tuple(g["KNIGHT_DENY"]),
-                   permission_mode="acceptEdits", persist_session=True)
+                   permission_mode="acceptEdits", persist_session=True, commandments=True)
 
 
 def _reviewer() -> Profile:
@@ -172,7 +205,7 @@ def _reviewer() -> Profile:
     builtins, bash = _split_grants("zryachiy-reviewer", g["KNIGHT_REVIEW_TOOLS"], g["KNIGHT_REVIEW_ALLOW"])
     return Profile("zryachiy-reviewer", model=g["KNIGHT_REVIEW_MODEL"], effort=g["KNIGHT_REVIEW_EFFORT"],
                    builtins=builtins, bash=bash, deny=tuple(g["KNIGHT_REVIEW_DENY"]),
-                   takes_dirs=True, persist_session=True)
+                   takes_dirs=True, persist_session=True, commandments=True)
 
 
 def _liveness() -> Profile:
@@ -189,7 +222,7 @@ def _scout() -> Profile:
     # files say. Sonnet at medium: this is reading and judging, not building.
     return Profile("moses-scout", model=os.environ.get("MOSES_SCOUT_MODEL", "claude-sonnet-5-5"),
                    effort=os.environ.get("MOSES_SCOUT_EFFORT", "medium"),
-                   builtins=("Glob", "Grep", "Read"), takes_dirs=True)
+                   builtins=("Glob", "Grep", "Read"), takes_dirs=True, commandments=True)
 
 
 def _explorer() -> Profile:
@@ -200,7 +233,7 @@ def _explorer() -> Profile:
     return Profile("zryachiy-explorer", model="claude-sonnet-5", effort="medium", mcp_config="",
                    approve_ceiling=r"mcp__[a-z][a-z0-9_-]*__browser_[a-z_]+",
                    never_approve=("browser_run_code_unsafe",),
-                   setting_sources="project", output="stream-json")
+                   setting_sources="project", output="stream-json", commandments=True)
 
 
 # app -> (reason, builder). The reason is REQUIRED for any app that grants a tool, and checked at import.
@@ -291,6 +324,8 @@ def build_argv(app: str, prompt: str, *, system_prompt: str | None = None, mcp_c
     argv += ["--model", model or p.model, "--effort", effort or p.effort]
     if system_prompt is not None:
         argv += ["--system-prompt", system_prompt]
+    if p.commandments:
+        argv += ["--append-system-prompt", commandments_text()]
     argv += ["--setting-sources", p.setting_sources]
     argv += ["--strict-mcp-config", "--mcp-config", servers]
     approved = p.approved() + extra
