@@ -140,7 +140,8 @@ reaches your own coding sessions, and it works without the Slack agent:
   sub-agent; stamp the real time on every prompt; list the memory notes that match a prompt; and
   refuse a reply that hands you a command or a console without saying what was already checked.
 - **Skills** carry the procedures: `ship-and-report`, `architecture-diagrams`, `diligence`,
-  `memory-hygiene`, `watch-it-fail`, and `delegate` (when sub-agents are faster, and when not).
+  `memory-hygiene`, `watch-it-fail`, and `delegate` (how to brief sub-agents and check their work;
+  whether to spawn them is a line in the always-on hook text).
 - **Agents:** `moses:explore` (read-only sweeps), `moses:builder` (one worktree each),
   `moses:reviewer` (fresh-eyes review).
 
