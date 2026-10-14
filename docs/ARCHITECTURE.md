@@ -696,6 +696,9 @@ swallowing real failures looks exactly like a quiet week.
         --tools and --allowedTools built from ONE declaration, so they cannot disagree
         a caller may narrow (approve less, refuse more), never widen
         a profile that grants anything needs a written reason of 20+ characters, or nothing imports
+        a BUILD profile (builder, reviewer, explorer, scout, diagnosis) gets the ten commandments
+          via --append-system-prompt, from the framework's hooks/inject-commandments.sh
+          ($MOSES_FRAMEWORK, else ../moses-framework); can't load them → the job refuses to start
                    │
                    ▼
       claude -p … ──▶ result ──▶ classify():  ok · DEGRADED · failed
@@ -929,26 +932,38 @@ gate, which is why the MCP direction is better than the agent design it replaced
 fallback from it. Layers 2–4 are built and tested but **parked** — see
 `/home/brad/Projects/moses/agent/README-parked.md` — because agents need a model and API spend is off.
 
-### 5a. Claude Code hooks — what every session with Brad is handed
+### 5a. The Moses plugin — what every Claude Code session, and every sub-agent, is handed
 
-These govern the interactive sessions (the editor and the CLI), not Moses's own `claude -p` turns,
-which run `--restricted` and ignore settings files. Registered in `~/.claude/settings.json`; the
-scripts live in `~/.claude/hooks/` and are **tracked in no repository** — the nightly backup is
-their only copy.
+Since 2026-10-14 the hooks ship as the Claude Code plugin `moses@moses-framework`, from the framework
+checkout (`~/Projects/moses-framework`: `.claude-plugin/`, `hooks/`, `skills/`, `agents/`), installed at
+user scope from a local marketplace. They are tracked there, and **nothing is registered in
+`~/.claude/settings.json` any more** (plugin and settings hooks are not de-duplicated, so re-adding them
+would run each twice). The installed copy is a cache pinned to plugin.json's `version`: bump it and
+run `claude plugin update moses@moses-framework`. These govern interactive sessions. Moses's own
+`claude -p` jobs run `--setting-sources ""`, so they load no plugin; the build pipeline gets the
+commandments from the runner instead (§ the runner, above).
 
 ```
+  SessionStart       load-moses.sh              roster, drift, ledger, memory-index pointer
+   (and compaction)  inject-commandments.sh     the ten, derived from project_moses.md
+  SubagentStart      inject-now.sh              a sub-agent sees none of the above, so it gets
+                     inject-commandments.sh     the clock and the ten itself
   UserPromptSubmit   inject-now.sh              the real clock (sessions stay open for days)
-   (every prompt)    inject-commandments.sh     the ten, from project_moses.md
+   (every prompt)    inject-commandments.sh     one line: the ten are in context, and where
                      inject-relevant-notes.sh   memory notes + this repo's docs/ sections whose
                                                 words match the prompt (relevant-notes.py, BM25,
                                                 high bar; replies like "yes please" get nothing)
-  Stop               gate-handoff.sh            blocks handing Brad work without stated diligence
-  SessionStart       load-moses.sh              roster, drift, ledger, memory-index pointer
+  Stop               gate-handoff.sh            blocks handing Brad work without stated diligence;
+                                                judges the revision too, at most 2 blocks a turn
 
-  Proof              gate-handoff-selftest.sh, relevant-notes-selftest.sh — weekly, Monday 07:40,
-                     moses-gate-selftest.timer; quiet on success, fail by fixture name
-  Counts             ~/.local/state/moses/handoff-blocks.log, relevant-notes.log
-                     (the self-tests write to /dev/null, so the counts are real prompts only)
+  Skills             ship-and-report · architecture-diagrams · diligence · memory-hygiene ·
+                     watch-it-fail · delegate     (Knight's and Zryachiy's briefs quote sections)
+  Agents             moses:explore · moses:builder · moses:reviewer
+
+  Proof              framework hooks/gate-handoff-selftest.sh and agent/relevant-notes-selftest.sh —
+                     weekly, Monday 07:40, moses-gate-selftest.timer; quiet on success
+  Counts             ~/.local/state/moses/handoff-blocks.log (cap:<code> = a revision let through
+                     at the cap), relevant-notes.log; the self-tests write to /dev/null
 ```
 
 **What no hook sees.** When the editor resumes a turn that a dropped connection interrupted, the app

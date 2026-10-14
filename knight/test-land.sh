@@ -105,6 +105,11 @@ else grep -qi "note nobody has answered" <<<"$out" && ok "an unanswered PLAUSIBL
 out=$(land "$w" job1 --anyway)
 merged "$w" && ok "--anyway lands it when Brad has answered the note" \
              || bad "--anyway lands it when Brad has answered the note" "$out"
+# The history must not call that landing clean (2026-10-14: every merge said "reviewed clean").
+msg=$(git -C "$w/repo" log -1 --format=%s main)
+grep -q "over a review note" <<<"$msg" && ! grep -q "reviewed clean" <<<"$msg" \
+    && ok "a landing over a note says so in the merge message" \
+    || bad "a landing over a note says so in the merge message" "$msg"
 
 w=$(new_world unfinished CLEAN running)
 out=$(land "$w" job1)

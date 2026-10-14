@@ -148,7 +148,13 @@ was=$(git -C "$KT_SOURCE" rev-parse --abbrev-ref HEAD)
 before=$(git -C "$KT_SOURCE" rev-parse HEAD)
 # --no-ff so the branch is legible in the history afterwards: what landed, when, and as one unit that
 # can be reverted as one unit.
-merge_out=$(git -C "$KT_SOURCE" merge --no-ff -m "Land $BRANCH (Knight job $JOB_ID, reviewed clean)" "$BRANCH" 2>&1)
+# The history says how it was reviewed, truthfully. Until 2026-10-14 this read "reviewed clean" on every
+# landing, including one that went over an answered PLAUSIBLE note with --anyway.
+reviewed="reviewed clean"
+if [ "$ANYWAY" = 1 ] && grep -qE '^PLAUSIBLE\b' "$DIR/review.txt" 2>/dev/null; then
+    reviewed="landed over a review note, on Brad's word"
+fi
+merge_out=$(git -C "$KT_SOURCE" merge --no-ff -m "Land $BRANCH (Knight job $JOB_ID, $reviewed)" "$BRANCH" 2>&1)
 merge_rc=$?
 if [ "$merge_rc" -ne 0 ]; then
     git -C "$KT_SOURCE" merge --abort >/dev/null 2>&1

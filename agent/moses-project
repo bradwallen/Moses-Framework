@@ -20,7 +20,7 @@ reused (V14). Given a code, the project can be left out. A plain position number
 THE REAL FRONT DOOR IS MOSES, NOT THIS. Brad files ideas by telling Moses in the Claude app, VS Code
 or Slack; he does not open a terminal to do it. This exists for when someone is already at a prompt.
 
-Every command is a call into moses-mcp/projects.py — the same module the MCP tools use. Deliberately
+Every command is a call into mcp/projects.py — the same module the MCP tools use. Deliberately
 a wrapper with no logic of its own: this codebase has already been bitten by the same logic living in
 two files and quietly drifting apart.
 """
