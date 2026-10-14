@@ -3,7 +3,9 @@ Description=Prove the handoff gate and the relevant-notes hook still discriminat
 
 [Service]
 Type=oneshot
-ExecStart=%h/.claude/hooks/gate-handoff-selftest.sh --quiet
+# The hooks ship as the Moses Claude Code plugin from the framework checkout since 2026-10-14; the
+# copies that used to live in ~/.claude/hooks are no longer what runs.
+ExecStart=%h/Projects/moses-framework/hooks/gate-handoff-selftest.sh --quiet
 # Added 2026-09-13. A oneshot runs each ExecStart in order and stops at the first failure, so a red
 # gate still fails the unit before this runs — and a red notes hook fails it on its own.
-ExecStart=%h/.claude/hooks/relevant-notes-selftest.sh --quiet
+ExecStart=%h/Projects/moses/agent/relevant-notes-selftest.sh --quiet
