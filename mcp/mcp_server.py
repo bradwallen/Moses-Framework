@@ -425,6 +425,23 @@ def tagilla_queue(hours: int = 24) -> str:
 
 
 @server.tool(
+    description="PROPOSE A BUILD for Brad to confirm (#2). In Slack this is the only way to give Knight work: "
+                "you cannot start a build directly. Pass the task, the acceptance criteria, the target repo, "
+                "and CONCRETE EXAMPLES — `will_include` (one per line: real cases the build must cover) and "
+                "`will_exclude` (one per line: real cases it must not). Use real titles and cases, never a "
+                "category label (\"GIS Analyst Intern\" and \"Civil Engineering Intern that mentions ArcGIS\", "
+                "not \"civil and water\"). Post the reply as it is; Brad says yes (or ✅) and code starts the "
+                "build with those examples as acceptance criteria. If he asks for a change, propose again."
+)
+def knight_propose(task: str, acceptance: str, will_include: str, will_exclude: str, target: str = "") -> str:
+    try:
+        import build_spec as _bs
+        return _bs.propose(task, acceptance, will_include, will_exclude, target)
+    except Exception as e:                                    # noqa: BLE001
+        return f"⚠️ The proposal could not be recorded ({type(e).__name__}). Nothing was proposed."
+
+
+@server.tool(
     description="KNIGHT (software development): hand him a build task on one of the repositories in "
                 "his target registry. `target` picks which: the default is the product; "
                 "'moses' is the agent, the MCP server and Knight himself; 'moses-framework' is the "
@@ -438,8 +455,8 @@ def tagilla_queue(hours: int = 24) -> str:
                 "AGENT never holds push rights — it works in an isolated clone with no remote and "
                 "no access outside its own directory. Returns a job id immediately; the work runs "
                 "up to 60 minutes in the background, one job at a time, 8 per day. Brief him like a "
-                "senior developer: what to build and how to verify it. Knight posts his own report "
-                "to the Knight channel when he finishes. "
+                "senior developer: what to build and how to verify it. The run reports on one status "
+                "card in Knight's channel, edited at each step, with his report as a reply under it. "
                 "`acceptance` IS REQUIRED AND IT DOES NOT GO TO KNIGHT — it goes to Zryachiy, who "
                 "reviews the finished diff and BLOCKS THE PUSH if the work does not meet it. Write "
                 "what must be TRUE when this is done, as observable outcomes someone could check "
@@ -451,11 +468,29 @@ def tagilla_queue(hours: int = 24) -> str:
                 "it BEFORE the code exists, which is the only reason it can judge anything — "
                 "criteria derived from a finished diff just describe whatever happened. If Brad was "
                 "vague, say what you are assuming in your reply so he can correct it before the "
-                "build finishes."
+                "build finishes. WRITE CRITERIA THE REVIEWER CAN JUDGE FROM THE DIFF: what the code does, "
+                "which tests exist, what is absent. Never a comparison with another branch or a past job "
+                "(the reviewer cannot run git across branches; one such criterion held a finished GIS "
+                "build for nothing on 2026-10-17). What only the live product can show is fine to ask "
+                "for, but it comes back UNCHECKED and goes to the verification ledger, not a pass. To "
+                "build on a branch an earlier job left, use the follow-up the pipeline starts by itself "
+                "rather than a new job."
 )
-def knight_start(task: str, acceptance: str, target: str = "viatica") -> str:
+def knight_start(task: str, acceptance: str, target: str = "", will_include: str = "",
+                 will_exclude: str = "") -> str:
     task = task.strip()
     acceptance = (acceptance or "").strip()
+    # EXAMPLES BEFORE ANY BUILD (Brad, 2026-10-17, #2). In Slack this tool is not granted at all — Moses
+    # proposes and the listener starts on Brad's yes. Here (the Claude app) the confirmation cannot be
+    # enforced in code, so the examples are required and the description says to show them first.
+    if not (will_include or "").strip() or not (will_exclude or "").strip():
+        return ("Give Knight concrete examples first: `will_include` (things the build must cover) and "
+                "`will_exclude` (things it must not), shown to Brad and agreed before you call this. Nothing "
+                "was started.")
+    import build_spec as _bs
+    acceptance += ("\n\nCONFIRMED EXAMPLES (Brad agreed to these before the build):\n"
+                   + "\n".join(f"- It INCLUDES: {x}" for x in _bs._lines(will_include)) + "\n"
+                   + "\n".join(f"- It does NOT include: {x}" for x in _bs._lines(will_exclude)))
     if len(task) < 15:
         return ("Give Knight a real brief — what to build and how to check it. A one-word task "
                 "produces a branch with nothing on it.")
@@ -469,11 +504,64 @@ def knight_start(task: str, acceptance: str, target: str = "viatica") -> str:
                 "  weak:   'remove the Labs entry'\n"
                 "  usable: 'the Labs/bcmdisplay host is absent from the hardware registry; the "
                 "registry still parses; no other host entry changed'")
-    out = _run([KNIGHT_BIN, "start", "--target", target.strip() or "viatica",
+    out = _run([KNIGHT_BIN, "start", "--target", target.strip() or _env.setting("KNIGHT_DEFAULT_TARGET"),
                 "--acceptance", acceptance, task], limit=3000)
     if "disabled" in out.lower():
         return f"{out}\n\nKnight is switched off. Brad can re-enable him with `knight enable`."
     return out
+
+
+@server.tool(
+    description="START A BRAND-NEW BUILD of a project already in the tracker, authorized by Brad's "
+                "one-time authenticator code (#14). Use it when Brad gives a project the green light "
+                "(\"build #13\", \"go ahead and build the listings finder\"). TWO CALLS: first with "
+                "just `project` (its tracker number, id or name) — that opens a code request and returns "
+                "a prompt; show Brad the prompt and ask for the 6-digit code from his authenticator. Then "
+                "call again with `project` and `code` exactly as he typed it. A verified code creates "
+                "the project's folder in ~/Projects, puts it under git, registers it with Knight and "
+                "starts Knight building its scope; the reply says each step. Never invent, guess or reuse "
+                "a code, never call with a code he did not just give you, and never say the build started "
+                "unless this tool's reply says so. A project that already has a Knight target needs no "
+                "code: use knight_start. Pass `path` on the first call when Brad says where it should live "
+                "(example.com/<path>); it is published there once its first job lands."
+)
+def new_build(project: str, code: str = "", path: str = "") -> str:
+    # NEVER RAISES. The tool wrapper writes a failing call's arguments to tool-failures.jsonl, and an
+    # argument here can be Brad's code. Every failure comes back as text instead.
+    try:
+        import new_build as nb                                # agent/new_build.py — the same code Slack uses
+        if not (code or "").strip():
+            return nb.start(f"{project} | {path}" if path.strip() else project, "mcp", "")
+        digits = nb.is_code(code)
+        if not digits:
+            return "That isn't a 6-digit code. Ask Brad for the code from his authenticator and call again."
+        note = nb._note()
+        if note.get("challenge") and note.get("channel") == "mcp" and note.get("project") \
+                and nb._project(project).get("id") != note.get("project"):
+            return (f"The open code request is for {note.get('name') or note.get('project')}, not {project}. "
+                    "Nothing was checked.")
+        said, work = nb.answer(digits, "mcp", "mcp", "")
+        if not work:
+            return said
+        return f"{said}\n\n{work()}"
+    except Exception as e:                                    # noqa: BLE001 — see above
+        return f"⚠️ The new-build step failed ({type(e).__name__}). Nothing about the code was logged."
+
+
+@server.tool(
+    description="PUT A PROJECT ON THE WEB at example.com/<path>, when Brad asks for it to be viewable "
+                "there. `project` is its tracker number, id or name; `path` is what follows example.com/. "
+                "How it works, so you never have to ask: a Cloudflare tunnel sends all of example.com to "
+                "the site server on Reserve, which forwards a published path to the project's own server, "
+                "run as a user service on this machine. This runs the app, routes the path to it, checks the "
+                "public address answers, and makes every later landing restart it. Report what it says."
+)
+def publish(project: str, path: str) -> str:
+    try:
+        import publish as pub                                 # agent/publish.py — the same code Slack uses
+        return pub.run(f"{project} | {path}")
+    except Exception as e:                                    # noqa: BLE001
+        return f"⚠️ Publishing failed ({type(e).__name__})."
 
 
 @server.tool(
@@ -764,13 +852,24 @@ def project_add(name: str, scope: str = "", rank: int | None = None, status: str
         return f"Could not add it: {e}"
 
 
+# WHAT CONVERSATION MAY NOT SET (review of 2026-10-17). project_update is granted on any human-directed
+# turn, not only the owner's, so a field that DECIDES what goes public cannot be one of its fields:
+# publish_path is set only by a new build Brad authorized with his code, deploy only by moses-publish.
+# "Put it at example.com/x" goes through the owner-only publish action instead.
+NOT_FROM_CONVERSATION = ("publish_path", "deploy")
+
+
 @server.tool(
     description="Change one field on a project. Fields: status (active/parked/dormant/scrapped), "
                 "stage (idea/scope/milestones/building/shipped), rank, target (YYYY-MM-DD), scope, "
                 "focus, next, phase, name. Writing a scope onto an idea moves it to the scope stage "
-                "on its own. The project can be named by id or by part of its name."
+                "on its own. The project can be named by id or by part of its name. Blockers are "
+                "a list and have their own tools: project_add_blocker, project_remove_blocker."
 )
 def project_update(project: str, field: str, value: str) -> str:
+    if (field or "").strip() in NOT_FROM_CONVERSATION:
+        return (f"'{field}' is not set from conversation: it decides what goes public. Use the publish "
+                "action (Brad only) to put a project on the web.")
     try:
         import projects
         return projects.update(project, field, value)
@@ -802,6 +901,26 @@ def project_remove_idea(item: str, project: str = "") -> str:
         return projects.remove_idea(project, item)
     except Exception as e:
         return f"Could not drop it: {e}"
+
+
+@server.tool(description="Record something that is stopping a project — it shows as BLOCKED on the "
+                         "dashboard and in the standup until it is cleared.")
+def project_add_blocker(project: str, blocker: str) -> str:
+    try:
+        import projects
+        return projects.add_blocker(project, blocker)
+    except Exception as e:
+        return f"Could not add the blocker: {e}"
+
+
+@server.tool(description="Clear a project's blocker once it no longer stands in the way. `blocker` is "
+                         "its 1-based position or an unambiguous piece of its text.")
+def project_remove_blocker(project: str, blocker: str) -> str:
+    try:
+        import projects
+        return projects.remove_blocker(project, blocker)
+    except Exception as e:
+        return f"Could not clear the blocker: {e}"
 
 
 @server.tool(

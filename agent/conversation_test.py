@@ -311,7 +311,7 @@ check("WEB reading REVOKES every acting tool",
       not any(conversation._qualified(t) in conversation.tools_for(True, True).split(",")
               for t in conversation.ACT_TOOLS))
 check("WEB and a normal directed turn still has them",
-      conversation._qualified("knight_start") in conversation.tools_for(True, False).split(","))
+      conversation._qualified("knight_propose") in conversation.tools_for(True, False).split(","))
 check("WEB the deny list is a CONSTANT — no per-turn lifting of anything",
       not hasattr(conversation, "no_tools_for") and "Read" in conversation.NO_TOOLS.split(","))
 check("WEB WebSearch is NOT granted — he reads what he is given, he does not go looking",

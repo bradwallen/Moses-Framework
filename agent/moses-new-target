@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""moses-new-target — stand up a brand-new build after Brad's one-time code checked out (#14 A4).
+
+    moses-new-target <project-id>
+
+Runs as the operator, never as root. What it does, in order, stopping at the first thing that fails
+and saying exactly what exists by then:
+
+  1. AUTHORIZATION   `moses-mfa authorized new-build <id>` must name an unused authorization. No
+                     code, no build — this script has no way around that, and no flag to skip it.
+  2. PRECONDITIONS   the project is in the tracker with a scope, may enter `building`, has no Knight
+                     target, and its directory does not exist yet. Nothing here touches an existing
+                     directory: a project that already lives somewhere is not a NEW build.
+  3. CONSUME         the authorization is spent BEFORE anything is created, so a crash halfway
+                     cannot leave a code that works twice. A failed start costs Brad one more code.
+  4. REPOSITORY      ~/Projects/<id>, `git init -b main`, a README carrying the scope, gate.sh and
+                     prep.sh, one commit.
+  5. TARGET          knight/targets/<id>.env with KT_PUSH_MODE=branch — always. A new project
+                     lands on a branch for review until Brad says otherwise; editing the target later
+                     needs no code (his call, 2026-10-16). Plus <id>.brief. Both are committed to the
+                     Moses tree by path, alone: knight-land refuses to merge into a dirty tree, so
+                     leaving them untracked would block every later merge there.
+  6. PROVE IT        `knight provision <id>`: the clone, prep and gate on an untouched mainline.
+  7. FIRST JOB       `knight start --target <id>` with the tracker scope as the brief, and
+                     acceptance criteria that make the first job replace gate.sh with real checks.
+  8. TRACKER         repo = the new directory, stage = building.
+
+THE STARTING GATE PASSES, ON PURPOSE. A fresh repository has nothing to test, and provisioning
+proves the plumbing (clone, prep, gate) on an untouched mainline, which a red placeholder would
+make impossible. So gate.sh starts as "no checks yet" and exits 0, and the first job's acceptance
+criteria require it to run real tests and to FAIL when one fails. Zryachiy reviews against those
+criteria, and the work lands on a branch, so a gate Knight left at `exit 0` is refused at review
+rather than trusted.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "lib"))
+import moses_env as _env  # noqa: E402
+
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+MFA_CMD = shlex.split(os.environ.get("MOSES_MFA_CMD", "sudo -n /usr/local/bin/moses-mfa"))
+KNIGHT = shlex.split(os.environ.get("KNIGHT_BIN", str(_env.ROOT / "knight" / "bin" / "knight")))
+TARGETS = Path(os.environ.get("KNIGHT_TARGETS", str(_env.ROOT / "knight" / "targets")))
+PROJECTS_DIR = Path(os.environ.get("MOSES_PROJECTS_DIR", str(_env.HOME / "Projects")))
+MCP_DIR = os.environ.get("MOSES_MCP_DIR", str(_env.ROOT / "mcp"))
+
+GATE_SH = """#!/usr/bin/env bash
+# gate.sh — the objective check Knight's runner runs before any work on this project ships.
+# It starts with nothing to check. The first build job replaces this with the project's real tests
+# and type check, and must make it exit non-zero when one of them fails.
+echo "no checks yet: the first build job replaces this gate"
+exit 0
+"""
+PREP_SH = """#!/usr/bin/env bash
+# prep.sh — what has to exist in Knight's clone before he can build and test (dependencies, generated
+# code). It runs OUTSIDE his sandbox, with network; the sandbox has none. Empty until the stack exists.
+exit 0
+"""
+
+
+class Stop(Exception):
+    pass
+
+
+def run(argv: list[str], cwd: Path | None = None, stdin: str = "", timeout: int = 900) -> tuple[int, str]:
+    try:
+        r = subprocess.run(argv, cwd=cwd, input=stdin, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, f"{type(e).__name__}: {e}"
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+def git(repo: Path, *args: str) -> str:
+    rc, out = run(["git", "-C", str(repo), *args])
+    if rc != 0:
+        raise Stop(f"git {' '.join(args[:2])} failed in {repo}: {out[-300:]}")
+    return out
+
+
+def registry():
+    if MCP_DIR not in sys.path:
+        sys.path.insert(0, MCP_DIR)
+    import projects                                             # noqa: PLC0415
+    return projects
+
+
+def target_env(pid: str, name: str, src: Path, kind: str = "") -> str:
+    return f"""# {pid} — created by moses-new-target after Brad authorized it with a one-time code (#14).
+#
+# KT_PUSH_MODE=branch because this is a new project: green work waits on knight/<slug> for review.
+# Editing this file later needs no code (Brad, 2026-10-16), so promoting it to `direct` is a normal
+# change, made on purpose.
+
+KT_DESC={shlex.quote(name)}
+KT_SOURCE={src}
+KT_BRANCH=main
+KT_PUSH_MODE=branch
+KT_PUSH_REMOTE={src}   # local repo, no remote yet; a branch push into a non-bare repo is fine
+
+# The project's own scripts, so the stack can change without editing this file.
+KT_PREP=(
+  './prep.sh'
+)
+KT_GATE=(
+  './gate.sh'
+)
+
+# Nothing runs from this repository yet, so nothing to restart after a merge.
+KT_LIVE_CMD=''
+KT_LIVE_CHECK=''
+
+# BUILDING AWAY (Brad, 2026-10-17). KT_AUTO_LAND: a green, reviewed job merges itself — only for an
+# internal project, and only once main's gate.sh is a real check (the first job still waits for
+# "merge it"). KT_CONTINUE: after each landed job Knight briefs the next piece of the scope, until he
+# reports SCOPE COMPLETE, a job does not land, or the day's budget is spent. See knight/bin/knight-next.
+KT_AUTO_LAND={"1" if kind == "internal" else "0"}
+KT_CONTINUE=1
+"""
+
+
+def brief(name: str, scope: str) -> str:
+    return f"""{name} is a NEW project, started from Brad's projects tracker. Its scope there:
+
+{scope}
+
+THE REPOSITORY STARTS EMPTY: a README, a placeholder gate.sh that checks nothing, and an empty
+prep.sh. Pick the simplest stack that fits the scope. For a web app, prefer Next.js with TypeScript,
+which is the stack Brad already runs and deploys; say why if you choose otherwise.
+
+gate.sh IS THE OBJECTIVE CHECK and you are expected to make it real: run the tests and the type check,
+and exit non-zero when either fails. prep.sh installs what the tests need (it runs with network,
+before you start; your sandbox has none). A gate that still exits 0 with no checks is a failed job.
+
+docs/ARCHITECTURE.md IS PART OF THE FIRST JOB, not a later one: every project carries its architecture
+(commandment V). Plain text (ASCII or Mermaid): each component and where it runs, the main flows,
+every caller of every address, where config and secrets come from (names, never values), and what
+degrades quietly versus what fails loudly. Keep it true in every later job that changes any of those.
+
+WHEN THE SCOPE IS COVERED, say so: put the words SCOPE COMPLETE on the first line of your report and
+change nothing. After each job lands, you are briefed again for the next piece of the scope, and those
+two words are how the run of jobs ends.
+
+Data rules from Brad's commandments: data comes from its provider directly; no inventing it when a
+source fails. Blank beats invented. Secrets never live in the repository.
+"""
+
+
+def acceptance(name: str) -> str:
+    return (f"gate.sh runs {name}'s automated tests and a type or lint check, and exits non-zero when a test "
+            "fails (shown by a test that was failing before the fix, or by breaking one on purpose and "
+            "reverting); prep.sh installs everything gate.sh needs from a clean clone; the README says how "
+            "to run the project locally in one command; docs/ARCHITECTURE.md draws each component, the main "
+            "flows, every caller of every address, where config and secrets come from (names only) and what "
+            "degrades; the core of the scope works and is covered by the tests; no secret, key or token is "
+            "committed.")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 1 or not NAME.match(argv[0]):
+        print("usage: moses-new-target <project-id>", file=sys.stderr)
+        return 1
+    pid = argv[0]
+    done: list[str] = []
+
+    def say(line: str) -> None:
+        done.append(line)
+        print(line, flush=True)
+
+    try:
+        # 1. A code was given for exactly this project.
+        rc, out = run([*MFA_CMD, "authorized", "new-build", pid], timeout=30)
+        if rc not in (0, 1):
+            raise Stop(f"could not check for an authorization (exit {rc}: {out.splitlines()[-1] if out else 'no answer'}). "
+                       "Nothing was created.")
+        if rc != 0:
+            raise Stop(f"no unused authorization for new-build:{pid} ({out.splitlines()[-1] if out else 'no answer'}). "
+                       "A new build starts with Brad's one-time code. Nothing was created.")
+        auth = out.strip().splitlines()[-1]
+
+        # 2. Preconditions, all before anything is spent or made.
+        reg = registry()
+        d = reg.load()
+        p = reg.find(d, pid)
+        if p["id"] != pid:
+            raise Stop(f"'{pid}' resolved to '{p['id']}'; a build is authorized by exact id. Nothing was created.")
+        name, scope = (p.get("name") or pid).strip(), (p.get("scope") or "").strip()
+        if not scope:
+            raise Stop(f"{name} has no scope in the tracker. Nothing was created.")
+        try:
+            reg.assert_may_build(p)
+        except Exception as e:                                  # noqa: BLE001 — ProjectError
+            raise Stop(f"{e}\nNothing was created.")
+        env_file, brief_file = TARGETS / f"{pid}.env", TARGETS / f"{pid}.brief"
+        if env_file.exists():
+            raise Stop(f"{pid} already has a Knight target ({env_file}). Nothing was created.")
+        src = PROJECTS_DIR / pid
+        if src.exists():
+            raise Stop(f"{src} already exists. A new build never adopts an existing directory. Nothing was created.")
+
+        # 3. Spend the authorization first.
+        rc, out = run([*MFA_CMD, "consume", auth], timeout=30)
+        if rc != 0:
+            raise Stop(f"could not use the authorization ({out[-200:]}). Nothing was created.")
+        say(f"🔓 Authorization used for new-build:{pid}.")
+
+        # 4. The repository.
+        src.mkdir(parents=True)
+        (src / "README.md").write_text(f"# {name}\n\n{scope}\n\nStarted by Moses from the projects tracker. "
+                                       "Knight builds it; see gate.sh for the checks every change must pass.\n")
+        (src / "gate.sh").write_text(GATE_SH)
+        (src / "prep.sh").write_text(PREP_SH)
+        (src / ".gitignore").write_text("node_modules/\n.venv/\n.env\n.env.*\n.next/\ndist/\n__pycache__/\n")
+        for f in ("gate.sh", "prep.sh"):
+            (src / f).chmod(0o755)
+        git(src, "init", "-q", "-b", "main")
+        git(src, "add", "README.md", "gate.sh", "prep.sh", ".gitignore")
+        git(src, "commit", "-q", "-m", f"{name}: a new project, started from the tracker (#14)")
+        say(f"📁 {src} created and under git ({git(src, 'rev-parse', '--short', 'HEAD')}).")
+
+        # 5. The target, committed alone.
+        env_file.write_text(target_env(pid, name, src, (p.get("kind") or "").strip().lower()))
+        brief_file.write_text(brief(name, scope))
+        top = Path(git(TARGETS, "rev-parse", "--show-toplevel"))
+        rel = [str(f.resolve().relative_to(top.resolve())) for f in (env_file, brief_file)]
+        git(top, "add", "--", *rel)
+        git(top, "commit", "-q", "-m", f"Knight target: {pid}, created after Brad's one-time code (#14)", "--", *rel)
+        say(f"🎯 Knight target `{pid}` registered (branch landing).")
+
+        # 6. Prove the plumbing.
+        rc, out = run([*KNIGHT, "provision", pid])
+        if rc != 0:
+            raise Stop(f"knight provision failed, so no job was started:\n{out[-600:]}")
+        say("✅ Provisioned: Knight's clone, prep and gate all run.")
+
+        # 7. The first job.
+        task = (f"Build the initial version of {name}, a brand-new project. The scope from the tracker:\n\n{scope}\n\n"
+                "The repository holds only a README and placeholder gate.sh/prep.sh. Choose the stack, build "
+                "the core of the scope, and make gate.sh a real check. The brief beside this target says more.")
+        rc, out = run([*KNIGHT, "start", "--target", pid, "--acceptance", acceptance(name), task], timeout=120)
+        if rc != 0:
+            raise Stop(f"knight start refused the first job:\n{out[-600:]}")
+        # Knight's own output ends with "Check with: knight status <id>", a terminal command. Brad does
+        # not run commands (2026-10-17), and Moses answers "how is it going" himself, so it is dropped.
+        out = "\n".join(l for l in out.splitlines() if not l.strip().lower().startswith("check with"))
+        say(f"🛠️ Knight's first job started:\n{out[-400:]}")
+
+        # 8. The tracker. A failure here is said, never fatal: the build is real either way.
+        try:
+            reg.update(pid, "repo", str(src))
+            reg.update(pid, "stage", "building")
+            say(f"📋 Tracker: {name} is now building, repo {src}.")
+        except Exception as e:                                  # noqa: BLE001
+            say(f"⚠️ The build started but the tracker was not updated: {e}")
+        return 0
+    except Stop as e:
+        print(f"⚠️ {e}", flush=True)
+        if done:
+            print("Done before it stopped:\n" + "\n".join(f"  {x}" for x in done), flush=True)
+        return 1
+    except Exception as e:                                      # noqa: BLE001
+        print(f"⚠️ moses-new-target failed ({type(e).__name__}: {e}).", flush=True)
+        if done:
+            print("Done before it stopped:\n" + "\n".join(f"  {x}" for x in done), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

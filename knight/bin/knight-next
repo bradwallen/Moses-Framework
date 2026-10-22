@@ -1,0 +1,507 @@
+#!/usr/bin/env bash
+# knight-next — what happens after a job, so a project Brad authorized keeps building without him.
+#
+#   knight-next <job-id>                (started detached by knight-run when a job ends)
+#   knight-next --after-land <job-id>   (started detached by knight-land after a merge)
+#
+# WHY (Brad, 2026-10-17): "when the project is scoped and I authorize it, they're free to build the
+# project in the ~/Projects folder, put it under version control and build away." His one-time code
+# (#14) is the authorization. Before this, every job stopped at a branch and waited for "merge it",
+# and nothing started the next one. Two settings in the target file turn that around, and both are
+# written by moses-new-target, so only projects started with his code have them:
+#
+#   KT_AUTO_LAND=1   a job that ends `pushed` is landed through knight-land — every refusal there
+#                    still applies (review not clean, an unanswered note, a dirty tree, a new or
+#                    repointed target) — but ONLY when ALL of these hold:
+#                      • the project is `internal` in the tracker, read now, not when the target
+#                        was written (a business keeps the "merge it" stop, his call);
+#                      • main's gate.sh is a real check, not the placeholder a new repository starts
+#                        with — so the FIRST job, which makes the gate real, waits for Brad;
+#                      • the branch does not touch gate.sh or prep.sh — a job does not get to weaken
+#                        the check that is about to wave it through. Such a branch waits for Brad.
+#   KT_CONTINUE=1    after a landing, the next job is briefed from the project's scope, unless the job
+#                    that just landed said SCOPE COMPLETE, Knight is disabled, the day's budget is
+#                    spent, or KT_CONTINUE_MAX jobs have already run on this target today.
+#
+# Every decision, including "waiting for you", is said in the conversation the work came from, and
+# recorded in lands.jsonl. Silence would look exactly like a chain that died.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+KNIGHT=${KNIGHT_HOME:-$(cd "$HERE/.." && pwd)}
+JOBS=${KNIGHT_JOBS:-$KNIGHT/jobs}
+TARGETS=${KNIGHT_TARGETS:-$KNIGHT/targets}
+LOG=${KNIGHT_LAND_LOG:-$KNIGHT/lands.jsonl}
+OPTENV=${KNIGHT_SLACK_ENV:-$MOSES_CONFIG_DIR/knight.env}
+MCP_DIR=${MOSES_MCP_DIR:-$KNIGHT/../mcp}
+LAND=${KNIGHT_LAND_BIN:-$HERE/knight-land}
+START=${KNIGHT_START_BIN:-$HERE/knight}
+PLACEHOLDER="no checks yet: the first build job replaces this gate"
+
+MODE=next
+[ "${1:-}" = "--after-land" ] && { MODE=after-land; shift; }
+JOB_ID=${1:-}
+[ -n "$JOB_ID" ] || { echo "usage: knight-next [--after-land] <job-id>" >&2; exit 64; }
+DIR="$JOBS/$JOB_ID"
+[ -d "$DIR" ] || { echo "no such job: $JOB_ID" >&2; exit 2; }
+TARGET=$(cat "$DIR/target" 2>/dev/null || echo "")
+BRANCH=$(cat "$DIR/branch" 2>/dev/null || echo "")
+STATUS=$(cat "$DIR/status" 2>/dev/null || echo "")
+[ -r "$TARGETS/$TARGET.env" ] || exit 0
+# shellcheck disable=SC1090
+KT_SOURCE=""; KT_BRANCH=""; KT_AUTO_LAND=0; KT_CONTINUE=0; KT_CONTINUE_MAX=""
+. "$TARGETS/$TARGET.env"
+MAIN=${KT_BRANCH:-main}
+CONTINUE_MAX=${KT_CONTINUE_MAX:-6}
+# shellcheck disable=SC1090
+[ -r "$KNIGHT/guards.env" ] && . "$KNIGHT/guards.env" 2>/dev/null
+FIXUP_ROUNDS=${KNIGHT_FIXUP_ROUNDS:-2}
+# How long to wait for a job in flight (the next piece, or the done check's provision): every two minutes, for an hour.
+WAIT_STEP=${KNIGHT_NEXT_WAIT_SEC:-120}; WAIT_TRIES=${KNIGHT_NEXT_WAIT_TRIES:-30}
+QUIET=0; [ -e "$DIR/quiet" ] && QUIET=1
+RUN_OF=$(cat "$DIR/run-of" 2>/dev/null || echo "$JOB_ID")   # the run's first job: its card is this run's card
+
+record() {
+    {
+        mkdir -p "$(dirname "$LOG")" || true
+        printf '{"at":"%s","job":"%s","branch":"%s","target":"%s","outcome":"%s","detail":"%s"}\n' \
+            "$(date -Is)" "$JOB_ID" "$BRANCH" "$TARGET" "$1" \
+            "$(printf '%s' "${2:-}" | tr -d '"\n' | head -c 300)" >> "$LOG"
+    } 2>/dev/null || true
+}
+
+# Same destinations as knight-land-live: the conversation that asked (notify.json), else Knight's channel.
+slack_say() {
+    local text=$1 tok chan thread
+    # A post that cannot be made is recorded, never silent: a held job nobody hears about looks exactly
+    # like a chain that died.
+    [ -r "$OPTENV" ] || { record "slack-not-posted" "no Slack settings readable: $(printf '%s' "$text" | head -c 120)"; return 0; }
+    local _xt=0; case $- in *x*) _xt=1; set +x ;; esac
+    # shellcheck disable=SC1090
+    tok=$(. "$OPTENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
+    if [ -n "${KNIGHT_SLACK_CHANNEL+x}" ]; then chan=$KNIGHT_SLACK_CHANNEL; else
+        chan=$(. "$OPTENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
+    [ "$_xt" = 1 ] && set -x
+    thread=""
+    if [ -r "$DIR/notify.json" ]; then
+        local nchan nthread
+        nchan=$(jq -r '.channel // ""' "$DIR/notify.json" 2>/dev/null)
+        nthread=$(jq -r '.thread_ts // ""' "$DIR/notify.json" 2>/dev/null)
+        [ -n "$nchan" ] && chan=$nchan && thread=$nthread
+    fi
+    [ -n "$tok" ] && [ -n "$chan" ] || { record "slack-not-posted" "no token or channel"; return 0; }
+    curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
+        -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
+        --data "$(jq -nc --arg c "$chan" --arg t "$text" --arg th "$thread" \
+            '{channel:$c,text:$t,username:"Knight",icon_emoji:":crossed_swords:"}
+             + (if $th == "" then {} else {thread_ts:$th} end)')" \
+        > "$DIR/next-slack.json" 2>&1
+    jq -e '.ok == true' "$DIR/next-slack.json" >/dev/null 2>&1 \
+        || record "slack-not-posted" "$(jq -r '.error // "no answer"' "$DIR/next-slack.json" 2>/dev/null)"
+}
+
+# THE RUN'S ONE CARD (2026-10-17): every step below edits the same Slack message (lib/card.py) instead of
+# posting a new one. <stage> is what is happening now; ping=1 only when the run is done or needs Brad,
+# because edits notify nobody.
+card() {  # card <stage> <ping 0|1> <line> [next]
+    local stage=$1 ping=$2 line=$3 nxt=${4-} extra=()
+    [ "$ping" = 1 ] && extra+=(--ping)
+    [ -n "$nxt" ] && extra+=(--next "$nxt")
+    if [ -x "$KNIGHT/lib/card.py" ]; then
+        "$KNIGHT/lib/card.py" "$DIR" "$stage" "$line" "${extra[@]}" >/dev/null 2>&1 || slack_say "$line"
+    else
+        slack_say "$line"
+    fi
+}
+
+# The tracker's word on the project, read now. Unknown is not internal.
+project_field() {
+    python3 - "$MCP_DIR" "$TARGET" "$1" <<'PY' 2>/dev/null
+import sys
+sys.path.insert(0, sys.argv[1])
+import projects
+# EXACT id only. projects.find falls back to a piece of the name, so a target whose project left the
+# tracker could borrow another project's kind and scope.
+try:
+    p = next((x for x in projects.load()["projects"] if x.get("id") == sys.argv[2]), None)
+    if p is None:
+        print("")
+    elif sys.argv[3] == "may-build":
+        try:
+            projects.assert_may_build(p)
+            print("yes")
+        except Exception as e:
+            print(str(e).splitlines()[0])
+    else:
+        print((p.get(sys.argv[3]) or "").strip())
+except Exception:
+    print("")
+PY
+}
+
+# project_set <field> <value> — through the tracker's own update(), so its rules apply. Never fatal.
+project_set() {
+    python3 - "$MCP_DIR" "$TARGET" "$1" "$2" <<'PY' >/dev/null 2>&1 || true
+import sys
+sys.path.insert(0, sys.argv[1])
+import projects
+projects.update(sys.argv[2], sys.argv[3], sys.argv[4])
+PY
+}
+
+# SCOPE COMPLETE counts on the report's FIRST line only: "not SCOPE COMPLETE yet" further down is
+# prose, not the signal. (The runner rewrites section labels, so the words may follow one.)
+scope_complete() { grep -m1 -v '^[[:space:]]*$' "$DIR/report.txt" 2>/dev/null | grep -q 'SCOPE COMPLETE'; }
+
+# Is the project still meant to be building? Brad pausing or parking it in the tracker stops
+# everything here, and so does anything the tracker's own build rule refuses.
+still_building() {
+    local st sg mb
+    st=$(project_field status); sg=$(project_field stage); mb=$(project_field may-build)
+    [ "$st" = active ] || { echo "the project is '${st:-not in the tracker}' in the tracker, not active"; return; }
+    [ "$sg" = building ] || { echo "the project's stage is '${sg:-unknown}', not building"; return; }
+    [ "$mb" = yes ] || { echo "the tracker will not let it build: ${mb:-could not check}"; return; }
+    echo ""
+}
+
+# WHAT DECIDES WHETHER THE GATE PASSES, not only gate.sh: the test runner's configuration and any file
+# gate.sh names. Without this a job could set `"test": "exit 0"` in package.json, or add a conftest.py
+# that skips everything, and land itself with gate.sh untouched. package.json and pyproject.toml are
+# compared section by section (scripts / [tool.*]), so adding a dependency does not hold a job.
+gate_files_touched() {
+    local changed f out=""
+    changed=$(git -C "$KT_SOURCE" diff --no-renames --name-only "$MAIN...$BRANCH" 2>/dev/null) || return 1
+    named=$(git -C "$KT_SOURCE" show "$MAIN:gate.sh" 2>/dev/null | grep -oE '[A-Za-z0-9_./-]+' | sort -u)
+    while read -r f; do
+        [ -n "$f" ] || continue
+        case "$(basename "$f")" in
+            gate.sh|prep.sh|conftest.py|pytest.ini|tox.ini|setup.cfg|Makefile|tsconfig*.json|\
+            jest.config.*|vitest.config.*|vite.config.*|playwright.config.*|.eslintrc*|eslint.config.*|\
+            .mocharc*|karma.conf.*|noxfile.py)
+                out="$out$f"$'\n'; continue ;;
+            package.json)
+                if ! python3 - "$KT_SOURCE" "$MAIN" "$BRANCH" "$f" <<'PY'
+import json, subprocess, sys
+src, main, branch, f = sys.argv[1:5]
+def scripts(ref):
+    try:
+        return json.loads(subprocess.run(["git", "-C", src, "show", f"{ref}:{f}"], capture_output=True,
+                                         text=True).stdout or "{}").get("scripts")
+    except ValueError:
+        return "unparseable"
+sys.exit(0 if scripts(main) == scripts(branch) else 1)
+PY
+                then out="$out$f (scripts)"$'\n'; fi
+                continue ;;
+            pyproject.toml)
+                a=$(git -C "$KT_SOURCE" show "$MAIN:$f" 2>/dev/null | awk '/^\[/{t=($0 ~ /^\[tool\./)} t')
+                b=$(git -C "$KT_SOURCE" show "$BRANCH:$f" 2>/dev/null | awk '/^\[/{t=($0 ~ /^\[tool\./)} t')
+                [ "$a" = "$b" ] || out="$out$f ([tool.*])"$'\n'
+                continue ;;
+        esac
+        # Any file gate.sh names on main.
+        if printf '%s\n' "$named" | grep -qxF -- "$f" || printf '%s\n' "$named" | grep -qxF -- "./$f"; then
+            out="$out$f"$'\n'
+        fi
+    done <<<"$changed"
+    printf '%s' "$out"
+}
+
+# WHAT LANDED IN THIS RUN, for the one message a run ends with: every job merged on this target today,
+# with the first line of what it did.
+digest() {
+    local today out=""
+    today=$(date +%Y-%m-%d)
+    while read -r j; do
+        [ -n "$j" ] || continue
+        line=$(grep -m1 -v '^[[:space:]]*$' "$JOBS/$j/report.txt" 2>/dev/null | sed -E 's/^\*[^*]+\*[[:space:]]*[—:-]?[[:space:]]*//' | cut -c1-160)
+        out="$out
+• \`$j\` — ${line:-landed}"
+    done < <(grep -F "\"target\":\"$TARGET\"" "$LOG" 2>/dev/null | grep -F "\"at\":\"$today" \
+             | grep -E '"outcome":"(merged)"' | sed -E 's/.*"job":"([^"]+)".*/\1/' | awk '!s[$0]++')
+    [ -n "$out" ] && printf '\nLanded today:%s' "$out"
+}
+
+# A GATE THAT CHECKS NOTHING passes with the code gone. Review of 2026-10-17: a first job whose gate.sh
+# was `exit 0` would have landed itself (and been published), because the only test was that the
+# placeholder text was gone. Mechanism, not text: in a scratch checkout of the branch, delete every
+# tracked file except gate.sh, prep.sh and dependency/config manifests, run gate.sh, and require it to
+# FAIL. A real gate has nothing to test and goes red; a gate that is green with no code is refused.
+gate_is_real() {
+    local tmp rc
+    tmp=$(mktemp -d) || return 1
+    if ! git -C "$KT_SOURCE" worktree add -q --detach "$tmp/w" "$BRANCH" >/dev/null 2>&1; then
+        rm -rf "$tmp"; return 1
+    fi
+    ( cd "$tmp/w" && git ls-files -z | grep -zvE '^(gate\.sh|prep\.sh|package(-lock)?\.json|tsconfig[^/]*\.json|pyproject\.toml|requirements[^/]*\.txt|\.gitignore)$' \
+        | xargs -0 -r rm -f -- )
+    ( cd "$tmp/w" && timeout 300 bash ./gate.sh >/dev/null 2>&1 ); rc=$?
+    git -C "$KT_SOURCE" worktree remove --force "$tmp/w" >/dev/null 2>&1; rm -rf "$tmp"
+    [ "$rc" -ne 0 ]
+}
+
+# A HOLD BECOMES WORK (Brad, 2026-10-17): a job stopped by its gate or its review is followed up by a job that starts from its branch (knight start --base) and is told exactly
+# what held it. Bounded: after KNIGHT_FIXUP_ROUNDS follow-ups it is Brad's, with the reason spelled out.
+fixup() {  # fixup <why> [what held it, when not the review or the gate]
+    local why=$1 round origin points task acc out rc new
+    # NEVER ON A TARGET THAT DEPLOYS ITSELF. A follow-up on a direct-push target (Viatica) would push
+    # to production with nobody having looked at why the first try was held. Those holds stay Brad's.
+    if [ "${KT_PUSH_MODE:-}" = direct ]; then
+        record "fixup-skipped" "direct-push target: $why"
+        card needs-you 1 "\`$JOB_ID\` was held: $why. This target deploys itself, so it is not followed up automatically." "Tell Moses what to do."
+        return
+    fi
+    round=$(cat "$DIR/fixup-round" 2>/dev/null || echo 0)
+    origin=$(cat "$DIR/fixup-of" 2>/dev/null || echo "$JOB_ID")
+    if [ "$round" -ge "$FIXUP_ROUNDS" ]; then
+        record "fixup-exhausted" "$why"
+        card needs-you 1 "Still held after $round follow-up(s): $why" "Say \"merge it anyway\" to Moses to land \`$JOB_ID\` as it is, or tell him what to change."
+        return
+    fi
+    # What HELD it: a defect or a missed requirement. A PLAUSIBLE beside them is a note, not a point to fix.
+    points=${2:-$(grep -E '^(CONFIRMED|MISSED)\b' "$DIR/review.txt" 2>/dev/null | head -6)}
+    [ -z "$points" ] && points=$(tail -25 "$DIR/gate.log" 2>/dev/null)
+    task="Follow-up $((round+1)) to job $origin. The work on branch $BRANCH was held: $why
+
+What held it:
+$points
+
+This job's branch STARTS FROM that branch (the runner put its commits here), so the work is already in
+front of you. Fix each point. If a point is wrong, prove it with a test and say so in the report. Do not
+rewrite anything else.
+
+THE ORIGINAL TASK:
+$(cat "$DIR/task.txt" 2>/dev/null)"
+    acc="$(cat "$DIR/acceptance.txt" 2>/dev/null)
+And: each point that held job $JOB_ID (listed in the task) is fixed, or the report names a test showing it does not apply."
+    out=$("$START" start --target "$TARGET" --base "$BRANCH" --quiet --run-of "$RUN_OF" --acceptance "$acc" "$task" 2>&1); rc=$?
+    new=$(printf '%s\n' "$out" | awk '/^started /{print $2; exit}')
+    if [ $rc -ne 0 ] || [ -z "$new" ]; then
+        record "fixup-refused" "$(printf '%s' "$out" | tail -1)"
+        card needs-you 1 "\`$JOB_ID\` is held ($why) and the follow-up could not start: $(printf '%s' "$out" | tail -1)" "Tell Moses what to do."
+        return
+    fi
+    printf '%s\n' "$origin" > "$JOBS/$new/fixup-of"; printf '%s\n' "$((round+1))" > "$JOBS/$new/fixup-round"
+    [ -r "$DIR/notify.json" ] && cp "$DIR/notify.json" "$JOBS/$new/notify.json"
+    record "fixup-started" "$new (round $((round+1))): $why"
+    # A person saw this job's report; tell them it is being handled. A quiet run says nothing until it ends.
+    card following-up 0 "Review held \`$JOB_ID\`: $why. Follow-up $((round+1)) of $FIXUP_ROUNDS (\`$new\`) is fixing it." "It is checked and reviewed again; it lands if clean."
+}
+
+# THE PROJECT'S NOTES LEDGER (#4, 2026-10-18). Review notes — PLAUSIBLE, the reviewer's "maybe" — are
+# written down here and never start a job by themselves. Brad, 2026-10-17: one job spawned two follow-ups
+# in four minutes over notes. They already travel in the commit message; here they wait for the next
+# piece of work that touches that code, which is handed them as context.
+NOTES_DIR=${KNIGHT_NOTES_DIR:-$KNIGHT/notes}
+record_notes() {
+    local n
+    n=$(grep -cE '^PLAUSIBLE\b' "$DIR/review.txt" 2>/dev/null) || n=0
+    [ "$n" -gt 0 ] || return 0
+    { mkdir -p "$NOTES_DIR" && grep -E '^PLAUSIBLE\b' "$DIR/review.txt" | head -6 \
+        | sed -E "s/^PLAUSIBLE[[:space:]]*:?[[:space:]]*/- $(date +%F) \`$JOB_ID\`: /" >> "$NOTES_DIR/$TARGET.md"
+      # Bounded: the newest 40, so the ledger (and the 8 handed to the next piece) stays current.
+      tail -40 "$NOTES_DIR/$TARGET.md" > "$NOTES_DIR/$TARGET.md.tmp" && mv "$NOTES_DIR/$TARGET.md.tmp" "$NOTES_DIR/$TARGET.md"; } 2>/dev/null || true
+    record "review-notes" "$n PLAUSIBLE, recorded in the notes ledger, not followed up"
+    card "$( [ "$STATUS" = pushed ] && echo landing || echo stopped )" 0 "Review left $n note(s): written down for later, not a reason to hold or redo the job."
+}
+open_notes() { tail -8 "$NOTES_DIR/$TARGET.md" 2>/dev/null; }
+
+# A CLEAR "DONE" (#5, 2026-10-18). Knight saying the scope is covered is one fact of four. Before Brad
+# is asked to look, knight-next proves the other two it can: the project's checks pass on its main
+# branch (`knight provision`, the same gate on an untouched checkout), and it answers at its live
+# address when it has one. Only then does the card ask for his look, which agent/glance.py records and
+# the listener's code closes — moving the project to `shipped`, which also ends every later run.
+LIVE_PROBE=${KNIGHT_LIVE_PROBE:-curl -fsS -m 20 -o /dev/null -A Knight-done-check}
+GLANCE=${KNIGHT_GLANCE_BIN:-$KNIGHT/../agent/glance.py}
+finish_run() {
+    local url pp out first
+    url=$(project_field deploy)
+    if [ -z "$url" ]; then pp=$(project_field publish_path); [ -n "$pp" ] && url="https://example.com/$pp/"; fi
+    # Bounded, and patient with a job in flight: provision refuses while one holds the clone.
+    local try rc=1
+    for try in $(seq 1 "$WAIT_TRIES"); do
+        out=$(timeout "${KNIGHT_DONE_CHECK_SEC:-1800}" "$START" provision "$TARGET" 2>&1); rc=$?
+        printf '%s' "$out" | grep -q 'already running' || break
+        sleep "$WAIT_STEP"
+    done
+    if [ "$rc" -eq 124 ]; then
+        record "done-check-red" "knight provision did not finish in ${KNIGHT_DONE_CHECK_SEC:-1800}s"
+        card needs-you 1 "Knight reports the scope is covered, but the checks on $MAIN did not finish in time. Not done." "Tell Moses to look at why they hang."
+        return
+    fi
+    if [ "$rc" -ne 0 ]; then
+        first=$(printf '%s\n' "$out" | grep -m1 -A1 'RED' | tail -1 | sed -E 's/^[[:space:]]+//' | cut -c1-200)
+        record "done-check-red" "${first:-knight provision failed}"
+        card needs-you 1 "Knight reports the scope is covered, but the checks FAIL on $MAIN: ${first:-knight provision $TARGET is red}. Not done." "Tell Moses whether to fix it."
+        return
+    fi
+    if [ -n "$url" ] && ! $LIVE_PROBE "$url" >/dev/null 2>&1; then
+        record "done-check-down" "$url does not answer"
+        card needs-you 1 "Knight reports the scope is covered and the checks pass, but $url does not answer. Not done." "Tell Moses to look at why it is down."
+        return
+    fi
+    record "done-check-green" "checks pass on $MAIN${url:+; $url answers}"
+    project_set next "Waiting for Brad's look${url:+ at $url} (since $(date +%F))"
+    # "Waiting for you", not "Done": it is done when Brad has looked (glance.close updates the card then).
+    card waiting 1 "The scope is covered, the checks pass on $MAIN$([ -n "$url" ] && printf ', and it is live at %s' "$url"). $(digest | tr '\n' ' ')" \
+        "Have a look. Reply *looks good* here (or ✅ this card) and Moses marks it done; anything off, just say what."
+    # The card exists now, so the request knows where Brad will answer.
+    python3 "$GLANCE" request "$TARGET" "$url" "$JOBS/$RUN_OF" >/dev/null 2>&1 || record "glance-not-recorded" "$GLANCE"
+}
+
+# ── After a job ends: land it, or say why it waits ───────────────────────────
+if [ "$MODE" = next ]; then
+    # Notes are written down whatever happens next — held, landing, waiting, or a project that does not
+    # land itself. A note never holds a job and never starts one.
+    record_notes
+    # A job that changed nothing because the scope is covered ends as done-not-pushed. That is the
+    # run of jobs finishing, and it is said and recorded rather than left looking like a failure.
+    if [ "$STATUS" = done-not-pushed ] && [ "$KT_CONTINUE" = 1 ] && scope_complete; then
+        record "chain-complete" "the job reported SCOPE COMPLETE and changed nothing"
+        finish_run
+        exit 0
+    fi
+    # Held by the gate or the review, with work committed: a follow-up, on any target.
+    if [ "$STATUS" = done-not-pushed ]; then
+        heldwhy=$(grep -m1 '^pushed=no' "$DIR/summary" 2>/dev/null | sed -E 's/^pushed=no( — )?//' | cut -c1-240)
+        commits=$(grep -m1 '^commits=' "$DIR/summary" 2>/dev/null | cut -d= -f2)
+        gatered=$(grep -m1 '^gate=red' "$DIR/summary" 2>/dev/null | sed -E 's/^gate=red: //' | cut -c1-200)
+        if [ "${commits:-0}" -gt 0 ] && [ -n "$heldwhy$gatered" ]; then
+            fixup "${heldwhy:-$gatered}"
+        elif [ "$QUIET" = 1 ]; then
+            # A quiet job that ended with nothing to follow up — no commits, and not SCOPE COMPLETE —
+            # is the end of the run, and the run ends with a message, never silence.
+            record "chain-stopped" "${heldwhy:-the job changed nothing}"
+            card stopped 1 "The run stopped: ${heldwhy:-the last job changed nothing}." "Tell Moses what to do next."
+        fi
+        exit 0
+    fi
+    [ "$KT_AUTO_LAND" = 1 ] || exit 0
+    [ "$STATUS" = pushed ] || exit 0          # nothing waiting on a branch; knight-run already said why
+    # A REVIEW THAT SETTLED NOTHING does not land itself (review of 2026-10-17): UNCHECKED never blocks
+    # a push, but a review made only of UNCHECKED lines, with no criterion SETTLED and no CLEAN, is
+    # one nobody actually judged. That is Brad's to look at, not something a follow-up can fix.
+    if grep -qE '^UNCHECKED\b' "$DIR/review.txt" 2>/dev/null && ! grep -qE '^(SETTLED|CLEAN)\b' "$DIR/review.txt" 2>/dev/null; then
+        record "auto-land-held" "the review settled no criterion from the diff"
+        card waiting 1 "\`$JOB_ID\` is green, but its review could not settle any requirement from the change (all UNCHECKED)." "Say \"merge it\" to Moses to land it."
+        exit 0
+    fi
+    # EVERY PROJECT CARRIES ITS ARCHITECTURE (commandment V). Brad, 2026-10-22, after the listings page
+    # ran five days with none: "EVERY project needs documentation — that is absolute failure." A job on a
+    # project with no docs/ARCHITECTURE.md does not land by itself; it is followed up by a job that writes
+    # one, like any other missed requirement.
+    if ! git -C "$KT_SOURCE" cat-file -e "$BRANCH:docs/ARCHITECTURE.md" 2>/dev/null \
+       && ! git -C "$KT_SOURCE" cat-file -e "$BRANCH:agent/docs/ARCHITECTURE.md" 2>/dev/null; then
+        fixup "the project has no docs/ARCHITECTURE.md" "MISSED: the project has no docs/ARCHITECTURE.md. Write one, in plain text (ASCII or Mermaid): each component and where it runs (service, port, timer), the main flows drawn one per diagram, every caller of every address, where config and secrets come from (names, never values), and what degrades quietly versus what fails loudly. Check it against what actually runs."
+        exit 0
+    fi
+    why=$(still_building)
+    kind=$(project_field kind)
+    if [ -n "$why" ]; then
+        why="$why, so it waits for your \"merge it\""
+    elif [ "$kind" != internal ]; then
+        why="the project is '${kind:-unknown}' in the tracker, not internal, so it waits for your \"merge it\""
+    elif ! git -C "$KT_SOURCE" show "$MAIN:gate.sh" >/dev/null 2>&1; then
+        why="main has no gate.sh to trust, so it waits for your \"merge it\""
+    elif git -C "$KT_SOURCE" show "$MAIN:gate.sh" 2>/dev/null | grep -qF "$PLACEHOLDER"; then
+        # THE FIRST JOB (Brad, 2026-10-17: it should not wait for him either). Main's gate is the
+        # placeholder, so this job is the one that makes it real — and it may land itself only if it
+        # did: its own gate.sh is no longer the placeholder, its gate ran green in the runner, and the
+        # review (whose criteria for a first job require gate.sh to run tests and fail when one fails)
+        # is clean. Changing gate.sh is the point here, so the touch check below does not apply.
+        if ! git -C "$KT_SOURCE" show "$BRANCH:gate.sh" >/dev/null 2>&1 \
+           || git -C "$KT_SOURCE" show "$BRANCH:gate.sh" 2>/dev/null | grep -qF "$PLACEHOLDER"; then
+            why="it leaves the project's checks as the placeholder, so it waits for your \"merge it\""
+        elif ! gate_is_real; then
+            why="its gate.sh still passes with the project's code deleted, so it checks nothing; it waits for your \"merge it\""
+        fi
+    else
+        touched=$(gate_files_touched) || touched="(could not compute what it changes)"
+        [ -z "$touched" ] || why="it changes $(printf '%s' "$touched" | tr '\n' ' ')— what decides whether its own tests pass — so it waits for your \"merge it\""
+    fi
+    if [ -n "$why" ]; then
+        record "auto-land-held" "$why"
+        card waiting 1 "\`$JOB_ID\` is green and reviewed, but not landing by itself: $why." "Say \"merge it\" to Moses to land it."
+        exit 0
+    fi
+    out=$("$LAND" "$JOB_ID" 2>&1); rc=$?
+    record "$([ $rc -eq 0 ] && echo auto-landed || echo auto-land-refused)" "$(printf '%s' "$out" | head -3)"
+    if [ $rc -ne 0 ]; then
+        card waiting 1 "\`$JOB_ID\` did not land by itself: $(printf '%s' "$out" | grep -m1 'REFUSED' | sed 's/^REFUSED: //')" "Tell Moses what to do."
+    else
+        card landed 0 "\`$JOB_ID\` landed by itself (checks green, review clean)." "Knight builds the next piece of the scope."
+    fi
+    exit 0
+fi
+
+# ── After a landing: publish if Brad named a place for it ───────────────────
+# "build #13 at example.com/listings" leaves publish_path on the tracker. The first landing
+# that leaves the project runnable publishes it there; until then moses-publish says why not (no run
+# command yet, say) and the next landing tries again. Never a reason to stop building.
+PUBLISH=${MOSES_PUBLISH_BIN:-$KNIGHT/../agent/moses-publish}
+want=$(project_field publish_path); live=$(project_field deploy)
+if [ -n "$want" ] && [ -z "$live" ] && [ -x "$PUBLISH" ]; then
+    pout=$("$PUBLISH" "$TARGET" "$want" 2>&1); prc=$?
+    record "$([ $prc -eq 0 ] && echo published || echo publish-not-yet)" "$(printf '%s' "$pout" | tail -1)"
+    if [ $prc -eq 0 ]; then card live 0 "Published at https://example.com/$want/"
+    else card landed 0 "Not published yet: $(printf '%s' "$pout" | tail -1)"; fi
+fi
+
+# ── After a landing: brief the next piece of the scope ───────────────────────
+[ "$KT_CONTINUE" = 1 ] || exit 0
+if scope_complete; then
+    record "chain-complete" "the job reported SCOPE COMPLETE"
+    finish_run
+    exit 0
+fi
+stop=$(still_building)
+if [ -n "$stop" ]; then
+    record "chain-stopped" "$stop"
+    card stopped 1 "Not starting the next piece: $stop." "Tell Moses when to carry on."
+    exit 0
+fi
+# Jobs on this project today, EXCLUDING anything before the last `knight reset-budget` — the same
+# epoch rule as Knight's daily count. Brad, 2026-10-17: a day of testing burned the runs, he reset the
+# budget, and this cap (which counted on its own) would still have said the project was done for the day.
+today=$(date +%Y%m%d); n=0
+epoch=$(cat "$KNIGHT/.budget-epoch" 2>/dev/null || true)
+for j in "$JOBS/$today"-*; do
+    [ -d "$j" ] || continue
+    [ -n "$epoch" ] && [ "$(basename "$j" | cut -c1-15)" \< "$epoch" ] && continue
+    [ "$(cat "$j/target" 2>/dev/null)" = "$TARGET" ] && n=$((n+1))
+done
+if [ "$n" -ge "$CONTINUE_MAX" ]; then
+    record "chain-paused" "$n jobs on $TARGET today"
+    card stopped 1 "$n jobs on this project today — the daily limit for one project." "Knight carries on when you ask Moses."
+    exit 0
+fi
+name=$(project_field name); scope=$(project_field scope)
+[ -n "$scope" ] || { record "chain-stopped" "no scope in the tracker"; card stopped 1 "No scope in the tracker, so there is nothing to brief the next job from." "Give the project a scope."; exit 0; }
+task="Continue building ${name:-$TARGET}. The scope from the tracker:
+
+$scope
+
+Read the README, the code and the git log to see what already exists. Then build the single most valuable piece of the scope that is NOT built yet, with tests that gate.sh runs. If the scope is fully covered, change nothing and put SCOPE COMPLETE on the first line of your report.$(notes=$(open_notes); [ -n "$notes" ] && printf '\n\nREVIEW NOTES FROM EARLIER JOBS (unconfirmed maybes, not requirements). Fix one only if the piece you build touches that code anyway, and say so in the report:\n%s' "$notes")"
+acceptance="The report's first line names the piece of the scope this job built; gate.sh passes and runs a test that covers that piece; nothing already working was removed; no secret, key or token is committed. OR: the report's first line says SCOPE COMPLETE and nothing was changed."
+# KNIGHT RUNS ONE JOB AT A TIME, so another job in flight (one Brad started on Viatica, say) is a
+# reason to wait, not to give up: try again every two minutes for up to an hour. Any other refusal —
+# disabled, the day's budget spent — ends the run and is said.
+for try in $(seq 1 "$WAIT_TRIES"); do
+    out=$("$START" start --target "$TARGET" --quiet --run-of "$RUN_OF" --acceptance "$acceptance" "$task" 2>&1); rc=$?
+    new=$(printf '%s\n' "$out" | awk '/^started /{print $2; exit}')
+    [ -z "$new" ] && printf '%s' "$out" | grep -q 'already running' || break
+    [ "$try" = 1 ] && card next-piece 0 "Knight is busy with another job; the next piece starts when he is free."
+    sleep "$WAIT_STEP"
+done
+if [ $rc -ne 0 ] || [ -z "$new" ]; then
+    record "chain-refused" "$(printf '%s' "$out" | tail -1)"
+    card stopped 1 "The next piece did not start: $(printf '%s' "$out" | tail -1)" "Tell Moses what to do."
+    exit 0
+fi
+# The next job reports to the same conversation as this one.
+[ -r "$DIR/notify.json" ] && [ -d "$JOBS/$new" ] && cp "$DIR/notify.json" "$JOBS/$new/notify.json"
+record "chain-started" "$new"
+# A quiet run is not narrated; the first hand-over after a person's merge says once that it continues.
+card next-piece 0 "Next piece \`$new\` started (job $((n+1)) on this project today)." "His checks and review run when he finishes."
+exit 0

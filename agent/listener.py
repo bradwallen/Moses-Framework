@@ -76,6 +76,10 @@ import proposals  # noqa: E402
 import scout  # noqa: E402 — checks a proposal against the code before Brad weighs it
 import silence  # noqa: E402
 import knight_notify  # noqa: E402
+import new_build  # noqa: E402 — the green light for a new build, and the one-time code (#14)
+import publish  # noqa: E402 — a project on the web at example.com/<path>
+import build_spec  # noqa: E402 — a build starts only after Brad confirms its examples (#2)
+import glance  # noqa: E402 — a project is done when it is live, green, and Brad has looked (#5)
 
 APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "")
 BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -298,9 +302,11 @@ def recent(channel: str, thread_ts: str = "", limit: int = 14) -> list[dict]:
     try:
         if thread_ts:
             r = web.conversations_replies(channel=channel, ts=thread_ts, limit=limit)
-            return list(reversed(list(r.get("messages") or [])))
+            return new_build.redact(list(reversed(list(r.get("messages") or []))))
         r = web.conversations_history(channel=channel, limit=limit)
-        return list(r.get("messages") or [])
+        # A one-time code Brad typed is still in the channel. It must never be in a model's context,
+        # on this turn or any later one, so every read goes through redact().
+        return new_build.redact(list(r.get("messages") or []))
     except Exception as e:
         print(f"moses: could not read {channel} ({type(e).__name__})", flush=True)
         return []
@@ -398,6 +404,25 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
             return
         if (event.get("reaction") or "") not in proposals.CONFIRM_REACTIONS:
             return
+        # ✅ on a finished run's card: Brad looked, and the project is done (#5).
+        g = glance.by_message((event.get("item") or {}).get("ts") or "") \
+            if (event.get("reaction") or "") in glance.REACTIONS else None
+        if g:
+            said = glance.close(g)
+            if said:
+                web.chat_postMessage(channel=(event.get("item") or {}).get("channel"),
+                                     thread_ts=g.get("thread_ts") or g.get("card_ts"), text=said,
+                                     username=MOSES_NAME, icon_emoji=MOSES_EMOJI, unfurl_links=False)
+            return
+        # A spec takes a CHECK MARK only: a 👍 reads as "seen", and here it would start a build.
+        spec = build_spec.by_message((event.get("item") or {}).get("ts") or "") \
+            if (event.get("reaction") or "") in build_spec.SPEC_REACTIONS else None
+        if spec:
+            said = build_spec.start(spec, user=event.get("user") or "")
+            web.chat_postMessage(channel=(event.get("item") or {}).get("channel"),
+                                 thread_ts=(event.get("item") or {}).get("ts"), text=said,
+                                 username=MOSES_NAME, icon_emoji=MOSES_EMOJI, unfurl_links=False)
+            return
         item = proposals.by_message((event.get("item") or {}).get("ts") or "")
         if not item:
             return
@@ -470,6 +495,86 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
     # nobody re-says a bot's name to agree with it. Matching is whole-message and only ever
     # against something already pending, so ordinary conversation never reaches it.
     if event.get("user") == OWNER_ID and not machine:
+        # ── A ONE-TIME CODE, before anything else reads the message ─────────
+        # A bare 6-digit reply is the answer to a new-build request (#14). It goes to the root helper
+        # on stdin and NOWHERE else: not to the operator's commands, not to the proposal matcher, and
+        # never to the model. The journal records that one arrived, never the digits.
+        code = new_build.is_code(raw)
+        if code:
+            print("moses: one-time code received — checked by code, not shown to the model", flush=True)
+            said, work = new_build.answer(code, event.get("user") or "", channel, thread_ts)
+            say(said)
+            if work:
+                _spawn(_local_run, say, work)     # the build takes minutes; never on the event thread
+            return
+        # ── "looks good" on a finished run: code marks the project done, not the model (#5) ──
+        # Only Brad's; only as a reply in the card's thread, or "mark <project> done" in its channel;
+        # only the words that mean it. Checked BEFORE the spec and the idea matchers, so that when one of
+        # them is also waiting here, the answer is a question rather than whichever matcher ran first.
+        g = None
+        if event.get("user") == OWNER_ID:
+            g = glance.by_mark(raw, channel) or (glance.pending(channel, thread_ts) if glance.is_looks_good(raw) else None)
+        if g and not glance.MARK.match(raw or ""):
+            other = build_spec.pending(channel, thread_ts) if build_spec.is_yes(raw) else None
+            ideas = [it for it in proposals.pending() if it.get("channel") == channel] \
+                if proposals.resolve(raw)[0] in ("confirm", "ambiguous") else []
+            if other or ideas:
+                say(f"Two things are waiting on that: *{g['target']}* being marked done"
+                    + (f", and the build plan `{other['id']}`" if other else "")
+                    + (", and " + ", ".join(f"`{it['id']}`" for it in ideas[:3]) if ideas else "")
+                    + f". Reply `mark {g['target']} done`"
+                    + (f", `start {other['id']}`" if other else "") + (", or `confirm <id>`" if ideas else "") + ".")
+                return
+            if not proposals.confirmation_is_for_me(
+                    recent(channel, thread_ts), g.get("card_ts") or "",
+                    is_self=lambda m: addressing.is_self(m, BOT_USER_ID, BOT_ID) or m.get("username") == "Knight",
+                    is_machine=lambda m: addressing.is_machine(m)):
+                say(f"Was that for me? Another agent has spoken since Knight's card — reply "
+                    f"`mark {g['target']} done` and I'll close it.")
+                return
+        if g:
+            print(f"moses: {g['target']} marked done on the owner's look", flush=True)
+            say(glance.close(g) or "That one is already marked done.")
+            return
+        # ── "yes" to a build spec: code starts the build, not the model (#2) ──
+        # Checked before the proposal matcher, because a spec is the more specific question: Moses just
+        # showed Brad what will and will not be built, in this conversation, and is waiting on it.
+        # The yes must be Brad's, in this exact conversation, with no other agent speaking since the spec
+        # — the Atlas "Sounds good!" rule — and anything else he says there retires the spec.
+        spec = build_spec.pending(channel, thread_ts) if event.get("user") == OWNER_ID else None
+        if spec:
+            explicit = build_spec.by_start_id(raw, channel, thread_ts)
+            if explicit:
+                print(f"moses: build spec {spec['id']} started by id", flush=True)
+                say(build_spec.start(spec, user=event.get("user") or ""))
+                return
+            if build_spec.is_yes(raw):
+                ideas_here = [it for it in proposals.pending() if it.get("channel") == channel]
+                if ideas_here and proposals.resolve(raw)[0] in ("confirm", "ambiguous"):
+                    say(f"Two things are waiting on a yes: the build plan `{spec['id']}` and "
+                        + ", ".join(f"`{it['id']}`" for it in ideas_here[:3])
+                        + f". Reply `start {spec['id']}` for the build, or `confirm <id>` for the other.")
+                    return
+                if not proposals.confirmation_is_for_me(
+                        recent(channel, thread_ts), spec.get("message_ts") or "",
+                        is_self=lambda m: addressing.is_self(m, BOT_USER_ID, BOT_ID),
+                        is_machine=lambda m: addressing.is_machine(m)):
+                    say(f"Was that for me? Another agent has spoken since I posted the build plan — reply "
+                        f"`start {spec['id']}` and I'll start it.")
+                    return
+                print(f"moses: build spec {spec['id']} confirmed by the owner", flush=True)
+                say(build_spec.start(spec, user=event.get("user") or ""))
+                return
+            gone = build_spec.expire_on_reply(channel, thread_ts)
+            print(f"moses: build spec {gone} retired — the owner said something other than yes", flush=True)
+        # Six digits INSIDE a sentence while a request is open ("123456 thanks") are probably the code.
+        # Not checked — a sentence is not an answer — and not read either: no model sees it.
+        if new_build.open_here(channel) and new_build.has_digits(raw):
+            print("moses: digits withheld while a code request is open", flush=True)
+            say("That message has six digits in it, so I didn't read it. If it was your code, send just "
+                "the six digits on their own.")
+            return
+
         # THIS OPERATOR'S OWN COMMANDS (agent/local_commands.py, absent from the framework). match()
         # returns (what to say now, the work to run) or None. The work runs off the event thread, since
         # it may take minutes, and its answer is posted here.
@@ -740,6 +845,8 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
     # it ends. Brad asked "ping me here when Knight is done", Moses promised it twice, and nothing
     # could deliver it. See knight_notify.
     jobs_before = knight_notify.snapshot()
+    specs_before = build_spec.ids()
+    turn = _turn_begin()
     try:
         if not history:
             history = recent(channel, thread_ts)
@@ -761,6 +868,30 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
     except Exception as e:                                        # noqa: BLE001
         print(f"moses: could not record where Knight reports back ({type(e).__name__}: {e})",
               flush=True)
+    # A build spec proposed on this turn belongs to this conversation; only the owner can confirm it.
+    claimed_specs: list[str] = []
+    overlapped = _turn_end(turn)
+    try:
+        if not machine:
+            claimed_specs = build_spec.claim(specs_before, channel=channel, thread_ts=thread_ts,
+                                             user=event.get("user") or "", port=_mcp_port(),
+                                             ambiguous=overlapped)
+            if overlapped and not claimed_specs and build_spec.ids() - specs_before:
+                say("I drafted a build plan, but another conversation was running at the same moment, so I "
+                    "can't be sure it was this one's. Nothing is armed — ask me again and I'll redo it.")
+    except Exception as e:                                        # noqa: BLE001
+        print(f"moses: could not record a build spec ({type(e).__name__})", flush=True)
+
+    def show_specs() -> None:
+        """POST THE SPEC ITSELF. What Brad confirms is the recorded spec, word for word — never the
+        model's paraphrase of it, and never a spec he was not shown because the reply failed."""
+        for sid in claimed_specs:
+            spec = build_spec.get(sid)
+            if spec:
+                shown = say(build_spec.render(spec))
+                build_spec.attach_message([sid], (shown or {}).get("ts", ""))
+    if claimed_specs and kind != "text":
+        show_specs()
 
 
     who = "bot" if machine else "human"
@@ -838,6 +969,26 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
             if machine:
                 print(f"moses: ignored DO {name} on a bot-prompted turn", flush=True)
                 continue
+            if name == new_build.NAME:
+                # The framework's own action: open the code request — for the OWNER's message only.
+                # The helper keeps one request open, so anyone else asking could occupy it, or put a
+                # prompt in front of Brad that he did not ask for.
+                if event.get("user") != OWNER_ID:
+                    note += "\n_Only the owner can start a new build. Nothing was asked for._"
+                    print(f"moses: ignored DO {name} from a non-owner", flush=True)
+                    continue
+                work.append(lambda a=arg: new_build.start(a, channel, thread_ts))
+                print(f"moses: DO {name} started", flush=True)
+                continue
+            if name == publish.NAME:
+                # Owner only, like a new build: a published path is public, and Brad decides what is.
+                if event.get("user") != OWNER_ID:
+                    note += "\n_Only the owner can publish a project. Nothing was published._"
+                    print(f"moses: ignored DO {name} from a non-owner", flush=True)
+                    continue
+                work.append(lambda a=arg: publish.run(a))
+                print(f"moses: DO {name} started", flush=True)
+                continue
             got = local_commands.act(name, arg) if local_commands and hasattr(local_commands, "act") else None
             if got is None:
                 note += f"\n_⚠️ I asked for `{name}`, and there is no such action here. Nothing was started._"
@@ -856,6 +1007,7 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
         # Remember which message carried them, so a checkmark on it confirms the right thing.
         for h in held:
             proposals.attach_message(h["id"], (posted or {}).get("ts", ""))
+        show_specs()
         # CHECK EACH ONE AGAINST THE CODE before Brad weighs it — after posting, off the reply path, so
         # a reply is never slower for it. A false premise is withdrawn with the reason; see scout.py.
         if held:
@@ -901,6 +1053,36 @@ def _local_run(say, work) -> None:
     except Exception as e:                                                # noqa: BLE001
         print(f"moses: local command failed ({type(e).__name__}: {e})", flush=True)
         say(f"⚠️ That didn't work: {e}")
+
+
+# TURNS IN FLIGHT. A build spec recorded by the MCP server is tied to "the turn that was running" —
+# which is only unambiguous when one turn was. Two at once, and either could own it (review, 2026-10-17).
+_TURN_LOCK = threading.Lock()
+_TURNS: dict[int, dict] = {}
+
+
+def _turn_begin() -> dict:
+    with _TURN_LOCK:
+        t = {"overlap": bool(_TURNS)}
+        for o in _TURNS.values():
+            o["overlap"] = True
+        _TURNS[id(t)] = t
+        return t
+
+
+def _turn_end(t: dict) -> bool:
+    """True when another turn ran at any point during this one."""
+    with _TURN_LOCK:
+        _TURNS.pop(id(t), None)
+        return t["overlap"]
+
+
+def _mcp_port() -> str:
+    from urllib.parse import urlparse
+    try:
+        return str(urlparse(conversation.MCP_URL).port or "")
+    except ValueError:
+        return ""
 
 
 def _spawn(fn, *args) -> None:

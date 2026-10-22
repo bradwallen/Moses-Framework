@@ -740,8 +740,81 @@ already exist? — at the two moments it matters:
 A check that could not run never blocks and never passes: it is said, and Knight is told to verify the
 premise himself. The verdict is the first line or it is UNCLEAR (scout_test.py proves prose cannot pass).
 
+### A build asked for in Slack: a confirmed spec, then one status card (2026-10-17)
+
+Brad: "When you said 'civil and water' earlier I didn't think you meant civil engineer" and "there's no
+real way for me to know the status of what's being built." So in Slack Moses cannot start Knight at
+all (knight_start is not among his tools); he proposes, Brad confirms by example, code starts it, and
+the run reports on ONE message that is edited in place.
+
 ```
-  knight_start(task, target) ──▶ knight   preflight: kill switch · 1 concurrent · 8/day
+  Brad ── "make the listings page GIS analysts only" ──▶ Moses (model turn)
+                                                        │  knight_propose(task, acceptance,
+                                                        │      will_include, will_exclude, target)
+                                                        ▼  agent/build_spec.py → STATE/build-specs.json
+  listener, after the turn: claim the spec for THIS conversation — only one recorded by the Slack
+        │  turn's own MCP server (:8765, never the iOS app's), and only if no other turn overlapped
+        │  then POSTS THE SPEC ITSELF (✅ will include / ❌ will not), word for word as recorded
+        ▼
+  Brad: "yes" · ✅ on the spec · "start <id>"     anything else he says there retires the spec
+        │  owner only · same channel AND thread · 24h · no other agent spoke since (else: asked)
+        │  an idea proposal also waiting here? asked which, nothing started
+        ▼
+  build_spec.start (code, not the model) ── knight start --acceptance "<criteria> + CONFIRMED EXAMPLES"
+        │  takes the spec under a lock first: two yeses start one build
+        ▼
+  knight/lib/card.py — THE RUN'S CARD: posted once, then chat.update at every step
+        started → building → checking → reviewing → following-up → landing → landed/live → done
+        │  moves once into the asking conversation (new copy posted first, old deleted after)
+        │  a conversation that refuses it → Knight's channel; failures appended to card-error.txt
+        ├── the report: one reply under the card
+        └── a ping (a reply; edits notify nobody): only when the run is finished or needs Brad
+        knight-next's follow-ups and next pieces carry run-of and edit the same card
+```
+
+What the confirmation does NOT cover: the next pieces knight-next briefs after a landing (they build
+the tracker scope the project was started with), and a new project's first job (gated by Brad's
+one-time code, with the scope from the tracker). From the iOS app, knight_start itself requires the
+examples, but nothing waits for a separate yes there — the request in the app is the confirmation.
+Tests: agent/build_spec_test.py, knight/lib/card_test.py, knight/test-notify.sh.
+
+**After the spec (2026-10-18): examples are tests, notes are notes, and "done" means something.**
+
+```
+  examples.txt (lib/examples.sh, from the acceptance) ──▶ builder's brief: one test per example
+        │                                                  (the example's text, verbatim)
+        ▼
+  knight-run, after KT_GATE: every example named in a test file at the branch tip (case, quotes,
+        │  escapes, spacing ignored; test paths, test-*.sh, Rust #[cfg(test)])? no ──▶ gate RED
+        │  the reviewer's brief: check each test asserts its example the right way round
+        │                                                  → knight-next follows it up (missed requirement)
+        ▼
+  review: CONFIRMED / MISSED ──▶ held → follow-up (bounded)   PLAUSIBLE ──▶ knight/notes/<target>.md
+        │                                                    + a card line; the job lands on its merits;
+        │                                                    the next piece is handed the open notes
+        ▼
+  scope covered (SCOPE COMPLETE) ──▶ knight-next: `knight provision` green on main? live URL answers?
+        │  (provision waits for a job holding the clone; a start waits for provision; 30 min cap)
+        │  either no ──▶ card "needs you", NOT done
+        ▼  both yes
+  card "waiting for you: have a look" · tracker next = "Waiting for Brad's look" · glance.py records it
+        ▼
+  Brad: "looks good"/"lgtm" as a REPLY IN THE CARD'S THREAD, "mark <project> done" in its channel,
+        or ✅ on the card — owner only, a week, no other agent since; a spec or idea also waiting there
+        gets a question instead ──▶ listener code: stage = shipped (exact id) → card says done →
+        knight-next builds nothing more
+```
+
+One log per run: card.py appends every step of every job in the run to run.log in the run's first
+job (written before Slack is tried); `knight status <job>` prints it, and the Projects page shows each
+project's newest card (stage, last line, what is next) from the same card.json the Slack card uses.
+Tests: knight/test-examples.sh, knight/test-next.sh, agent/glance_test.py, knight/lib/card_test.py,
+mcp/dashboard_board_test.py.
+
+```
+  knight_start(task, target, will_include, will_exclude) ──▶ knight      (the iOS app; from Slack,
+                                                                          build_spec.start above)
+                                          preflight: kill switch · 1 concurrent · 8/day
                             │
                             ├── targets/<name>.env ── unknown name? REFUSED, and the
                             │      KT_SOURCE / KT_PREP        refusal lists the real ones
@@ -974,6 +1047,192 @@ writes the prompt "Continue from where you left off." and a placeholder reply, "
 requested.", itself — no model call, no UserPromptSubmit, no Stop. The turn is not re-run unless
 the undocumented `CLAUDE_CODE_RESUME_INTERRUPTED_TURN` is set, and the editor does not set it. The work
 waits for Brad. See the memory note `feedback-continue-means-continue`.
+
+---
+
+## 5b. A new build needs a code (#14, 2026-10-16)
+
+**Why.** Brad wants to say "build this" in Slack and have it happen, even when "this" is a new
+repository. Knight builds only registered targets (`knight/targets/<name>.env`), so a new build
+starts by adding a target, and a target is what gives Knight access to a repository. Until now the
+only thing stopping Moses from adding one was that he has no file tools. That is a capability he
+lacks, not a control. Giving him the capability without a control would let anyone who can post as
+Brad in Slack, or any agent text that can talk Moses into it, open a new repository to an
+unattended builder.
+
+**The decision (Brad, 2026-10-16):** the green light is Brad telling Moses to build a project that
+is already in the tracker ("Moses, build #13"). Moses then asks for a one-time authenticator code
+(TOTP), and a verified code unlocks the whole start: a new directory for the project, version
+control, its Knight target, and Knight's first job, briefed from the project's scope in the
+tracker. *Creating* a target is what the code gates. Editing an existing target, including its push mode, works as it does today. Ordinary
+Knight jobs on existing targets need no code. A code works once and only while its challenge is
+open, the seed never lives in a repository, and every attempt leaves an audit row.
+
+### Who can create a target today
+
+```
+  path                                         today                      after #14
+  ───────────────────────────────────────────  ─────────────────────────  ──────────────────────────
+  Moses, from Slack                            cannot — no file tools     only through the code flow
+  Knight, in a job on the `moses` target       a branch can ADD           knight_land refuses an added
+                                               knight/targets/x.env, and  target file with no
+                                               knight_land merges it      authorization for that name
+                                               ← skips the gate entirely
+  A Claude Code session at Brad's keyboard     can write the file         unchanged — Brad is present
+  Any process running as the operator          can write the file         unchanged; see "the limit"
+```
+
+### The flow
+
+```
+  Brad (Slack): "Moses, build #13"       ← the green light; #13 must already be in the tracker
+        │                                    with a scope, and must not already have a target
+        ▼
+  Moses proposes it (a declared action, not prose)
+        │
+        ▼
+  listener (code) ── sudo moses-mfa challenge new-build X ───▶  root: one open challenge,
+        │                                                       purpose stored ROOT-SIDE,
+        │   ONE request open at a time: a different project is refused until this
+        │   one is answered or expires, so nothing can swap X out from under Brad
+        │   posts "Authorize a new build for `X`?                    expires in 5 minutes
+        │          Reply with your 6-digit code."
+        ▼             ▲ purpose text comes from the helper's output, never from the model
+  Brad replies 123456
+        │   a 6-digit reply from the owner, matched to the open challenge BEFORE the model is
+        │   called. The code is never put in a prompt, an argv, or a log.
+        ▼
+  listener ── code on STDIN ──▶ sudo moses-mfa verify <challenge>
+                                    │  seed: /etc/moses/mfa/totp.seed (root, 0600)
+                                    │  window ±1 step · a time step is accepted once
+                                    │  3 wrong codes kill the challenge
+                                    │  5 failures in 24 hours lock verify for 24 hours
+                                    ▼
+                               authorization row (root-owned ledger)
+                                    │
+        ┌───────────────────────────┴───────────────────────────┐
+        ▼                                                       ▼
+  moses-new-target X (A4)                               knight_land (A5)
+  consumes the authorization; makes the                 a branch that ADDS a target file
+  project's directory, git init, target .env            lands only if an authorization
+  with KT_PUSH_MODE=branch, .brief from the             for that name exists
+  scope, knight provision
+        │
+        ▼
+  Knight's first job (A4): the project's scope from the tracker is the brief.
+  Green work lands on a branch, as for every branch-mode target.
+```
+
+**Why root holds the state, not the listener.** The listener runs as the operator, and so does
+every agent. If the challenge's purpose lived in an operator-writable file, a process could swap
+`X` for something else between Brad seeing the prompt and typing the code. So the helper keeps the
+purpose, the seed, the replay counter and the audit ledger under root, and runs as a single
+stdlib-only Python file installed root-owned in `/usr/local/bin` (section 7b: root runs nothing the
+operator can write). Its path overrides (`MOSES_MFA_*`) are honored only when it is NOT running as
+root, so the tests can run the real script against a scratch directory while a sudo caller cannot
+point it at a seed of their own.
+
+**Why the code goes on stdin.** sudo logs the command line to the auth log, and argv is visible in
+`ps` while the helper runs. Stdin is neither.
+
+**The brute-force arithmetic.** With a ±1 step window, three codes are valid at any moment, so one
+guess succeeds with probability 3 in 1,000,000. Three tries per challenge alone is not enough,
+because a process running as the operator can open challenges in a loop. The lockout caps it
+at 5 guesses a day: about 1,800 a year, or a 0.55% chance in a year of nonstop trying, and every
+failure is an audit row that Birdeye can report on.
+
+### The limit — say what this does NOT cover
+
+- **The operator account.** Anything running as the operator can still write
+  `knight/targets/<x>.env` directly, because the registry is the operator's own directory. The code
+  gates the paths an *unattended* request takes (Slack → Moses, and Knight's branches). It does not
+  replace the sandbox that keeps Knight's own process inside his clone (section 4c), and it does not
+  guard a session Brad is sitting at.
+- **Brad's phone.** Whoever holds the authenticator holds the gate. The seed is shown once at
+  enrollment and never again.
+- **The clock.** TOTP depends on Reserve's clock being right; a clock more than 30 seconds off makes
+  correct codes fail. That fails closed (it says why), and Brad can see it in the audit ledger.
+- **The lockout is a lever.** Five wrong codes in a day lock verify for a day, and any process
+  running as the operator can spend them. That trades a day of Brad's new builds for the brute-force
+  bound above; the audit ledger shows who spent them.
+- **Repointing an existing target is starting a new project** (Brad, 2026-10-17: a code "only when
+  Moses/Knight are starting work on a NEW project"). So a branch that changes an existing target's
+  `KT_SOURCE` or `KT_PUSH_REMOTE`, or adds an `eval` to it, is refused by knight-land outright, and no
+  code unlocks it: the one door into a new folder is the tracker's new build. Every other edit stays
+  code-free. The check reads text and never sources the branch, so a changed target file must also
+  hold PLAIN SETTINGS only (knight/lib/target-shape.py): `declare "KT_AUTO_""LAND=1"`, `printf -v`,
+  `$(…)` and a second statement after `;` are refused for their shape, so what the text says is what
+  sourcing the file does.
+- **The gate's own files.** A branch that weakens knight-land, new_build.py or the listener lands
+  through review like any Moses change, with no code. The code gates new targets, not changes to the
+  machinery that checks for them; Zryachiy's review and branch landing are what stand there.
+- **Anything outside this machine.** A GitHub repository, a Railway service and DNS are still
+  ask-first under commandment 9. A code does not authorize them.
+
+### After the code: building away (A8–A11, 2026-10-17)
+
+Brad's aim for #14, in his words: replace the roadblocks with one code, after which Moses and Knight
+"are free to build the project in the ~/Projects folder, put it under version control and build away."
+So a target created by moses-new-target carries two settings, and `knight/bin/knight-next` acts on them:
+
+```
+  job ends `pushed` ──▶ knight-run starts knight-next <job> (detached: one job at a time)
+                          │ KT_AUTO_LAND=1, and ALL of:
+                          │   project is active, at `building`, and passes the tracker's build rule
+                          │   project is `internal` in the tracker (read now)   ── else "merge it"
+                          │   main's gate.sh is real, not the placeholder      ── else "merge it" (first job)
+                          │   the branch leaves alone what decides its tests:  ── else "merge it"
+                          │     gate.sh, prep.sh, files gate.sh names, test-runner configs
+                          │     (conftest, pytest/tox/setup.cfg, tsconfig, jest/vitest…),
+                          │     package.json "scripts", pyproject [tool.*]
+                          ▼
+                        knight-land <job>   (every refusal there still applies)
+                          │ merged, KT_CONTINUE=1
+                          ▼
+                        knight-next --after-land <job>
+                          │ stops on: SCOPE COMPLETE on the report's first line · the project paused,
+                          │ parked or past `building` in the tracker · KT_CONTINUE_MAX (6) jobs on it
+                          │ today · Knight disabled or the day's budget spent. Another job in flight
+                          │ is waited for (every 2 min, up to an hour), not a reason to stop.
+                          ▼
+                        knight start --target <project>  "build the next piece of the scope"
+```
+
+Every hold and every stop is said in the conversation the work came from and recorded in
+lands.jsonl; a Slack post that fails is recorded as `slack-not-posted`. A job that finds the scope
+covered changes nothing and ends `done-not-pushed`, and knight-run hands that to knight-next too, so
+the run ends with "scope covered" rather than looking like a failed build. A branch cannot switch these on for another target: knight-land treats KT_AUTO_LAND and
+KT_CONTINUE like KT_SOURCE, refused outright. From the Claude app, the `new_build` MCP tool runs the
+same code check as Slack, two calls: one opens the request, the next carries the code (Brad accepted
+the app's model seeing a code: they last 30 seconds and work once). That tool never raises, because a
+raised call's arguments are written to tool-failures.jsonl.
+
+### Where it lives
+
+```
+  agent/moses-mfa            the root helper: challenge, verify (code on stdin), authorized, consume,
+                             status, enroll. Installed root-owned at /usr/local/bin/moses-mfa.
+                             Seed /etc/moses/mfa/totp.seed (0600) · state + audit.jsonl /var/lib/moses/mfa
+  agent/new_build.py         the listener's half: `DO: new-build <project>` opens a challenge; a bare
+                             6-digit reply from the owner is answered here before anything else reads
+                             it; redact() strips codes from every history the model is given
+  agent/moses-new-target     runs after a verified code, as the operator: the directory, git, the
+                             branch-landing target (committed alone), knight provision, the first job
+  knight/bin/knight-land     landable() refuses a branch that ADDS a target with no code waiting,
+                             and the land spends the code before merging
+  agent/install-mfa.sh       the one install, by the operator, with a password (never in sudoers)
+  agent/mfa-suite            every check above in one command, each guard watched failing
+  /etc/sudoers.d/moses-mfa   challenge, verify, authorized, consume, status — NOT enroll
+```
+
+**Defense in depth, found by the tests.** Twice, removing one guard on purpose left its check
+green, because a second barrier stood behind it: moses-new-target's `authorized` check is backed by
+`consume` refusing a non-authorization, and knight-land's `landable()` check is backed by spending
+the code before the merge. The mutants now remove both, so each pair is watched failing as a pair.
+
+**The gap the suite closes.** Knight's `moses` gate runs every `*_test.py`, so three of the four
+suites run on every Moses job. `knight/test-land.sh` is not a `*_test.py` and is not in that gate;
+`agent/mfa-suite` runs it, and the installer runs the suite before it changes anything.
 
 ---
 

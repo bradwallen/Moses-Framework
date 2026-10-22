@@ -19,6 +19,17 @@
 #                                                 it silently is exactly the mistake not made that day
 #   • a target that does not land on a branch   — viatica already deploys itself; nothing to do here
 #   • a dirty tree, or a branch already merged  — say so rather than guess
+#   • a branch that ADDS a Knight target        — #14: a new target opens a repository to an
+#     with no one-time code waiting for it        unattended builder, so it takes Brad's code. A
+#                                                 Knight job on `moses` could otherwise add one in a
+#                                                 branch and have this merge it, skipping the gate.
+#                                                 Editing an existing target needs no code (his call).
+#   • a branch that REPOINTS an existing target — Brad, 2026-10-17: a code only when a NEW project
+#     (KT_SOURCE / KT_PUSH_REMOTE changed)          starts, and pointing a target at another folder
+#                                                 IS starting one. So no branch may do it at all —
+#                                                 it is refused outright, with no code that unlocks
+#                                                 it. The way to work in a new folder is the
+#                                                 tracker's new build, where the code is asked.
 #
 # IT REPORTS WHAT IS LIVE, NOT WHAT IT COPIED. The merge is not the end: the listener runs from this
 # source tree as a systemd USER unit, so the change is live only once that unit has restarted and
@@ -37,6 +48,10 @@ TARGETS=${KNIGHT_TARGETS:-$KNIGHT/targets}
 # out of that was to chown the file — the better fix is to stop needing root for a log written by a
 # script that runs as brad.
 LOG=${KNIGHT_LAND_LOG:-$KNIGHT/lands.jsonl}
+
+# THE CODE HELPER (agent/moses-mfa, root-owned, via sudo). Overridable so test-land.sh can run the real
+# script unprivileged against a scratch seed; the helper itself ignores its own overrides as root.
+read -ra MFA <<< "${KNIGHT_MFA_CMD:-sudo -n /usr/local/bin/moses-mfa}"
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf 'REFUSED: %s\n' "$*"; record "refused" "$*"; exit 2; }
@@ -66,6 +81,63 @@ find_job() {
         if [ "$(cat "$d/branch")" = "$want" ]; then printf '%s' "$(basename "$d")"; return; fi
     done
     return 1
+}
+
+# The Knight targets a branch ADDS to the registry this lander reads — only when that registry lives
+# inside the branch's own repository (it does for `moses`). --no-renames, because with rename
+# detection on, moving viatica.env to a new name shows as a rename and never as an addition.
+new_targets() {
+    local src=$1 main=$2 branch=$3 top rel
+    top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null) || return 0
+    rel=$(realpath -m --relative-to="$top" "$TARGETS" 2>/dev/null) || return 0
+    case "$rel" in ..*|/*) return 0 ;; esac
+    # A diff that cannot be computed (no merge base, a missing ref) is a FAILURE, never "adds nothing".
+    local out
+    out=$(git -C "$src" diff --no-renames --name-only --diff-filter=A "$main...$branch" -- "$rel/*.env" 2>/dev/null) || return 1
+    printf '%s\n' "$out" | while read -r f; do [ -n "$f" ] && basename "$f" .env; done
+    return 0
+}
+
+# Existing targets a branch REPOINTS: any change, between the merge base and the branch, to an
+# uncommented line that names KT_SOURCE or KT_PUSH_REMOTE or uses eval. Text, never sourced: the
+# branch is not merged yet, and running its contents to read two variables would execute it.
+# Comments are dropped first, so rewording one is not a repoint — a guard that fires on correct work
+# gets switched off. The limit, said out loud: an assignment hidden from this text (built from parts
+# without eval) is not seen here; Zryachiy's review is what stands behind that.
+repointed_targets() {
+    local src=$1 main=$2 branch=$3 top rel base files f a b
+    top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null) || return 0
+    rel=$(realpath -m --relative-to="$top" "$TARGETS" 2>/dev/null) || return 0
+    case "$rel" in ..*|/*) return 0 ;; esac
+    base=$(git -C "$src" merge-base "$main" "$branch" 2>/dev/null) || return 1
+    files=$(git -C "$src" diff --no-renames --name-only --diff-filter=M "$base" "$branch" -- "$rel/*.env" 2>/dev/null) || return 1
+    for f in $files; do
+        a=$(git -C "$src" show "$base:$f" 2>/dev/null | sed -E '/^[[:space:]]*#/d; s/[[:space:]]+#.*$//' \
+            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
+        b=$(git -C "$src" show "$branch:$f" 2>/dev/null | sed -E '/^[[:space:]]*#/d; s/[[:space:]]+#.*$//' \
+            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
+        [ "$a" = "$b" ] || basename "$f" .env
+    done
+    return 0
+}
+
+# A target file a branch CHANGES may hold only plain settings — `KT_NAME=` with a single-quoted,
+# double-quoted (no $ or backtick) or bare value, single-quoted array entries, `)`, comments. The
+# repoint check above reads text, and the review of 2026-10-17 showed text can be fooled:
+# `declare "KT_AUTO_""LAND=1"` and `printf -v "KT_CONT""INUE" 1` both set the variable when the file
+# is sourced and name neither. Anything that could run or assemble at source time is refused, so
+# what the text says is what the file does. All four targets on main pass this as written.
+odd_target_lines() {
+    local src=$1 main=$2 branch=$3 top rel base files f
+    top=$(git -C "$src" rev-parse --show-toplevel 2>/dev/null) || return 0
+    rel=$(realpath -m --relative-to="$top" "$TARGETS" 2>/dev/null) || return 0
+    case "$rel" in ..*|/*) return 0 ;; esac
+    base=$(git -C "$src" merge-base "$main" "$branch" 2>/dev/null) || return 1
+    files=$(git -C "$src" diff --no-renames --name-only --diff-filter=M "$base" "$branch" -- "$rel/*.env" 2>/dev/null) || return 1
+    for f in $files; do
+        git -C "$src" show "$branch:$f" 2>/dev/null | python3 "$KNIGHT/lib/target-shape.py" "$(basename "$f" .env)"
+    done
+    return 0
 }
 
 landable() {
@@ -107,6 +179,32 @@ landable() {
         echo "the review left a note nobody has answered — $(printf '%s' "$plausible" | head -1)"
         return
     fi
+    local t rc added moved odd
+    odd=$(odd_target_lines "$KT_SOURCE" "${KT_BRANCH:-main}" "$branch") \
+        || { echo "could not read the target files the branch changes, so it cannot land"; return; }
+    if [ -n "$odd" ]; then
+        echo "the branch changes a Knight target with a line that is not a plain setting ($(printf '%s' "$odd" | head -1)). Target files hold KT_NAME=value lines only, so what they say is what they do"
+        return
+    fi
+    moved=$(repointed_targets "$KT_SOURCE" "${KT_BRANCH:-main}" "$branch") \
+        || { echo "could not work out whether the branch repoints a Knight target, so it cannot land"; return; }
+    if [ -n "$moved" ]; then
+        echo "the branch points the existing Knight target '$(printf '%s' "$moved" | head -1)' at a different repository (KT_SOURCE or KT_PUSH_REMOTE). Working in a new folder is starting a new project: that happens from the tracker, where Brad's one-time code is asked, never in a branch"
+        return
+    fi
+    added=$(new_targets "$KT_SOURCE" "${KT_BRANCH:-main}" "$branch") \
+        || { echo "could not work out whether the branch adds a Knight target, so it cannot be checked for a one-time code"; return; }
+    for t in $added; do
+        "${MFA[@]}" authorized new-build "$t" >/dev/null 2>&1; rc=$?
+        if [ "$rc" = 1 ]; then
+            echo "the branch adds a new Knight target '$t', which takes Brad's one-time code (#14), and none is waiting for it"
+            return
+        elif [ "$rc" != 0 ]; then
+            # "Could not check" is never "checked and fine".
+            echo "the branch adds a new Knight target '$t', and the one-time code check could not run (exit $rc)"
+            return
+        fi
+    done
     echo ""
 }
 
@@ -149,6 +247,18 @@ dirty=$(git -C "$KT_SOURCE" status --porcelain | head -5)
 [ -z "$dirty" ] || die "$KT_SOURCE has uncommitted changes, so nothing was merged:
 $dirty"
 
+# A NEW TARGET SPENDS ITS CODE BEFORE THE MERGE, like moses-new-target: an authorization must never
+# survive the thing it authorized. landable() already confirmed one is waiting for each.
+added=$(new_targets "$KT_SOURCE" "$MAIN" "$BRANCH") \
+    || die "could not work out whether the branch adds a Knight target, so nothing was merged"
+for t in $added; do
+    auth=$("${MFA[@]}" authorized new-build "$t" 2>/dev/null | tail -1)
+    "${MFA[@]}" consume "$auth" >/dev/null 2>&1 \
+        || die "the one-time code for new target '$t' could not be used, so nothing was merged"
+    say "Used Brad's one-time code for the new Knight target \`$t\`."
+    record "authorized" "new-build:$t"
+done
+
 was=$(git -C "$KT_SOURCE" rev-parse --abbrev-ref HEAD)
 [ "$was" = "$MAIN" ] || git -C "$KT_SOURCE" checkout "$MAIN" >/dev/null 2>&1 \
     || die "could not switch $KT_SOURCE to $MAIN (it is on $was)"
@@ -162,6 +272,9 @@ reviewed="reviewed clean"
 if [ "$ANYWAY" = 1 ] && grep -qE '^PLAUSIBLE\b' "$DIR/review.txt" 2>/dev/null; then
     reviewed="landed over a review note, on Brad's word"
 fi
+# Say what the review could NOT judge, rather than calling it clean (review of 2026-10-17).
+_nu=$(grep -cE '^UNCHECKED\b' "$DIR/review.txt" 2>/dev/null || true)
+[ "${_nu:-0}" -gt 0 ] && reviewed="$reviewed, $_nu criteria not checkable from the diff"
 merge_out=$(git -C "$KT_SOURCE" merge --no-ff -m "Land $BRANCH (Knight job $JOB_ID, $reviewed)" "$BRANCH" 2>&1)
 merge_rc=$?
 if [ "$merge_rc" -ne 0 ]; then
@@ -182,8 +295,24 @@ say "Merged \`$BRANCH\` into $MAIN — \`${after:0:7}\`"
 # No live command recorded for this target means merging IS the whole job, and this says that rather
 # than implying something was activated.
 # shellcheck disable=SC1090
-KT_LIVE_CMD=""; . "$TARGETS/$TARGET.env"
+KT_LIVE_CMD=""; KT_CONTINUE=0; . "$TARGETS/$TARGET.env"
 record "merged" "${after:0:7}"
+
+# A project started with Brad's code keeps building (KT_CONTINUE): knight-next briefs the next piece of
+# its scope. Detached, for the same reason as the restart below — this may be running inside the job
+# that is about to be followed.
+if [ "${KT_CONTINUE:-0}" = 1 ]; then
+    nxenv=(--setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+    for v in KNIGHT_HOME KNIGHT_JOBS KNIGHT_TARGETS KNIGHT_LAND_LOG KNIGHT_SLACK_ENV KNIGHT_SLACK_CHANNEL KNIGHT_MFA_CMD MOSES_REGISTRY KNIGHT_START_BIN KNIGHT_LAND_BIN MOSES_MCP_DIR MOSES_PUBLISH_BIN; do
+        [ -n "${!v+x}" ] && nxenv+=(--setenv="$v=${!v}")
+    done
+    if ! { command -v systemd-run >/dev/null 2>&1 \
+           && systemd-run --user --collect --quiet --unit="knight-after-land-${JOB_ID}" "${nxenv[@]}" \
+                "$HERE/knight-next" --after-land "$JOB_ID" 2>>"$DIR/next.log"; }; then
+        setsid "$HERE/knight-next" --after-land "$JOB_ID" >> "$DIR/next.log" 2>&1 < /dev/null &
+    fi
+    say "Handed to knight-next, which decides whether Knight builds the next piece of the scope and says so in this thread."
+fi
 
 if [ -z "$KT_LIVE_CMD" ]; then
     say "Nothing needs restarting for this target — the merge is the whole job."

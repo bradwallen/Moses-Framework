@@ -42,6 +42,21 @@ REG.write_text(json.dumps({"projects": [
 ], "inbox": [{"title": "captured with no project", "note": ""}]}))
 projects.REGISTRY = REG
 
+# Knight's run cards, as card.py saves them: a fresh one for Alpha, a week-old one for Beta, and one for
+# a project not on the page. The board must show only Alpha's.
+JOBS = REG.parent / "jobs"
+for jid, target, stage, line, nxt, age in [
+        ("J1", "alpha", "reviewing", "Review: clean.", "It lands by itself if clean.", 0),
+        ("J2", "beta", "building", "Old news.", "", 8 * 24 * 3600),
+        ("J3", "gamma", "failed", "Someone else's run.", "", 0)]:
+    (JOBS / jid).mkdir(parents=True)
+    (JOBS / jid / "target").write_text(target + "\n")
+    f = JOBS / jid / "card.json"
+    f.write_text(json.dumps({"stage": stage, "title": "Build it", "lines": [["23:41", line]], "next": nxt}))
+    if age:
+        os.utime(f, (f.stat().st_mtime - age, f.stat().st_mtime - age))
+d.KNIGHT_JOBS = JOBS
+
 
 def _parses(js: str) -> bool:
     """True if node can parse it. If node is absent we say so rather than reporting a pass —
@@ -83,6 +98,16 @@ beta = page[page.index('>Beta<'):]
 beta_summary = beta[:beta.index("</summary>")]
 check("a collapsed project still says where its work sits",
       "1 building" in beta_summary, beta_summary[-160:])
+
+print("\nwhat Knight is doing, on the project (#1)")
+_alpha = page[page.index('>Alpha<'):page.index('>Beta<')]
+check("an active run's status is on its project's line: the stage, from the same card Slack shows",
+      'Knight: 🔎 In review' in _alpha[:_alpha.index("</summary>")], _alpha[:400])
+check("and in the open project: what happened last and what happens next",
+      "Knight now:" in _alpha and "Review: clean." in _alpha and "It lands by itself if clean." in _alpha, _alpha[-600:])
+_beta = page[page.index('>Beta<'):]
+check("a run that has not moved in a week is not shown as current", "Old news." not in _beta and "Knight:" not in _beta[:_beta.index("</summary>")])
+check("another project's run is not shown here", "Someone else's run." not in page)
 
 print("\ncards land in the right column")
 alpha = page[page.index('>Alpha<'):page.index('>Beta<')]

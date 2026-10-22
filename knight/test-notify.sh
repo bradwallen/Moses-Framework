@@ -1,83 +1,59 @@
 #!/usr/bin/env bash
-# test-notify.sh — a job started from a conversation reports back to that conversation.
+# test-notify.sh — the conversation that asked hears how its build is going, on ONE card.
 #
-#   ./test-notify.sh
+#   bash knight/test-notify.sh
 #
-# WHY THIS EXISTS. Brad, 2026-09-11, in #the_4_horsemen: "Ping me here when Knight is done." Moses
-# promised it twice; the runner only ever posted to #viatica-dev, so the promise had nothing behind
-# it and nobody in that channel was told. Drives the REAL notify_payload lifted out of bin/knight-run,
-# never a restatement. The listener's half (writing notify.json) is pinned in agent/listener_test.py.
+# 2026-09-11: Moses promised "I'll ping you here when it lands" and nothing could. That became a post to
+# the asking conversation (notify.json) beside Knight's channel report. 2026-10-17, Brad: too many
+# messages from too many agents. Now every step of a run edits ONE status card (lib/card.py), which
+# moves into the asking conversation and pings there when the run is done or needs him. card_test.py
+# drives card.py itself against a fake Slack; this checks the WIRING — that every step that used to
+# post is now a card update, so nothing posts around it.
 set -uo pipefail
-cd "$(dirname "$0")"
+# NO TEST POSTS TO SLACK. Everything this suite runs — and anything those scripts hand off to, like
+# knight-next after a landing — inherits this. test-land once did not, and its scratch target "t1"
+# posted "Stopped" cards into Brad's channel on every run (2026-10-18). test-notify.sh checks every suite.
+export KNIGHT_SLACK_CHANNEL="" KNIGHT_SLACK_ENV=/nonexistent
+HERE=$(cd "$(dirname "$0")" && pwd)
 pass=0; fail=0
-ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }
-bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; fail=$((fail+1)); }
+ok()  { printf '  ok    %s\n' "$1"; pass=$((pass+1)); }
+bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
 
-RUN=bin/knight-run
-fn=$(sed -n '/^notify_payload() {/,/^}/p' "$RUN")
-[ -n "$fn" ] || { echo "  notify_payload is GONE from $RUN — this test is watching nothing" >&2; exit 2; }
-eval "$fn"
-TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-
-H='⚠️ *moses → built but NOT pushed* — the gate failed'
-echo "the conversation that asked is told"
-printf '%s' '{"channel":"C_HORSEMEN","thread_ts":"","user":"U_BRAD"}' > "$TMP/n.json"
-p=$(notify_payload "$TMP/n.json" "$H" "C_DEV" "JOB1")
-[ "$(jq -r .channel <<<"$p" 2>/dev/null)" = C_HORSEMEN ] && ok "posts to the channel that asked" \
-    || bad "posted to: $(jq -r .channel <<<"$p" 2>/dev/null) (payload: ${p:-none})"
-jq -r .text <<<"$p" 2>/dev/null | head -1 | grep -q '^<@U_BRAD> ' && ok "mentions who asked" \
-    || bad "does not mention who asked"
-jq -r .text <<<"$p" 2>/dev/null | grep -qF "$H" \
-    && ok "carries the runner's own headline, so the two can never disagree" \
-    || bad "the headline is not the runner's"
-jq -r .text <<<"$p" 2>/dev/null | grep -q 'JOB1' && ok "names the job" || bad "does not name the job"
-jq -r .text <<<"$p" 2>/dev/null | grep -q '<#C_DEV>' && ok "points to the full report" \
-    || bad "no pointer to the full report"
-jq -e 'has("thread_ts") | not' <<<"$p" >/dev/null 2>&1 && ok "asked at top level → answered at top level" \
-    || bad "invented a thread"
-
-printf '%s' '{"channel":"C_HORSEMEN","thread_ts":"123.456","user":""}' > "$TMP/t.json"
-p=$(notify_payload "$TMP/t.json" "$H" "C_DEV" "JOB2")
-[ "$(jq -r .thread_ts <<<"$p" 2>/dev/null)" = 123.456 ] && ok "asked in a thread → answered in that thread" \
-    || bad "lost the thread (payload: ${p:-none})"
-jq -r .text <<<"$p" 2>/dev/null | grep -q '^<@' && bad "mentioned someone when nobody was recorded" \
-    || ok "no one recorded → no mention"
-
-printf '%s' '{"channel":"C_DEV","thread_ts":"9.9","user":"U_BRAD"}' > "$TMP/d.json"
-p=$(notify_payload "$TMP/d.json" "$H" "C_DEV" "JOB3")
-[ "$(jq -r .thread_ts <<<"$p" 2>/dev/null)" = 9.9 ] && ok "a thread in the report channel still hears it" \
-    || bad "a thread in the report channel was skipped"
-jq -r .text <<<"$p" 2>/dev/null | grep -q '<#C_DEV>' && bad "pointed to the channel it is already in" \
-    || ok "and does not point to the channel it is in"
+echo "every step of a run reports on its one card"
+grep -q 'lib/card.py" "\$dir" building' "$HERE/bin/knight" && ok "knight start opens (or joins) the run's card" || bad "knight start does not use the card"
+grep -q -- '--run-of' "$HERE/bin/knight" && ok "a job can join its run's card (--run-of)" || bad "knight start cannot join a run"
+grep -q '"\$CARD" "\$DIR" checking' "$HERE/bin/knight-run" && ok "the checks starting is a card line" || bad "knight-run does not say the checks started"
+grep -q 'card.py" "\$DIR" reviewing' "$HERE/bin/knight-run" && ok "the review is a card line, not Zryachiy's own post" || bad "the review is not on the card"
+grep -q '"\$CARD" "\$DIR" "\$_cs"' "$HERE/bin/knight-run" && ok "every job outcome updates the card" || bad "the job's outcome is not on the card"
+grep -q 'report-slack.txt' "$HERE/bin/knight-run" && ok "the report goes under the card as a reply" || bad "the report is not under the card"
 
 echo
-echo "nobody to tell means no post"
-for c in \
-  "missing|" \
-  "malformed|{not json" \
-  "no channel|{\"channel\":\"\",\"thread_ts\":\"\",\"user\":\"U_BRAD\"}" \
-  "the report channel's top level — the report is already there|{\"channel\":\"C_DEV\",\"thread_ts\":\"\",\"user\":\"U_BRAD\"}" \
-; do
-    label=${c%%|*}; body=${c#*|}
-    rm -f "$TMP/x.json"; [ "$label" = missing ] || printf '%s' "$body" > "$TMP/x.json"
-    p=$(notify_payload "$TMP/x.json" "$H" "C_DEV" "JOBX")
-    [ -z "$p" ] && ok "$label → nothing posted" || bad "$label → posted: $p"
+echo "nothing posts around the card"
+! grep -q 'chat.postMessage' "$HERE/bin/knight-run" && ok "knight-run posts nothing itself" || bad "knight-run still posts on its own"
+! grep -q 'notify_payload' "$HERE/bin/knight-run" && ok "the old second post to the asking conversation is gone" || bad "knight-run still double-posts"
+left=$(sed -n '/^# The tracker.s word on the project/,$p' "$HERE/bin/knight-next" | grep -c 'slack_say "')
+[ "$left" = 0 ] && ok "knight-next says everything on the card" || bad "knight-next still posts directly ($left place(s))"
+grep -q 'card_or_say live' "$HERE/bin/knight-land-live" && ok "making it live is a card line" || bad "knight-land-live posts on its own"
+grep -q 'live)   extra+=(--next "Nothing — it is live.")' "$HERE/bin/knight-land-live" \
+    && ok "a live card's Next line says so, not \"say merge it\"" || bad "a live card keeps its old Next line"
+grep -q -- '--run-of "\$RUN_OF"' "$HERE/bin/knight-next" && ok "knight-next's jobs join the run's card" || bad "knight-next starts jobs with cards of their own"
+
+echo
+echo "the conversation that asked"
+grep -q 'notify.json' "$HERE/../agent/knight_notify.py" && ok "the listener records the conversation that asked" || bad "nothing writes notify.json"
+grep -q 'notify.json' "$HERE/lib/card.py" && ok "the card goes where the request came from" || bad "the card ignores the asking conversation"
+
+echo
+echo "no suite posts to Slack"
+# Every knight/test-*.sh switches Slack off before it runs anything, for itself and for whatever the
+# scripts it runs hand off to. 2026-10-18: test-land did not, and a knight-next it set off posted a
+# "t1 … Stopped" card into Brad's channel on every gate run, which Moses then tried to explain to him.
+loud=""
+for t in "$HERE"/test-*.sh; do
+    grep -qE '^export .*KNIGHT_SLACK_CHANNEL=""' "$t" || loud="$loud $(basename "$t")"
 done
+[ -z "$loud" ] && ok "every knight suite exports KNIGHT_SLACK_CHANNEL=\"\" at the top" \
+    || bad "these suites can post to the real Slack:$loud"
 
-echo
-echo "the wiring, not just the logic"
-call=$(grep -n 'notify_payload "\$DIR/notify.json" "\$head"' "$RUN" | head -1 | cut -d: -f1)
-main=$(grep -n 'slack_report=\$(python3' "$RUN" | head -1 | cut -d: -f1)
-[ -n "$call" ] && ok "the runner calls it with its own headline" \
-    || bad "the runner never calls notify_payload with \$head"
-[ -n "$call" ] && [ -n "$main" ] && [ "$call" -gt "$main" ] \
-    && ok "after the headline is decided, not before" || bad "called before \$head exists"
-# Inside the tok/chan guard, so a suite that empties the channel posts nowhere at all.
-guard=$(grep -n 'if \[ -n "\$tok" \] && \[ -n "\$chan" \]; then' "$RUN" | tail -1 | cut -d: -f1)
-[ -n "$guard" ] && [ -n "$call" ] && [ "$call" -gt "$guard" ] \
-    && ok "inside the post guard, so the suites stay silent" || bad "outside the post guard"
-[ -f ../agent/knight_notify.py ] && grep -q 'notify.json' ../agent/knight_notify.py \
-    && ok "the listener writes the file this reads" || bad "nothing writes notify.json"
-
-printf '\n  %d passed, %d failed\n' "$pass" "$fail"
-[ "$fail" -eq 0 ] || exit 1
+printf '\n%d ok, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

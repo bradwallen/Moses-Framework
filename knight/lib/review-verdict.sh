@@ -6,7 +6,7 @@
 # and the one that mattered would be whichever nobody remembered — see the estate's standing rule
 # that a module gets one copy.
 #
-# Sets review_ok / review_why / plausible.
+# Sets review_ok / review_why / plausible / unchecked.
 # ── Reading the review's verdict ─────────────────────────────────────────────
 # A FUNCTION so the test suite can drive the real decision with fixture files. The review itself
 # needs a green gate, real commits and a successful rebase before it ever runs, which makes the
@@ -18,7 +18,7 @@
 # "could not look" has never meant "fine" anywhere else in this estate.
 review_verdict() {
     local rrc=$1 file=$2 body
-    review_ok=1; review_why=""; plausible=""; review_noverdict=0
+    review_ok=1; review_why=""; plausible=""; unchecked=""; review_noverdict=0
     # A LINE THAT REPORTS NOTHING IS NOT A FINDING. 2026-09-11: Zryachiy passed Brad's bot-cap change
     # with "CONFIRMED: none — no defects found in the diff." and then CLEAN, and this blocked it for
     # starting with the word CONFIRMED. Nothing shipped; a correct build sat on a branch.
@@ -36,7 +36,7 @@ review_verdict() {
     if [ "$rrc" -ne 0 ]; then
         review_ok=0
         review_why="the review agent exited $rrc — NOT a clean review, so nothing ships"
-    elif ! grep -qE '^(CONFIRMED|MISSED|PLAUSIBLE|CLEAN)\b' <<<"$body"; then
+    elif ! grep -qE '^(CONFIRMED|MISSED|PLAUSIBLE|UNCHECKED|CLEAN)\b' <<<"$body"; then
         # NOT "returned nothing". 2026-10-01: the review settled six of seven criteria in detail and
         # simply never wrote its verdict line; this message told Brad it had returned nothing at all.
         # Still a block — a verdict is a line, never inferred from the prose around it — but said
@@ -59,4 +59,8 @@ review_verdict() {
     else
         plausible=$(grep -E '^PLAUSIBLE\b' <<<"$body" | head -5 || true)
     fi
+    # UNCHECKED (2026-10-17): a criterion no diff can answer. Never a block and never a pass — it is
+    # carried to the commit and the report, and the verification ledger already holds every criterion
+    # the review did not SETTLE. Read on every path, so a CONFIRMED beside it still blocks as before.
+    unchecked=$(grep -E '^UNCHECKED\b' <<<"$body" | head -5 || true)
 }

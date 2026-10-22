@@ -84,6 +84,12 @@ def classify(text: str) -> Intent:
             return Intent("question")
         if len(body) < 3:
             return Intent("question")
+        # NO LIST NAMED, NO CAPTURE. "put the listings page at example.com/listings" and "add a CSV
+        # export button to the trip page" start with a capture verb and are not list items at all — they
+        # are asks for the model, which knows the projects and the actions. Before 2026-10-17 they got
+        # the retired to-do list's refusal instead (found when Brad's real phrasing was replayed in a test).
+        if not target:
+            return Intent("question")
         dest = "ideas" if "idea" in target else "todo"
         return Intent("capture", body, dest)
 

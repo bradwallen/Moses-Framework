@@ -90,7 +90,9 @@ print("\nact tools are unlocked by a human, never by another machine")
 directed = C.tools_for(True)
 reactive_only = C.tools_for(False)
 
-check("a human-directed turn can hand work to Knight", "mcp__moses__knight_start" in directed)
+check("a human-directed turn can hand work to Knight — by proposing it", "mcp__moses__knight_propose" in directed)
+# #2 (2026-10-17): in Slack a build starts only on Brad's yes to a spec with examples; the listener starts it.
+check("no turn in Slack can start a build directly", "mcp__moses__knight_start" not in directed)
 check("a human-directed turn can capture an idea", "mcp__moses__add_idea" in directed)
 check("there is no general to-do tool to grant at all — tasks belong to a project now",
       not any("todo" in t for t in C.READ_TOOLS + C.ACT_TOOLS))
@@ -169,10 +171,10 @@ print("\nthe capability paragraph is DERIVED from the allowlist, not written bes
 directed_text = C._capability_text(True)
 machine_text  = C._capability_text(False)
 
-check("a directed turn is told it can hand work to Knight", "knight_start" in directed_text)
+check("a directed turn is told it can hand work to Knight, by proposing", "knight_propose" in directed_text)
 check("a directed turn is told about the repair ops", "remediate" in directed_text)
 check("a machine turn is told it cannot act", "cannot act on this turn" in machine_text)
-check("a machine turn is NOT told it can start a build", "knight_start" not in machine_text)
+check("a machine turn is NOT told it can start a build", "knight_start" not in machine_text and "knight_propose" not in machine_text)
 
 # The exact sentence that made Moses tell Brad he couldn't dispatch Knight, while holding the tool.
 for denial in ("everything you can reach is read-only", "you cannot start a build",
@@ -210,7 +212,8 @@ check("no BARE tool name is offered as callable",
 # that fetched a page.
 _REGISTRY_WRITES = ("project_add", "project_update", "project_add_milestone",
                     "project_complete_milestone", "project_promote_idea",
-                    "project_remove_idea", "project_remove")
+                    "project_remove_idea", "project_remove",
+                    "project_add_blocker", "project_remove_blocker")
 for _t in _REGISTRY_WRITES:
     check(f"{_t} is available when a human directs it",
           C._qualified(_t) in C.tools_for(True).split(","))

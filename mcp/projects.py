@@ -56,7 +56,10 @@ def milestone_lane(m: dict) -> str:
     return st if st in MILESTONE_STATES else "next"
 STATUSES = ["active", "parked", "dormant", "scrapped"]
 SETTABLE = ["status", "stage", "rank", "target", "scope", "focus", "next", "phase", "name", "repo",
-            "kind", "who_pays", "evidence", "kill_test"]
+            "kind", "who_pays", "evidence", "kill_test",
+            # Where the project is live (written by moses-publish), and where Brad asked for it to go
+            # when he gave the green light ("build #13 at example.com/listings").
+            "deploy", "publish_path"]
 
 # ── The demand gate: no business starts building on a hunch ──────────────────
 #
@@ -568,6 +571,11 @@ def add(name: str, rank: int | None = None, scope: str = "", status: str = "park
 
 
 def update(pid: str, field: str, value: str) -> str:
+    # Blockers are a LIST, so "set" has no honest meaning — it would either flatten the list into
+    # one string or silently replace the others. Point at the two calls that do mean something.
+    if field == "blockers":
+        raise ProjectError("blockers are a list — add one with `moses-project block <id> \"<text>\"`, "
+                           "clear one with `moses-project unblock <id> <n|text>`")
     if field not in SETTABLE:
         raise ProjectError(f"cannot set '{field}'. One of: {', '.join(SETTABLE)}")
     d = load()
@@ -601,6 +609,60 @@ def update(pid: str, field: str, value: str) -> str:
             p["stage"] = "scope"
     save(d)
     return f"{p['name']}: {field} = {value or '(cleared)'}"
+
+
+# ── Blockers: what is stopping a project, said out loud ──────────────────────
+#
+# WHY (2026-10-14, M36): `update()` refused "blockers", so the only way to clear one was a hand edit
+# of projects.json — which skips every check this module makes. moses-framework carried "Moses
+# itself needs more work first" for days after Brad un-parked it, because nothing could take it off.
+# A blocker nobody can clear is worse than none: the dashboard keeps saying BLOCKED, and people
+# learn to read past the word.
+
+def add_blocker(pid: str, text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        raise ProjectError("a blocker needs to say what is in the way")
+    d = load()
+    p = find(d, pid)
+    bl = p.setdefault("blockers", [])
+    if any(b.strip().lower() == text.lower() for b in bl):
+        raise ProjectError(f"{p['name']} already lists that blocker")
+    bl.append(text)
+    save(d)
+    return f"{p['name']}: blocked — {text}  ({len(bl)} blocker(s))"
+
+
+def remove_blocker(pid: str, which) -> str:
+    """Clear one blocker, named by its 1-based position or by an unambiguous piece of its text."""
+    d = load()
+    p = find(d, pid)
+    bl = p.get("blockers") or []
+    if not bl:
+        raise ProjectError(f"{p['name']} has no blockers")
+    s = str(which or "").strip()
+    if not s:
+        raise ProjectError("which blocker? Give its number or a piece of its text")
+    if s.isdigit():
+        n = int(s)
+        if not 1 <= n <= len(bl):
+            raise ProjectError(f"{p['name']} has {len(bl)} blocker(s); asked for {n}")
+        k = n - 1
+    else:
+        exact = [i for i, b in enumerate(bl) if b.strip().lower() == s.lower()]
+        hits = exact or [i for i, b in enumerate(bl) if s.lower() in b.lower()]
+        if not hits:
+            raise ProjectError(f"no blocker on {p['name']} mentions '{s}'. They are: "
+                               + "; ".join(f"{i}. {b}" for i, b in enumerate(bl, 1)))
+        if len(hits) > 1:
+            raise ProjectError(f"'{s}' matches {len(hits)} blockers on {p['name']} — give its number: "
+                               + "; ".join(f"{i + 1}. {bl[i]}" for i in hits))
+        k = hits[0]
+    gone = bl.pop(k)
+    p["blockers"] = bl
+    save(d)
+    left = f"{len(bl)} left" if bl else "no blockers left"
+    return f"{p['name']}: cleared blocker — {gone}  ({left})"
 
 
 def add_milestone(pid: str, title: str) -> str:

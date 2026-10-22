@@ -57,6 +57,8 @@ OPTENV=$MOSES_CONFIG_DIR/knight.env
 
 # shellcheck disable=SC1091
 source "$KNIGHT_HOME/guards.env"
+# Brad's confirmed examples become tests (#3): written into the job and the brief here, checked by knight-run.
+source "$(dirname "$(readlink -f "$0")")/../lib/examples.sh"
 mkdir -p "$JOBS"
 
 die() { echo "knight: $*" >&2; exit 1; }
@@ -242,6 +244,11 @@ ensure_repo() {
     # Fetch by PATH or URL, never by named remote, so no remote is ever created.
     git -C "$REPO" fetch -q "$KT_READ_FROM" "$KT_BRANCH" 2>/dev/null \
         || die "could not fetch $KT_BRANCH from $KT_READ_FROM"
+    # LEFTOVERS GO FIRST. The wipe below used to run only after this checkout — but an untracked file the
+    # mainline now TRACKS blocks the checkout itself ("would be overwritten"), so the job died before the
+    # wipe could help. 2026-10-17: prep had left package-lock.json untracked in the GIS clone, main
+    # started tracking it, and the next job failed "could not check out main". Same -e exclusions as below.
+    git -C "$REPO" clean -qfd -e node_modules -e .venv
     git -C "$REPO" checkout -q --detach FETCH_HEAD || die "could not check out $KT_BRANCH"
 
     # Wipe anything the previous job left behind. Not theoretical: a run that wrote a test file but
@@ -283,7 +290,7 @@ ensure_repo() {
 cmd_start() {
     # --target NAME may appear before or after the task, because Moses and Brad both type these and
     # neither should have to remember an order.
-    local target="$DEFAULT_TARGET" incident="" acceptance="" args=()
+    local target="$DEFAULT_TARGET" incident="" acceptance="" base="" quiet=0 run_of="" args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --target|-t) target="${2:-}"; [ -n "$target" ] || die "--target needs a name (one of: $(known_targets | tr '\n' ' '))"; shift 2 ;;
@@ -303,6 +310,18 @@ cmd_start() {
             # a flawless change solving the wrong problem shipped clean.
             --acceptance) acceptance="${2:-}"; [ -n "$acceptance" ] || die "--acceptance needs the criteria"; shift 2 ;;
             --acceptance=*) acceptance="${1#*=}"; shift ;;
+            # BUILD ON EARLIER WORK. The job's branch starts from <base> instead of the mainline: a
+            # follow-up to a held job, or the next piece after one. Until 2026-10-17 Knight was told to
+            # "bring that branch's files over" and, with merge blocked in his sandbox, copied them by
+            # hand — twice, each time reporting "verified identical". The runner does it now, in git.
+            --base)      base="${2:-}"; [ -n "$base" ] || die "--base needs a branch"; shift 2 ;;
+            --base=*)    base="${1#*=}"; shift ;;
+            # Started by knight-next, not by a person: report only the outcome (knight-next says it),
+            # never the start, so a run of jobs is one message and not a running commentary.
+            --quiet)     quiet=1; shift ;;
+            # The run this job belongs to (its first job's id): it reports on that run's ONE status card
+            # instead of starting a card of its own.
+            --run-of)    run_of="${2:-}"; shift 2 ;;
             *)           args+=("$1"); shift ;;
         esac
     done
@@ -326,6 +345,7 @@ check without reading the diff. Not a restatement of the task — the observable
 
     local r; r=$(running_jobs)
     [ "$r" -ge "$KNIGHT_MAX_CONCURRENT" ] && die "$r job(s) already running (max $KNIGHT_MAX_CONCURRENT). One clone, one worker."
+    provisioning_now && die "1 job(s) already running (max $KNIGHT_MAX_CONCURRENT): a provision is checking the clone ($(cat "$PROVISIONING"))."
     local c; c=$(today_count)
     [ "$c" -ge "$KNIGHT_MAX_PER_DAY" ] && die "$c jobs already today (max $KNIGHT_MAX_PER_DAY). Knight spends Brad's Pro usage; raise KNIGHT_MAX_PER_DAY if that is deliberate."
 
@@ -342,6 +362,8 @@ check without reading the diff. Not a restatement of the task — the observable
     branch="knight/$slug-${id##*-}"
     printf '%s\n' "$task" > "$dir/task.txt"
     printf '%s\n' "$acceptance" > "$dir/acceptance.txt"
+    # Brad's confirmed examples, one per line: the builder must test each, and the runner checks (#3).
+    examples_extract "$dir/acceptance.txt" "$dir/examples.txt"
     printf '%s\n' "$branch" > "$dir/branch"
     printf '%s\n' "$TARGET" > "$dir/target"
     [ -n "$incident" ] && printf '%s\n' "$incident" > "$dir/incident"
@@ -355,7 +377,18 @@ check without reading the diff. Not a restatement of the task — the observable
               printf "launch aborted before the agent started — see the shell error above.\n" > "$dir/summary"
           fi' EXIT
 
-    git -C "$REPO" checkout -q -B "$branch" || die "could not create branch $branch"
+    if [ -n "${base:-}" ]; then
+        # The base is a branch Knight pushed to the source, or one still only in this clone.
+        git -C "$REPO" rev-parse --verify -q "refs/heads/$base" >/dev/null \
+            || git -C "$REPO" fetch -q "$KT_SOURCE" "refs/heads/$base:refs/heads/$base" 2>/dev/null \
+            || die "no branch '$base' in the clone or in $KT_SOURCE to build on"
+        git -C "$REPO" checkout -q -B "$branch" "$base" || die "could not create branch $branch from $base"
+        printf '%s\n' "$base" > "$dir/base"
+    else
+        git -C "$REPO" checkout -q -B "$branch" || die "could not create branch $branch"
+    fi
+    [ "${quiet:-0}" = 1 ] && : > "$dir/quiet"
+    [ -n "${run_of:-}" ] && [ -d "$JOBS/$run_of" ] && printf '%s\n' "$run_of" > "$dir/run-of"
 
     # The agent's brief, assembled DIRECTLY INTO THE FILE — never through a shell variable.
     #
@@ -473,6 +506,7 @@ SPEC
         printf 'never push or merge (the runner does), and your report is the four lines above, nothing else.\n\n'
         printf '%s\n\n' "$fw_build"
         printf 'TASK:\n%s\n' "$task"
+        examples_brief "$dir/examples.txt"
     } > "$dir/brief.txt"
 
     # ── The reviewer's brief — written here, read by the runner, never by the builder ──────────
@@ -507,6 +541,7 @@ OUTPUT FORMAT — nothing else, one finding per line, no preamble and no closing
   CONFIRMED: <file>:<line> — <one sentence: the defect, and the input or state that triggers it>
   MISSED: <criterion> — <one sentence: what the change does instead, or what it left undone>
   PLAUSIBLE: <file>:<line> — <one sentence: what you suspect and what you could not verify>
+  UNCHECKED: <criterion> — <one sentence: why a diff cannot show it, and what would>
   CLEAN
 
 Use CONFIRMED only when you can name the concrete case that breaks: an input, a sequence, a state.
@@ -525,8 +560,13 @@ author's account of what they attempted. Judge the diff against them one at a ti
 
   * A criterion the change does not satisfy is MISSED, and MISSED BLOCKS THE PUSH exactly like
     CONFIRMED. Correct code that solves a different problem is not a pass.
-  * A criterion you cannot judge from the diff and the repo is MISSED too, naming what you could not
-    check. Do not assume it holds because nothing contradicts it.
+  * A criterion you CANNOT JUDGE from the diff and the repo — it is about the running product, another
+    branch, a live service, a person's opinion — is UNCHECKED, not MISSED. Say what would settle it.
+    It does not block: it goes to the verification ledger for whoever can look at the live thing, and
+    it is not a pass either, because you do not SETTLE it. MISSED is for a criterion the diff shows is
+    not met. (Until 2026-10-17 this line said "MISSED", and a few lines below said to stay silent about
+    what you cannot settle; Zryachiy followed the first, and correct work sat blocked on criteria no
+    diff could answer — 5 of 21 reviewed jobs.)
   * Extra work beyond the criteria is not automatically wrong, but scope nobody asked for on a
     change that ships straight to production IS a finding — say so as PLAUSIBLE.
 
@@ -549,25 +589,61 @@ line naming that as the reason. A review that could not run must never read as a
 REVIEWSPEC
         printf '\nTHE FRAMEWORK'"'"'S REVIEW RULES, word for word from the Moses framework, alongside the\n'
         printf 'commandments in your system prompt. The OUTPUT FORMAT above wins over how they say to report:\n'
-        printf 'a surface you could not review becomes a MISSED or PLAUSIBLE line, never prose, and\n'
+        printf 'a surface you could not review becomes a MISSED, PLAUSIBLE or UNCHECKED line, never prose, and\n'
         printf 'nothing else goes on the page.\n\n%s\n' "$fw_review"
         printf '\nACCEPTANCE CRITERIA — what must be true for this change to be done:\n%s\n' \
             "$(cat "$dir/acceptance.txt" 2>/dev/null)"
         printf '\nThe job directory is: %s\n' "$dir"
+        examples_review_brief "$dir/examples.txt"
     } > "$dir/review-brief.txt"
 
     # Detached, in its own process group so `cancel` kills the whole tree. The worker is a separate
     # script because the permission lists are arrays; threading those through `bash -c` is what
     # flattened them into a string and silently broke every multi-word rule.
-    setsid nohup "$KNIGHT_HOME/bin/knight-run" "$dir" "$REPO" "$branch" "$TARGET" "$incident" \
-      > "$dir/nohup.log" 2>&1 &
+    # ITS OWN UNIT, NOT A CHILD OF WHOEVER ASKED (2026-10-17). `setsid nohup … &` gives a new session but
+    # leaves the job in the CALLER'S CGROUP, and systemd kills a unit's whole cgroup when it ends. So a
+    # job started by knight-next (a transient unit that exits a second later) died at once, silently,
+    # with "running" on its record — the first chained GIS job, 11:06 that day. The same was true of a
+    # job started from an MCP server that then restarted. knight-land hit this exact trap in September
+    # (see knight-land); the fix is the same: a transient user unit of its own, given the caller's whole
+    # environment, because a transient unit starts clean and the job relies on what nohup used to pass.
+    local unit="knight-job-$id" pid="" v envs=()
+    for v in $(compgen -e); do
+        case "$v" in _|PWD|OLDPWD|SHLVL|BASH_*|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID|MANAGERPID|NOTIFY_SOCKET) continue ;; esac
+        envs+=(--setenv="$v=${!v}")
+    done
+    : > "$dir/nohup.log"
+    if command -v systemd-run >/dev/null 2>&1 \
+       && systemd-run --user --collect --quiet --unit="$unit" "${envs[@]}" \
+            -p StandardOutput="append:$dir/nohup.log" -p StandardError="append:$dir/nohup.log" \
+            "$KNIGHT_HOME/bin/knight-run" "$dir" "$REPO" "$branch" "$TARGET" "$incident" 2>>"$dir/nohup.log"; then
+        # The worker's real pid, so `cancel` and job_alive read the process, not systemd-run's.
+        for _ in $(seq 1 20); do
+            pid=$(systemctl --user show -p MainPID --value "$unit" 2>/dev/null)
+            [ -n "$pid" ] && [ "$pid" != 0 ] && break
+            [ "$(cat "$dir/status" 2>/dev/null)" = starting ] || break     # already finished
+            sleep 0.1
+        done
+        printf '%s\n' "$unit" > "$dir/unit"
+    else
+        # No user systemd (a container, a test box): the old way, which a caller's exit can kill.
+        setsid nohup "$KNIGHT_HOME/bin/knight-run" "$dir" "$REPO" "$branch" "$TARGET" "$incident" \
+          >> "$dir/nohup.log" 2>&1 &
+        pid=$!
+    fi
 
-    echo "$!" > "$dir/pid"
+    echo "${pid:-0}" > "$dir/pid"
     printf 'running\n' > "$dir/status"
     trap - EXIT
-    notify "*Knight* started \`$id\` on *$TARGET*
-> $task
-branch \`$branch\` · lands: $([ "$KT_PUSH_MODE" = direct ] && echo "$KT_BRANCH" || echo "branch for review") · ceiling $((KNIGHT_TIMEOUT_SEC/60))m"
+    # THE STATUS CARD (2026-10-17): one Slack message per run, edited at every step — see lib/card.py.
+    # A job in a run (knight-next's follow-ups and next pieces) adds a line to that run's card.
+    if [ -n "${run_of:-}" ] && [ -f "$dir/run-of" ]; then
+        "$KNIGHT_HOME/lib/card.py" "$dir" building "Job \`$id\` started: $(printf '%s' "$task" | head -1 | cut -c1-120)" \
+            --next "His checks and review run when he finishes (up to $((KNIGHT_TIMEOUT_SEC/60)) minutes)." >/dev/null 2>&1 || true
+    else
+        "$KNIGHT_HOME/lib/card.py" "$dir" building "Job \`$id\` started on branch \`$branch\`." \
+            --next "His checks and review run when he finishes (up to $((KNIGHT_TIMEOUT_SEC/60)) minutes); it $([ "$KT_PUSH_MODE" = direct ] && echo "deploys if they pass" || echo "waits on a branch or lands by itself if they pass")." >/dev/null 2>&1 || true
+    fi
 
     echo "started  $id"
     echo "target   $TARGET"
@@ -628,6 +704,11 @@ PY
         echo "  It no longer holds the concurrency slot."
     fi
     [ -s "$dir/summary" ] && { echo; sed 's/^/  /' "$dir/summary"; }
+    # THE WHOLE RUN, in one log (#6): this job and every follow-up and next piece in its run, step by
+    # step — the same lines as the run's status card, kept in full where the card shows the latest.
+    local run_dir="$dir" origin; origin=$(cat "$dir/run-of" 2>/dev/null || true)
+    [ -n "$origin" ] && [ -d "$JOBS/$origin" ] && run_dir="$JOBS/$origin"
+    [ -s "$run_dir/run.log" ] && { echo; echo "the run ($(basename "$run_dir"), every step):"; sed 's/^/  /' "$run_dir/run.log"; }
     if [ -s "$dir/result.json" ]; then
         echo
         echo "Knight's report:"
@@ -666,6 +747,8 @@ cmd_cancel() {
     local dir="$JOBS/$id"; [ -d "$dir" ] || die "no job $id"
     local pid; pid=$(cat "$dir/pid" 2>/dev/null)
     [ -n "$pid" ] && kill -TERM -- "-$pid" 2>/dev/null
+    # A job in its own unit: stopping the unit takes everything it started with it.
+    [ -r "$dir/unit" ] && systemctl --user stop "$(cat "$dir/unit")" >/dev/null 2>&1
     sleep 2
     [ -n "$pid" ] && kill -KILL -- "-$pid" 2>/dev/null
     echo cancelled > "$dir/status"
@@ -678,9 +761,26 @@ cmd_cancel() {
 # runner that needs a path set, a lockfile step nobody thought of. Discovering that from a real job
 # costs an hour of Brad's allowance and produces a report about a failure that has nothing to do with
 # the task. This makes the first run free.
+# PROVISION SHARES THE CLONE WITH THE JOBS. It resets and cleans knight/repo/<target>, preps it and
+# runs the whole gate there, so it must never run under a job, nor a job start under it (review,
+# 2026-10-18: knight-next now runs it unattended, to prove a finished project is green). A marker
+# with its pid keeps `knight start` out while it runs; a running job keeps it out.
+PROVISIONING="$KNIGHT_HOME/.provisioning"
+provisioning_now() { local pid; pid=$(cut -d' ' -f1 "$PROVISIONING" 2>/dev/null) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; }
+
 cmd_provision() {
     local target="${1:-$DEFAULT_TARGET}"
     load_target "$target"
+    reconcile_jobs
+    local r; r=$(running_jobs)
+    [ "$r" -gt 0 ] && die "$r job(s) already running — provision resets the clone they work in, so it waits for them."
+    provisioning_now && die "a provision is already running ($(cat "$PROVISIONING"))."
+    printf '%s %s\n' "$$" "$target" > "$PROVISIONING"
+    local glog; glog=$(mktemp "${TMPDIR:-/tmp}/knight-provision-gate.XXXXXX")
+    # Expanded NOW: the trap runs when the script exits, after this function's locals are gone. Written
+    # with single quotes it read an unset $glog, errored under set -u, and left the marker behind.
+    # shellcheck disable=SC2064
+    trap "rm -f '$PROVISIONING' '$glog'" EXIT
     ensure_repo
     echo "  clone      $REPO"
     echo "  at         $(git -C "$REPO" log -1 --format='%h %s' 2>/dev/null)"
@@ -689,11 +789,11 @@ cmd_provision() {
     local step rc=0
     for step in "${KT_GATE[@]}"; do
         printf '    %s\n' "$step"
-        if ( cd "$REPO" && bash -c "$step" >/tmp/knight-provision-gate.log 2>&1 ); then
+        if ( cd "$REPO" && bash -c "$step" >"$glog" 2>&1 ); then
             echo "      green"
         else
             echo "      RED — this target cannot ship work until this passes:"
-            tail -15 /tmp/knight-provision-gate.log | sed 's/^/        /'
+            tail -15 "$glog" | sed 's/^/        /'
             rc=1
             break
         fi

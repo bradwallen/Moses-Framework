@@ -155,6 +155,37 @@ else
     fi
 fi
 
+# ── --base and --quiet (2026-10-17): a follow-up starts FROM the held branch ──────────────
+# knight-next starts follow-ups and the next piece with these. --base must put the earlier branch's
+# commits under the new job's branch (in git, not by Knight copying files), and --quiet must mark the
+# job so its start and report are not posted step by step.
+if [ -n "$job" ] && wait_done "$job"; then
+    btarget=$(cat "$JOBS/$job/target" 2>/dev/null)
+    brepo="$MOSES_ROOT/knight/repo/$btarget"
+    if git -C "$brepo" rev-parse -q --verify HEAD >/dev/null 2>&1; then
+        git -C "$brepo" -c user.email=t@t -c user.name=t commit -q --allow-empty -m "base marker for test-runner" 2>/dev/null
+        bsha=$(git -C "$brepo" rev-parse HEAD)
+        git -C "$brepo" branch -f zzz-base-test "$bsha" >/dev/null 2>&1
+        bjob=$(start_job env KNIGHT_FAKE_AGENT=1 "$KNIGHT" start --target "$btarget" --base zzz-base-test --quiet \
+               --acceptance "the job record exists and reaches a terminal status" "build on the base branch") || bjob=""
+        if [ -n "$bjob" ]; then
+            cleanup+=("$bjob")
+            bbranch=$(cat "$JOBS/$bjob/branch")
+            [ "$(cat "$JOBS/$bjob/base" 2>/dev/null)" = zzz-base-test ] \
+              && git -C "$brepo" merge-base --is-ancestor "$bsha" "$bbranch" 2>/dev/null \
+              && ok "--base starts the job's branch from the held branch, in git" \
+              || bad "--base did not put the base branch's commit under the job's branch"
+            [ -e "$JOBS/$bjob/quiet" ] && ok "--quiet marks the job so it is not narrated" || bad "--quiet left no mark on the job"
+            wait_done "$bjob" || true
+        else
+            bad "knight start --base --quiet did not start a job (output above)"
+        fi
+        git -C "$brepo" branch -D zzz-base-test >/dev/null 2>&1
+    else
+        printf '  skip  --base: no clone for %s to branch from\n' "$btarget"
+    fi
+fi
+
 # ── BUG 2a: the wall-clock ceiling must actually kill ───────────────────────
 hdr "Wall-clock ceiling — the backstop the unattended design leans on"
 
@@ -347,6 +378,47 @@ else
 fi
 rm -rf "$jd"
 rm -f "$TARGETS/zzz-landing.env"; rm -rf "$scratch"
+
+# ── A job that changes prep gets prep before its gate (2026-10-17) ───────────
+hdr "Prep again — a job that changes what prep installs is gated with it installed"
+
+# The first GIS job wrote a prep.sh that installs TypeScript; prep had already run (the placeholder),
+# the type check found nothing, and tested work never reached a branch. Here prep.sh is what the gate
+# needs: the fake job adds a prep.sh that writes installed.flag, and the gate checks for it.
+scratch3=$(mktemp -d /tmp/knight-prep-XXXXXX)
+(
+  set -e
+  git -C "$scratch3" init -q -b main src
+  cd "$scratch3/src"
+  git config user.email t@t; git config user.name t
+  echo one > file.txt; git add file.txt; git commit -qm one
+) || bad "could not build the scratch repo"
+cat > "$TARGETS/zzz-prep.env" <<PREPT
+KT_DESC="scratch target, written by test-runner.sh"
+KT_SOURCE=$scratch3/src
+KT_BRANCH=main
+KT_PUSH_MODE=branch
+KT_PUSH_REMOTE=$scratch3/src
+KT_PREP=( '[ ! -x ./prep.sh ] || ./prep.sh' )
+KT_GATE=( 'test -f installed.flag' )
+PREPT
+clone3="$scratch3/clone"
+git clone -q --no-hardlinks "$scratch3/src" "$clone3"
+git -C "$clone3" remote remove origin
+git -C "$clone3" fetch -q "$scratch3/src" main
+git -C "$clone3" checkout -q --detach FETCH_HEAD
+git -C "$clone3" checkout -q -B knight/prep-test
+git -C "$clone3" config user.email t@t; git -C "$clone3" config user.name t
+printf '#!/bin/sh\ntouch installed.flag\n' > "$clone3/prep.sh"; chmod +x "$clone3/prep.sh"
+git -C "$clone3" add prep.sh; git -C "$clone3" commit -qm "a prep the gate depends on"
+jd3=$(mktemp -d /tmp/knight-prep-job-XXXXXX)
+KNIGHT_FAKE_AGENT=1 "$MOSES_ROOT/knight/bin/knight-run" "$jd3" "$clone3" knight/prep-test zzz-prep >/dev/null 2>&1
+if git -C "$scratch3/src" rev-parse --verify -q refs/heads/knight/prep-test >/dev/null; then
+    ok "a job that changes prep.sh is gated after prep runs again, and its work is pushed"
+else
+    bad "a job that changes prep.sh never had prep re-run before its gate: $(grep -E 'gate=|prep' "$jd3/summary" "$jd3/gate.log" 2>/dev/null | head -3)"
+fi
+rm -rf "$jd3"; rm -f "$TARGETS/zzz-prep.env"; rm -rf "$scratch3"
 
 # ── An incident is closed only by work that actually landed ─────────────────
 hdr "Incident close — nothing shipped means nothing is fixed"

@@ -37,10 +37,12 @@ WHAT IS STRIPPED FROM THE CALL, and why each matters:
                           READ_TOOLS on any turn, and ACT_TOOLS only when a HUMAN directed the
                           turn — `directed and not reactive`, so another agent cannot unlock them by
                           asking, and a turn that fetched a web page has none at all.
-                          ACT_TOOLS: knight_start, knight_land, zryachiy_explore, resolve_incident, add_idea, remediate,
+                          ACT_TOOLS: knight_propose (a build starts only on Brad's yes to its
+                          examples — the listener starts it, #2), knight_land, zryachiy_explore, resolve_incident, add_idea, remediate,
                           verification_record, and the project registry — project_add,
                           project_update, project_add_milestone, project_complete_milestone,
-                          project_promote_idea, project_remove_idea, project_remove.
+                          project_promote_idea, project_remove_idea, project_remove,
+                          project_add_blocker, project_remove_blocker.
                           verification_record ticks one acceptance criterion on a delivered job. It
                           is an ACTING tool because a request stays open until every row is verified
                           — including the rows only Brad can check — so being able to write one is
@@ -208,7 +210,10 @@ READ_TOOLS = [
 # and records; he does not get a shell. Anything needing one goes to Knight, whose runner enforces
 # the test gate, or comes back to Brad.
 ACT_TOOLS = [
-    "knight_start",      # hand code work to the agent that is built for it
+    # PROPOSE, NEVER START (Brad, 2026-10-17, #2): in Slack a build begins only after Brad confirms a spec
+    # with concrete include/exclude examples, and the LISTENER starts it on his "yes". knight_start is not
+    # granted here at all, so a turn cannot skip the confirmation.
+    "knight_propose",
     # FINISHING a job that is waiting on a branch: merge it and restart what runs it. Behind the same
     # gate as starting one, and for a stronger reason — this is the tool that puts code into Brad's
     # own machinery. Branch-mode work has always ended "for a human to merge", and until 2026-09-17
@@ -264,6 +269,10 @@ ACT_TOOLS = [
     "project_promote_idea",
     "project_remove_idea",
     "project_remove",
+    # Blockers joined the registry 2026-10-14 (M36) and sit behind the same human-directed gate:
+    # clearing one is exactly the kind of write that could flatter a status report.
+    "project_add_blocker",
+    "project_remove_blocker",
 ]
 
 # Deliberately NOT granted even when directed, and listed so the intent is auditable:
@@ -582,8 +591,12 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
     product = _env.product_name()
     return (read + "\n\nA PERSON ASKED YOU DIRECTLY, so on this turn you can also ACT. Call these by "
             "their FULL names, exactly as written:\n"
-            f"- `{q('knight_start')}` — hand code work to Knight. The right move for anything that "
-            "means changing a repo. Do it rather than describing it; Knight has his own test gate.\n"
+            f"- `{q('knight_propose')}` — hand code work to Knight, by PROPOSING it. You cannot start a "
+            "build directly: you propose the task, the acceptance criteria and CONCRETE EXAMPLES of what it "
+            "WILL include and what it WILL NOT (real titles, real cases — 'GIS Analyst Intern: yes; Civil "
+            "Engineering Intern that mentions ArcGIS: no' — never a category label he has to decode). Put "
+            "the tool's reply in your message as it is. Brad answers yes (or ✅) and code starts it; if he "
+            "says change something, propose again with the change. Never say a build has started.\n"
             "  Pass `target` to say WHICH repo: the product (the default, and the only one where a "
             "green build deploys), 'moses' (this agent, the MCP server and Knight himself) or "
             f"'moses-framework'. `{q('knight_targets')}` lists them by name with their "
@@ -610,7 +623,17 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
             "op='ops' to see what is on the list. Anything not on it is refused by name; that is not "
             "a failure, it is the boundary.\n\n"
             "Do not say you cannot do something without trying the tool. If a call is refused, say "
-            "exactly what was refused and what it said." + _local_actions_text())
+            "exactly what was refused and what it said." + _framework_actions_text() + _local_actions_text())
+
+
+def _framework_actions_text() -> str:
+    """Actions every install has. Same `DO:` line as the operator's own; code does the work."""
+    import new_build                                            # noqa: PLC0415
+    import publish                                              # noqa: PLC0415
+    return ("\n\nACTIONS. These are not tools: ask for one with a line on its own, `DO: <name> <argument>`, "
+            "and code runs it after your reply is posted and reports back here. Keep the rest of your "
+            "reply to a line saying it has started.\n"
+            + "\n".join(f"- `{n}`: {d}" for n, d in new_build.actions() + publish.actions()))
 
 
 def _local_actions_text() -> str:

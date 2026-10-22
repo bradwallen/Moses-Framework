@@ -64,11 +64,11 @@ check("and an idea-stage project is not promoted by having an idea",
 
 print("\npromotion is the moment it becomes a commitment")
 seed()
-projects.add_idea("demo", "Group trips", "the Jamaica trip is the acceptance test")
+projects.add_idea("demo", "Group trips", "the beach trip is the acceptance test")
 projects.promote_idea("demo", 1)
 p = only()
 check("it is now a milestone", [m["title"] for m in p["milestones"]][-1] == "Group trips")
-check("carrying its reasoning", p["milestones"][-1].get("note") == "the Jamaica trip is the acceptance test")
+check("carrying its reasoning", p["milestones"][-1].get("note") == "the beach trip is the acceptance test")
 check("and it has left the candidate list", not p.get("ideas"))
 check("the ratio now counts it", "2/3" in projects.brief(), projects.brief())
 
@@ -466,6 +466,43 @@ try:
     check("FIND a repo name that is no project is refused", False)
 except projects.ProjectError:
     check("FIND a repo name that is no project is refused", True)
+
+# ── Blockers can be cleared through the module, not only by hand-editing the file (M36) ────────
+# moses-framework carried a stale "Moses itself needs more work first" because update() refused
+# the field and nothing else could touch it.
+print("\nblockers")
+seed(blockers=["Moses itself needs more work first"])
+
+
+def refused(label, fn, want=""):
+    try:
+        fn()
+        check(label, False, "was accepted")
+    except projects.ProjectError as e:
+        check(label, want.lower() in str(e).lower(), str(e))
+
+
+refused("SET blockers is refused with a pointer to block/unblock",
+        lambda: projects.update("demo", "blockers", "x"), "unblock")
+projects.add_blocker("demo", "waiting on the Stripe review")
+check("BLOCK appends, keeping the one already there",
+      projects.load()["projects"][0]["blockers"] == ["Moses itself needs more work first",
+                                                     "waiting on the Stripe review"])
+check("BLOCK shows on the dashboard", "BLOCKED: waiting on the Stripe review" in projects.dashboard())
+refused("BLOCK twice with the same text is refused", lambda: projects.add_blocker("demo", "Waiting on the Stripe review "), "already")
+refused("BLOCK with no text is refused", lambda: projects.add_blocker("demo", "  "), "needs")
+refused("UNBLOCK a piece matching both is refused, not guessed",
+        lambda: projects.remove_blocker("demo", "e"), "give its number")
+refused("UNBLOCK text that matches nothing lists what is there",
+        lambda: projects.remove_blocker("demo", "budget"), "1. Moses itself")
+refused("UNBLOCK a number out of range is refused", lambda: projects.remove_blocker("demo", "3"), "has 2")
+projects.remove_blocker("demo", "Moses itself")
+check("UNBLOCK by a piece of its text clears exactly that one",
+      projects.load()["projects"][0]["blockers"] == ["waiting on the Stripe review"])
+projects.remove_blocker("demo", "1")
+check("UNBLOCK by number clears it, and the dashboard stops saying BLOCKED",
+      projects.load()["projects"][0]["blockers"] == [] and "BLOCKED" not in projects.dashboard())
+refused("UNBLOCK on a project with none says so", lambda: projects.remove_blocker("demo", "1"), "no blockers")
 
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

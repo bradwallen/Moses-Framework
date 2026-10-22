@@ -347,5 +347,54 @@ with _tf.TemporaryDirectory() as _d:
     drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
 
 
+print("\nevery project carries an architecture document (commandment V)")
+# 2026-10-22: the listings page ran five days with none, and even a doc in its own repo would not have
+# been read here — MOSES_ARCH_DOCS was a hand-kept list no new project ever joined.
+with _tf.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "Projects"
+    root.mkdir()
+    def _git(path):
+        path.mkdir(parents=True)
+        _sp.run(["git", "init", "-q", str(path)], check=True)
+        return path
+    documented = _git(root / "documented")
+    (documented / "docs").mkdir()
+    (documented / "docs/ARCHITECTURE.md").write_text("app-documented-thing runs on :8800")
+    moses_like = _git(root / "moses-like")
+    (moses_like / "agent/docs").mkdir(parents=True)
+    (moses_like / "agent/docs/ARCHITECTURE.md").write_text("x")
+    _git(root / "undocumented")
+    worktree = root / "a-worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: elsewhere")       # a worktree is the same project, not a new one
+    (root / "not-a-repo").mkdir()
+    tracked = _git(Path(tmp) / "elsewhere" / "tracked-only")   # tracked in the registry, outside Projects
+    reg = Path(tmp) / "projects.json"
+    reg.write_text(_json.dumps({"projects": [{"id": "tracked-only", "repo": str(tracked)},
+                                             {"id": "no-repo", "repo": ""}]}))
+    _was = (drift.PROJECTS_DIR, drift.REGISTRY, drift.ARCH_DOCS)
+    drift.PROJECTS_DIR, drift.REGISTRY, drift.ARCH_DOCS = root, reg, []
+    try:
+        drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+        drift.check_projects_documented()
+        named = sorted(w.split(": ", 1)[1] for w, _ in drift.DRIFT)
+        check("a project repo with no docs/ARCHITECTURE.md is drift, by name — under Projects or only in the tracker",
+              named == ["tracked-only", "undocumented"], f"got {named}")
+        check("agent/docs/ARCHITECTURE.md counts, a worktree is not a second project, a plain folder is not one",
+              "moses-like" not in named and "a-worktree" not in named and "not-a-repo" not in named, named)
+        corpus, read_any = drift.arch_corpus()
+        check("a project's own doc is read when looking for undocumented running components",
+              read_any and "app-documented-thing" in corpus, corpus[:200])
+        (root / "undocumented" / "docs").mkdir()
+        (root / "undocumented" / "docs/ARCHITECTURE.md").write_text("y")
+        (tracked / "docs").mkdir()
+        (tracked / "docs/ARCHITECTURE.md").write_text("z")
+        drift.DRIFT.clear(); drift.AGREED.clear()
+        drift.check_projects_documented()
+        check("once every project has one, it agrees", not drift.DRIFT and drift.AGREED, f"{drift.DRIFT}")
+    finally:
+        drift.PROJECTS_DIR, drift.REGISTRY, drift.ARCH_DOCS = _was
+        drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

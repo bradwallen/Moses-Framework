@@ -13,6 +13,10 @@
 # rather than restart in-line (the failure that would take down the caller mid-answer), and the live
 # script is checked to verify the service came back rather than trust the restart's exit code.
 set -uo pipefail
+# NO TEST POSTS TO SLACK. Everything this suite runs — and anything those scripts hand off to, like
+# knight-next after a landing — inherits this. test-land once did not, and its scratch target "t1"
+# posted "Stopped" cards into Brad's channel on every run (2026-10-18). test-notify.sh checks every suite.
+export KNIGHT_SLACK_CHANNEL="" KNIGHT_SLACK_ENV=/nonexistent
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 LAND="$HERE/bin/knight-land"
@@ -236,6 +240,193 @@ EOF
 else
     printf '  skip  end to end (no user systemd here)\n'
 fi
+
+# ── #14: a branch that ADDS a Knight target needs Brad's one-time code ──────────────────────────
+# Here the registry lives INSIDE the repository being merged, as it does for `moses`: that is the
+# case where a Knight job could add a target in a branch and have this script merge it, skipping
+# the code. The real helper runs unprivileged against a scratch seed (it ignores those overrides as
+# root). Each refusal is then watched failing against a copy of the lander with that check removed.
+MFA_HELPER="$HERE/../agent/moses-mfa"
+MFA_SECRET=$(printf 'land-test-seed-01234' | base32 | tr -d '=')
+mfa_world() {  # mfa_world <name> add|edit|rename
+    local name=$1 change=$2 w="$TMP/$1"
+    mkdir -p "$w/repo/knight/targets" "$w/jobs/job1" "$w/mfa"
+    printf '%s\n' "$MFA_SECRET" > "$w/seed"
+    git -C "$w/repo" init -q -b main
+    git -C "$w/repo" config user.email t@t.test; git -C "$w/repo" config user.name t
+    printf 'KT_SOURCE=%s\nKT_BRANCH=main\nKT_PUSH_MODE=branch\nKT_LIVE_CMD=\nKT_LIVE_CHECK=\n' "$w/repo" \
+        > "$w/repo/knight/targets/t1.env"
+    echo one > "$w/repo/file.txt"
+    git -C "$w/repo" add -A; git -C "$w/repo" commit -qm first
+    git -C "$w/repo" checkout -q -b feature/x
+    echo two > "$w/repo/file.txt"
+    case "$change" in
+        add)    printf 'KT_SOURCE=/somewhere/new\nKT_BRANCH=main\nKT_PUSH_MODE=direct\n' > "$w/repo/knight/targets/newproj.env" ;;
+        edit)   printf '# a comment, edited — it even mentions KT_SOURCE\nKT_PREP=(\x27true\x27)\n' >> "$w/repo/knight/targets/t1.env" ;;
+        repoint) sed -i "s|^KT_SOURCE=.*|KT_SOURCE=/somewhere/else|" "$w/repo/knight/targets/t1.env" ;;
+        evil)   printf 'eval "KT_SOU""RCE=/somewhere/else"\n' >> "$w/repo/knight/targets/t1.env" ;;
+        autoflag) printf 'KT_AUTO_LAND=1\nKT_CONTINUE=1\n' >> "$w/repo/knight/targets/t1.env" ;;
+        declare)  printf 'declare "KT_AUTO_""LAND=1"\n' >> "$w/repo/knight/targets/t1.env" ;;
+        printfv)  printf 'printf -v "KT_CONT""INUE" 1\n' >> "$w/repo/knight/targets/t1.env" ;;
+        rename) cp "$w/repo/knight/targets/t1.env" "$w/repo/knight/targets/t1.env.keep"
+                git -C "$w/repo" mv knight/targets/t1.env knight/targets/sneaky.env ;;
+    esac
+    git -C "$w/repo" add -A; git -C "$w/repo" commit -qm second
+    git -C "$w/repo" checkout -q main
+    rm -f "$w/repo/knight/targets/t1.env.keep"
+    printf 'feature/x' > "$w/jobs/job1/branch"; printf 't1' > "$w/jobs/job1/target"
+    printf 'pushed' > "$w/jobs/job1/status"; printf 'CLEAN\n' > "$w/jobs/job1/review.txt"
+    printf '%s' "$w"
+}
+mland() {  # mland <world> <lander> [args…]
+    local w=$1 lander=$2; shift 2
+    KNIGHT_JOBS="$w/jobs" KNIGHT_TARGETS="$w/repo/knight/targets" KNIGHT_LAND_LOG="$w/lands.jsonl" \
+        KNIGHT_MFA_CMD="${MFA_CMD_OVERRIDE:-$MFA_HELPER}" MOSES_MFA_SEED="$w/seed" MOSES_MFA_STATE="$w/mfa" \
+        "$lander" "$@" 2>&1
+}
+mfa() { local w=$1; shift; MOSES_MFA_SEED="$w/seed" MOSES_MFA_STATE="$w/mfa" "$MFA_HELPER" "$@"; }
+authorize() {  # authorize <world> <target>
+    local w=$1 c code
+    c=$(mfa "$w" challenge new-build "$2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["challenge"])')
+    code=$(python3 -c '
+import base64,hashlib,hmac,struct,sys,time
+s=sys.argv[1]; k=base64.b32decode(s+"="*(-len(s)%8))
+m=hmac.new(k,struct.pack(">Q",int(time.time()//30)),hashlib.sha1).digest(); o=m[-1]&15
+print(str((struct.unpack(">I",m[o:o+4])[0]&0x7fffffff)%1000000).zfill(6))' "$MFA_SECRET")
+    printf '%s' "$code" | mfa "$w" verify "$c" >/dev/null 2>&1
+}
+
+a5_cases() {  # a5_cases <lander> — echoes one "name=merged|refused" line per case
+    local L=$1 w
+    w=$(mfa_world "a5-noauth-$RANDOM" add); mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "noauth=merged" || echo "noauth=refused"
+    w=$(mfa_world "a5-rename-$RANDOM" rename); mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "rename=merged" || echo "rename=refused"
+    w=$(mfa_world "a5-broken-$RANDOM" add); MFA_CMD_OVERRIDE=/nonexistent/moses-mfa mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "broken=merged" || echo "broken=refused"
+    w=$(mfa_world "a5-repoint-$RANDOM" repoint); mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "repoint=merged" || echo "repoint=refused"
+    w=$(mfa_world "a5-declare-$RANDOM" declare); mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "declare=merged" || echo "declare=refused"
+}
+
+echo
+echo "knight-land — a new Knight target needs Brad's one-time code (#14)"
+w=$(mfa_world a5-noauth add)
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && grep -q "one-time code" <<<"$out" \
+    && ok "a branch adding a target with no code waiting is refused, and nothing merges" \
+    || bad "a branch adding a target with no code waiting is refused, and nothing merges" "$out"
+out=$(mland "$w" "$LAND" --list)
+grep -q "BLOCKED.*one-time code" <<<"$out" && ok "--list says why it is blocked" || bad "--list says why it is blocked" "$out"
+
+authorize "$w" newproj
+out=$(mland "$w" "$LAND" job1)
+merged "$w" && grep -q "Used Brad's one-time code" <<<"$out" \
+    && ok "with Brad's code waiting for that target, it merges" \
+    || bad "with Brad's code waiting for that target, it merges" "$out"
+st=$(mfa "$w" status)
+grep -q '"waiting": \[\]' <<<"$st" && ok "and the code is spent by the merge" || bad "and the code is spent by the merge" "$st"
+
+w=$(mfa_world a5-other add)
+authorize "$w" someotherproject
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && ok "a code for a different project does not land this one" \
+    || bad "a code for a different project does not land this one" "$out"
+
+w=$(mfa_world a5-edit edit)
+out=$(mland "$w" "$LAND" job1)
+merged "$w" && ok "editing an existing target needs no code — even a comment naming KT_SOURCE (Brad, 2026-10-16)" \
+    || bad "editing an existing target needs no code — even a comment naming KT_SOURCE (Brad, 2026-10-16)" "$out"
+
+w=$(mfa_world a5-rename rename)
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && ok "renaming a target to a new name counts as adding one" \
+    || bad "renaming a target to a new name counts as adding one" "$out"
+
+w=$(mfa_world a5-broken add)
+out=$(MFA_CMD_OVERRIDE=/nonexistent/moses-mfa mland "$w" "$LAND" job1)
+! merged "$w" && grep -q "could not run" <<<"$out" \
+    && ok "a code check that cannot run refuses, and says it could not check" \
+    || bad "a code check that cannot run refuses, and says it could not check" "$out"
+
+# BRAD, 2026-10-17: pointing an existing target at another folder is starting a new project, so a
+# branch may never do it — refused outright, with no code that unlocks it.
+w=$(mfa_world a5-repoint repoint)
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && grep -q "starting a new project" <<<"$out" \
+    && ok "a branch that repoints an existing target is refused, and says why" \
+    || bad "a branch that repoints an existing target is refused, and says why" "$out"
+authorize "$w" t1
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && ok "and no code unlocks it — a new folder starts from the tracker" \
+    || bad "and no code unlocks it — a new folder starts from the tracker" "$out"
+w=$(mfa_world a5-evil evil)
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && ok "an eval that assembles KT_SOURCE is treated as a repoint" \
+    || bad "an eval that assembles KT_SOURCE is treated as a repoint" "$out"
+
+# A branch may not switch on "build away" for an existing target either: KT_AUTO_LAND and KT_CONTINUE
+# are what Brad's code grants, so they are guarded like the folder lines.
+w=$(mfa_world a5-autoflag autoflag)
+out=$(mland "$w" "$LAND" job1)
+! merged "$w" && ok "a branch that turns on auto-land or keep-building for a target is refused" \
+    || bad "a branch that turns on auto-land or keep-building for a target is refused" "$out"
+
+# REVIEW 2026-10-17: a setting can be assembled so no line names it. A changed target file may hold
+# plain settings only, so these are refused for their shape, before any text comparison.
+for kind in declare printfv; do
+    w=$(mfa_world "a5-$kind" "$kind")
+    out=$(mland "$w" "$LAND" job1)
+    ! merged "$w" && grep -q "not a plain setting" <<<"$out" \
+        && ok "a target line that assembles a setting ($kind) is refused" \
+        || bad "a target line that assembles a setting ($kind) is refused" "$out"
+done
+
+# After a merge on a keep-building target, knight-next runs (detached) and records what it decided.
+# With no tracker entry it stops for want of a scope — which proves it ran, and that it says so.
+w=$(mfa_world a5-continue plain)   # the branch changes only file.txt
+printf 'KT_CONTINUE=1\n' >> "$w/repo/knight/targets/t1.env"
+git -C "$w/repo" commit -qam "keep building"
+# A stand-in for `knight start`, so nothing here can start a real job even if a registry were found.
+printf '#!/bin/sh\necho "$@" > %s/started-by-test\n' "$w" > "$w/fake-start"; chmod +x "$w/fake-start"
+out=$(MOSES_REGISTRY="$w/no-registry.json" KNIGHT_START_BIN="$w/fake-start" mland "$w" "$LAND" job1)
+for _ in $(seq 1 20); do grep -q '"outcome":"chain-' "$w/lands.jsonl" 2>/dev/null && break; sleep 0.5; done
+merged "$w" && grep -q "Handed to knight-next" <<<"$out" && grep -q '"outcome":"chain-stopped"' "$w/lands.jsonl" \
+    && ok "a merge on a keep-building target hands over to knight-next, which says what it decided" \
+    || bad "a merge on a keep-building target hands over to knight-next, which says what it decided" "$out
+$(cat "$w/lands.jsonl" 2>/dev/null)"
+
+# REVIEW FINDING 5: a branch git cannot diff against main (no merge base) is refused, not waved on.
+w=$(mfa_world a5-orphan edit)
+git -C "$w/repo" checkout -q --orphan feature/x-orphan
+git -C "$w/repo" commit -qm "second, from nowhere" --allow-empty
+git -C "$w/repo" checkout -q main
+printf 'feature/x-orphan' > "$w/jobs/job1/branch"
+out=$(mland "$w" "$LAND" --list)
+grep -qE "BLOCKED.*could not (work out|read)" <<<"$out" \
+    && ok "a branch with no merge base is blocked because it could not be checked" \
+    || bad "a branch with no merge base is blocked because it could not be checked" "$out"
+
+# Watch each one fail: a copy of the lander with that check removed must merge. Two barriers stand in
+# front of a new target — landable()'s check, and spending the code before the merge — so the mutants
+# remove both (SPEND below). Removing one and staying refused is defense in depth, not blindness.
+SPEND='s/|| die "the one-time code for new target/|| true; : "/'
+
+MUT="$TMP/mut"; mkdir -p "$MUT"
+cp -r "$HERE/bin" "$HERE/lib" "$MUT/"
+watch_fail() {  # watch_fail <label> <case> <sed expression>
+    rm -rf "$MUT/bin"; cp -r "$HERE/bin" "$MUT/bin"
+    sed -i "$3" "$MUT/bin/knight-land"
+    cmp -s "$HERE/bin/knight-land" "$MUT/bin/knight-land" && { bad "$1" "the sabotage no longer applies"; return; }
+    grep -q "^$2=merged$" <<<"$(a5_cases "$MUT/bin/knight-land")" \
+        && ok "watched fail: $1" || bad "watched fail: $1" "the suite did not see it"
+}
+watch_fail "with the check removed, a new target lands with no code" noauth 's/if \[ "\$rc" = 1 \]; then/if false; then/; s/elif \[ "\$rc" != 0 \]; then/elif false; then/; '"$SPEND"
+watch_fail "with the repoint check removed, a branch moves a target to a new folder" repoint 's/\[ -n "\$moved" \]/false/'
+watch_fail "with the shape check removed, an assembled setting lands" declare 's/if \[ -n "\$odd" \]; then/if false; then/'
+watch_fail "with rename detection on, a renamed target slips through" rename 's/diff --no-renames/diff/'
+watch_fail "with 'could not check' read as fine, a broken helper waves it through" broken 's/elif \[ "\$rc" != 0 \]; then/elif false; then/; '"$SPEND"
 
 printf '\n%d ok, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

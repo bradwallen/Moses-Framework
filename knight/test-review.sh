@@ -12,6 +12,10 @@
 # that answered in a shape nobody can parse are both "could not look" — and if either reads as a
 # pass, the gate is decorative.
 set -uo pipefail
+# NO TEST POSTS TO SLACK. Everything this suite runs — and anything those scripts hand off to, like
+# knight-next after a landing — inherits this. test-land once did not, and its scratch target "t1"
+# posted "Stopped" cards into Brad's channel on every run (2026-10-18). test-notify.sh checks every suite.
+export KNIGHT_SLACK_CHANNEL="" KNIGHT_SLACK_ENV=/nonexistent
 . "$(dirname "$(readlink -f "$0")")/../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
 cd "$(dirname "$0")"
 
@@ -200,6 +204,20 @@ grep -q 'review_noverdict:-0}" -eq 1 ] && \[ -z\|"\${review_noverdict:-0}" -eq 1
   && grep -q 'review-brief-retry.txt' bin/knight-run \
   && ok "the runner asks the reviewer once more when the verdict is missing" \
   || bad "the runner no longer retries a review with no verdict"
+
+echo
+echo "UNCHECKED (2026-10-17): a criterion no diff can answer is carried, never a block and never a pass"
+printf 'UNCHECKED: 3 — whether the page looks right on a phone; a browser would show it\nSETTLED: 1 — x\n' > "$TMP/r.txt"
+review_verdict 0 "$TMP/r.txt"
+[ "$review_ok" -eq 1 ] && [[ "$unchecked" == *"on a phone"* ]] && [ -z "$plausible" ] \
+    && ok "UNCHECKED alone ships, carried as unchecked (not as a note that holds a landing)" \
+    || bad "UNCHECKED alone — ok=$review_ok unchecked='$unchecked' plausible='$plausible' why=$review_why"
+printf 'CONFIRMED: a.ts:3 — crashes on empty input\nUNCHECKED: 2 — live only\n' > "$TMP/r.txt"
+review_verdict 0 "$TMP/r.txt"
+[ "$review_ok" -eq 0 ] && ok "a CONFIRMED beside an UNCHECKED still blocks" || bad "UNCHECKED let a CONFIRMED through"
+grep -q 'UNCHECKED: <criterion>' bin/knight && ! grep -q 'cannot judge from the diff and the repo is MISSED' bin/knight \
+    && ok "the reviewer's brief says UNCHECKED for what a diff cannot show, not MISSED" \
+    || bad "the brief still tells the reviewer to block on what no diff can show"
 
 printf '\n  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1

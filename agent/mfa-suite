@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# mfa-suite — every check behind "a new build needs Brad's one-time code" (#14), in one command.
+#
+#   agent/mfa-suite
+#
+# Four suites, and each one also breaks the code under it on purpose and requires its own check to
+# go red (commandment 8). Run before installing (agent/install-mfa.sh runs it first) and after any
+# change to these files. Knight's `moses` gate already runs the three *_test.py files; it does NOT
+# run knight/test-land.sh, which is why this exists as one command rather than a reminder.
+#
+# WHERE EACH CASE BRAD ASKED FOR (A6) IS WATCHED FAILING:
+#   wrong code           mfa_test.py            "three wrong codes close the challenge", lockout
+#   replayed code        mfa_test.py            "a used code cannot authorize again", the race
+#   expired challenge    mfa_test.py            "an expired challenge refuses even the right code"
+#   not the owner        new_build_test.py      "a code from anyone but the owner authorizes nothing"
+#   bot-prompted         new_build_test.py      "another agent cannot open a code request"
+#   code reaches a model new_build_test.py      the intercept, and redaction from later turns
+#   no code, no build    moses_new_target_test  "with no authorization, nothing is created"
+#   branch adds a target knight/test-land.sh    "#14" section, incl. a renamed target
+set -uo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)
+
+# The listener suites import slack_sdk; use the first interpreter that has it.
+PY=""
+for p in "${MOSES_PYTHON:-}" "$ROOT/.venv/bin/python" "$HOME/moses-venv/bin/python" python3; do
+    [ -n "$p" ] && command -v "$p" >/dev/null 2>&1 && "$p" -c 'import slack_sdk' 2>/dev/null && { PY=$p; break; }
+done
+[ -n "$PY" ] || { echo "mfa-suite: no python with slack_sdk — set MOSES_PYTHON. Nothing was run." >&2; exit 2; }
+
+fail=0
+run() {
+    local label=$1; shift
+    printf '== %s\n' "$label"
+    local out rc
+    out=$("$@" 2>&1); rc=$?
+    # Every failure line, then the suite's own last line (its count).
+    printf '%s\n' "$out" | grep -v '^moses: ' | grep -E '^ *FAIL' | sed 's/^/   /'
+    printf '%s\n' "$out" | grep -v '^moses: ' | grep -v '^ *$' | tail -1 | sed 's/^/   /'
+    [ "$rc" = 0 ] && printf '   green\n' || { printf '   RED (exit %s)\n' "$rc"; fail=1; }
+}
+run "the root helper (moses-mfa)"             "$PY" "$HERE/mfa_test.py"
+run "the green light and the code (listener)" "$PY" "$HERE/new_build_test.py"
+run "the build itself (moses-new-target)"     "$PY" "$HERE/moses_new_target_test.py"
+run "knight-land and new targets"             bash "$ROOT/knight/test-land.sh"
+
+[ "$fail" = 0 ] && { echo; echo "mfa-suite: all green, and every guard was watched failing"; exit 0; }
+echo; echo "mfa-suite: RED — see above"; exit 1

@@ -405,15 +405,68 @@ def _is_ours(unit: str, user: bool) -> bool:
     return not path.strip().startswith("/usr/lib/")
 
 
-def check_undocumented_components() -> None:
-    corpus = ""
-    read_any = False
-    for d in ARCH_DOCS:
+# EVERY PROJECT'S OWN ARCHITECTURE DOC (commandment V), found rather than listed. MOSES_ARCH_DOCS was a
+# hand-kept list, so a project started after it was written never joined it: the listings page ran for
+# five days reported here as "in no architecture document" — true, and unfixable from this side, because
+# even a doc in its own repo would not have been read. Brad, 2026-10-22: "EVERY project needs
+# documentation — that is absolute failure."
+PROJECTS_DIR = Path(_env.setting("MOSES_PROJECTS_DIR") or _env.ROOT.parent)
+ARCH_NAMES = ("docs/ARCHITECTURE.md", "agent/docs/ARCHITECTURE.md")
+
+
+def project_repos() -> dict[str, Path]:
+    """Every project with code: each git repository directly under PROJECTS_DIR (its own .git
+    directory — a worktree's .git is a file and is the same project), plus every tracker project whose
+    `repo` is a local folder."""
+    found: dict[str, Path] = {}
+    try:
+        for d in sorted(PROJECTS_DIR.iterdir()):
+            if (d / ".git").is_dir():
+                found[d.name] = d
+    except OSError:
+        pass
+    try:
+        for p in json.loads(Path(REGISTRY).read_text()).get("projects", []):
+            repo = os.path.expanduser(str(p.get("repo") or "").strip())
+            if repo.startswith("/") and Path(repo).is_dir() and Path(repo) not in found.values():
+                found[p.get("id") or Path(repo).name] = Path(repo)
+    except (OSError, ValueError):
+        pass
+    return found
+
+
+def arch_doc(repo: Path) -> Path | None:
+    return next((repo / n for n in ARCH_NAMES if (repo / n).is_file()), None)
+
+
+def arch_corpus() -> tuple[str, bool]:
+    """All architecture text, lowercased: the listed docs and every project's own. (text, read any?)"""
+    corpus, read_any = "", False
+    docs = [Path(d) for d in ARCH_DOCS] + [d for d in (arch_doc(r) for r in project_repos().values()) if d]
+    for d in dict.fromkeys(docs):
         try:
-            corpus += Path(d).read_text(errors="ignore").lower()
+            corpus += d.read_text(errors="ignore").lower()
             read_any = True
         except Exception:                                         # noqa: BLE001
             continue
+    return corpus, read_any
+
+
+def check_projects_documented() -> None:
+    """Every project with code carries docs/ARCHITECTURE.md. One drift line per project without one."""
+    repos = project_repos()
+    if not repos:
+        return blind("projects documented", f"found no project repositories under {PROJECTS_DIR}")
+    missing = sorted(name for name, repo in repos.items() if not arch_doc(repo))
+    for name in missing:
+        drift(f"a project with no architecture document: {name}",
+              f"{repos[name]} has no docs/ARCHITECTURE.md — every project carries one (commandment V)")
+    if not missing:
+        agreed(f"all {len(repos)} projects with code carry an architecture document")
+
+
+def check_undocumented_components() -> None:
+    corpus, read_any = arch_corpus()
     if not read_any:
         return blind("undocumented components", "could not read any architecture document")
 
@@ -846,6 +899,7 @@ CHECKS = {
     "allowlist": check_tool_allowlist,
     "prompt": check_prompt_matches_tools,
     "components": check_undocumented_components,
+    "documented": check_projects_documented,
     "modules": check_duplicate_modules,
     "tracked": check_tracked_units,
     "activity": check_activity_index,

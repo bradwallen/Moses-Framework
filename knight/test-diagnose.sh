@@ -9,6 +9,10 @@
 #
 #   --prove-red   run against a sabotaged copy (merge test disabled) and require at least one failure
 set -uo pipefail
+# NO TEST POSTS TO SLACK. Everything this suite runs — and anything those scripts hand off to, like
+# knight-next after a landing — inherits this. test-land once did not, and its scratch target "t1"
+# posted "Stopped" cards into Brad's channel on every run (2026-10-18). test-notify.sh checks every suite.
+export KNIGHT_SLACK_CHANNEL="" KNIGHT_SLACK_ENV=/nonexistent
 HERE=$(cd "$(dirname "$0")" && pwd)
 LIB="$HERE/lib/diagnose-branch.sh"
 if [ "${1:-}" = "--prove-red" ]; then

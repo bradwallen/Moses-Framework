@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""moses-publish — put a project Moses built on the web at example.com/<path>.
+
+    moses-publish <project-id> <path>          e.g. moses-publish example-app listings
+
+Runs as the operator. No sudo, no Cloudflare: the tunnel already sends all of example.com to the
+site server on this machine, and that server forwards every prefix listed in its apps file
+(MOSES_SITE_APPS, a setting in moses.env) to a local app with the prefix taken off. So publishing is:
+
+  1. CHECK      the project is in the tracker with a Knight target; the path is free (not a folder of
+                the site, not another project's); the project says how to run it — ./run.sh, else an
+                `npm start` script. No way to run it is said, never guessed.
+  2. PREP       ./prep.sh in the project's checkout, when there is one.
+  3. SERVICE    a user unit, app-<id>.service: the checkout as its working directory, PORT and
+                HOST=127.0.0.1 and BASE_PATH in the environment, the project's .env loaded, restarted
+                on failure. A port in 8800–8899 is chosen once and kept.
+  4. LOCAL      the app answers on 127.0.0.1:<port> before anything public changes.
+  5. ROUTE      the prefix goes into apps.json (read per request by the site server; no restart).
+  6. PUBLIC     https://example.com/<path>/ is fetched from outside and must answer 200.
+  7. LANDINGS   the Knight target's KT_LIVE_CMD / KT_LIVE_CHECK are set, so every later landing
+                re-runs prep, restarts the app and checks it is up (knight-land-live does this).
+  8. TRACKER    the project's `deploy` field is the URL.
+
+WHY (Brad, 2026-10-17): "if all of this were already in place I would not have come home to the
+listings finder built. Only a local repo of it." Built means somewhere the person it was for can open it. Moses
+answered "I don't know how example.com is served" — true, because the pattern was only written down
+inside the docs-server note. This script is the pattern, so nobody has to know it again.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "lib"))
+import moses_env as _env  # noqa: E402
+
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{1,40}$")
+TARGETS = Path(os.environ.get("KNIGHT_TARGETS", str(_env.ROOT / "knight" / "targets")))
+MCP_DIR = os.environ.get("MOSES_MCP_DIR", str(_env.ROOT / "mcp"))
+# The operator's site: its built pages (so a prefix cannot shadow one), its apps file, its public address.
+# Settings, not names in the engine — the public framework is for someone else's site.
+SITE_DIR = Path(_env.setting("MOSES_SITE_DIR") or str(_env.HOME / "Projects" / "site" / "site"))
+APPS_FILE = Path(_env.setting("MOSES_SITE_APPS") or str(_env.CONFIG / "site-apps.json"))
+UNIT_DIR = Path(os.environ.get("MOSES_UNIT_DIR", str(_env.HOME / ".config" / "systemd" / "user")))
+PUBLIC = _env.setting("MOSES_PUBLIC_BASE", "https://example.com")
+SYSTEMCTL = shlex.split(os.environ.get("MOSES_SYSTEMCTL", "systemctl --user"))
+PORTS = range(8800, 8900)
+
+
+class Stop(Exception):
+    pass
+
+
+def run(argv, cwd=None, timeout=600):
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def registry():
+    if MCP_DIR not in sys.path:
+        sys.path.insert(0, MCP_DIR)
+    import projects                                             # noqa: PLC0415
+    return projects
+
+
+def apps() -> dict:
+    try:
+        return json.loads(APPS_FILE.read_text()).get("apps") or {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        raise Stop(f"{APPS_FILE} is unreadable ({type(e).__name__}); nothing was changed")
+
+
+def write_apps(entries: dict) -> None:
+    APPS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = APPS_FILE.with_name(f"{APPS_FILE.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"apps": entries}, indent=1) + "\n")
+    os.replace(tmp, APPS_FILE)
+
+
+def listening(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.3)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def listener_ok(port: int, unit: str) -> str:
+    """"" when the port's listener is on loopback only AND belongs to this unit; else why not.
+
+    Review of 2026-10-17: a 200 on the port proved only that SOMETHING answered, and the GIS app was
+    listening on every interface — reachable from the LAN and the tailnet around the site server."""
+    rc, out = run(["ss", "-ltnpH", f"sport = :{port}"], timeout=10)
+    if rc != 0 or not out.strip():
+        return f"could not read who listens on port {port} (ss: {out[-120:] or rc}), so it was not published"
+    rc, mp = run([*SYSTEMCTL, "show", "-p", "MainPID", "--value", f"{unit}.service"], timeout=10)
+    main = int(mp.strip()) if mp.strip().isdigit() else 0
+    for line in out.splitlines():
+        parts = line.split()
+        local = parts[3] if len(parts) > 3 else ""
+        if not (local.startswith("127.0.0.1:") or local.startswith("[::1]:")):
+            return (f"the app listens on {local}, not only on 127.0.0.1, so anyone on the network could reach it "
+                    "around the site server. It must listen on HOST (127.0.0.1). Not published")
+        pids = [int(x) for x in re.findall(r"pid=(\d+)", line)]
+        if not pids:
+            return f"could not see which process listens on port {port}, so it was not published"
+        if main and not any(_descends(p, main) for p in pids):
+            return f"port {port} is answered by a process that is not {unit}'s, so it was not published"
+    return ""
+
+
+def _descends(pid: int, ancestor: int) -> bool:
+    for _ in range(30):
+        if pid == ancestor:
+            return True
+        try:
+            ppid = int(re.search(r"^PPid:\s+(\d+)", Path(f"/proc/{pid}/status").read_text(), re.M).group(1))
+        except (OSError, AttributeError, ValueError):
+            return False
+        if ppid <= 1:
+            return False
+        pid = ppid
+    return False
+
+
+def exposes_secrets(port: int) -> str:
+    """The app must not serve its own .env or .git — a run.sh that serves its directory would."""
+    for path, mark in (("/.env", "="), ("/.git/config", "[core]")):
+        status, body = get(f"http://127.0.0.1:{port}{path}", timeout=5)
+        if status == 200 and mark in body:
+            return f"the app serves {path} — its secrets or its git history would be public. Not published"
+    return ""
+
+
+def run_command(src: Path) -> list[str]:
+    if (src / "run.sh").is_file() and os.access(src / "run.sh", os.X_OK):
+        return ["./run.sh"]
+    try:
+        pkg = json.loads((src / "package.json").read_text())
+        if (pkg.get("scripts") or {}).get("start"):
+            return ["/usr/bin/npm", "start"]
+    except (OSError, ValueError):
+        pass
+    raise Stop("the project does not say how to run it: it needs a ./run.sh or an `npm start` script. "
+               "Nothing was published.")
+
+
+def get(url: str, timeout: int = 15) -> tuple[int, str]:
+    # A real User-Agent: Cloudflare blocks Python-urllib's default outright.
+    req = urllib.request.Request(url, headers={"User-Agent": f"moses-publish/1 (+{PUBLIC})"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read(4000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, ""
+    except (OSError, ValueError) as e:
+        return 0, f"{type(e).__name__}"
+
+
+def set_live(env_file: Path, cmd: str, check: str) -> bool:
+    """Replace (or add) KT_LIVE_CMD / KT_LIVE_CHECK as plain single-quoted settings."""
+    text = env_file.read_text()
+    lines = [l for l in text.splitlines() if not re.match(r"^\s*KT_LIVE_(CMD|CHECK)=", l)]
+    new = "\n".join(lines).rstrip("\n") + (
+        "\n\n# PUBLISHED by moses-publish: each landing re-runs prep, restarts the app, checks it is up.\n"
+        f"KT_LIVE_CMD='{cmd}'\nKT_LIVE_CHECK='{check}'\n")
+    if new == text:
+        return False
+    env_file.write_text(new)
+    return True
+
+
+def verify(pid: str) -> int:
+    """After a landing restarted it (KT_LIVE_CHECK): it answers, on loopback only, owned by its unit,
+    serving no .env or .git. A landing must not quietly undo what publishing checked."""
+    entry = next(((k, v) for k, v in apps().items() if v.get("project") == pid), None)
+    if not entry:
+        print(f"{pid} is not published"); return 1
+    port, unit = entry[1].get("port"), f"app-{pid}"
+    status = 0
+    for _ in range(30):
+        status, _b = get(f"http://127.0.0.1:{port}/", timeout=3)
+        if 0 < status < 500:
+            break
+        time.sleep(1)
+    problem = ("" if 0 < status < 500 else f"it does not answer on 127.0.0.1:{port}") \
+        or listener_ok(port, unit) or exposes_secrets(port)
+    if problem:
+        print(f"⚠️ {pid}: {problem}")
+        return 1
+    print(f"✅ {pid} answers on loopback only and serves no secrets")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "--verify" and NAME.match(argv[1]):
+        try:
+            return verify(argv[1])
+        except Stop as e:
+            print(f"⚠️ {e}"); return 1
+    if len(argv) != 2 or not NAME.match(argv[0]) or not NAME.match(argv[1].strip("/")):
+        print("usage: moses-publish <project-id> <path>   (path: lowercase letters, digits, dashes)", file=sys.stderr)
+        return 1
+    pid, name = argv[0], argv[1].strip("/")
+    prefix = "/" + name
+    done: list[str] = []
+
+    def say(line: str) -> None:
+        done.append(line)
+        print(line, flush=True)
+
+    try:
+        # 1. Check.
+        reg = registry()
+        p = next((x for x in reg.load()["projects"] if x.get("id") == pid), None)
+        if not p:
+            raise Stop(f"no project '{pid}' in the tracker. Nothing was published.")
+        env_file = TARGETS / f"{pid}.env"
+        if not env_file.exists():
+            raise Stop(f"{pid} has no Knight target, so there is no build to publish yet. Nothing was published.")
+        m = re.search(r"^KT_SOURCE=(\S+)", env_file.read_text(), re.M)
+        src = Path(m.group(1)) if m and re.fullmatch(r"/[A-Za-z0-9._/-]+", m.group(1)) else None
+        if not src or not (src / ".git").exists():
+            raise Stop(f"{pid}'s target names no checkout to run. Nothing was published.")
+        if (SITE_DIR / name).exists():
+            raise Stop(f"example.com{prefix} is already a page of the site. Pick another path. Nothing was published.")
+        entries = apps()
+        owner = (entries.get(prefix) or {}).get("project")
+        if owner and owner != pid:
+            raise Stop(f"example.com{prefix} is already {owner}'s. Pick another path. Nothing was published.")
+        cmd = run_command(src)
+
+        # 2. Prep.
+        if (src / "prep.sh").is_file():
+            rc, out = run(["./prep.sh"], cwd=src)
+            if rc != 0:
+                raise Stop(f"prep.sh failed, so the app was not started:\n{out[-400:]}")
+            say("📦 Prep ran.")
+
+        # 3. Service.
+        mine = [k for k, v in entries.items() if v.get("project") == pid]
+        port = (entries.get(mine[0]) or {}).get("port") if mine else None
+        if not port:
+            taken = {v.get("port") for v in entries.values()}
+            port = next((q for q in PORTS if q not in taken and not listening(q)), None)
+            if not port:
+                raise Stop("no free port in 8800–8899. Nothing was published.")
+        unit = f"app-{pid}"
+        UNIT_DIR.mkdir(parents=True, exist_ok=True)
+        # NOTHING FROM THE TRACKER GOES IN THIS FILE (review of 2026-10-17): a project name is text anyone
+        # in a channel could set, and a newline in it would be a new directive running as Brad. Only the
+        # validated id, the validated path, the port and a checkout path from the target file appear.
+        # No BASE_PATH either: the site server strips the prefix, so an app that also added it would
+        # double it; X-Forwarded-Prefix tells an app its public prefix if it needs one.
+        # PORT and HOST are also set ON THE COMMAND LINE: systemd lets EnvironmentFile override
+        # Environment=, so a PORT in the project's .env won — the first real publish (2026-10-17) found the
+        # app on :3000 while the check waited on :8800. Set by `env` at exec, they cannot be overridden.
+        # NoNewPrivileges, measured to take effect in a user unit here: the app can never use sudo,
+        # including the operator's password-free helpers. ProtectHome/ReadWritePaths were measured
+        # NOT to take effect in user units on this machine, so they are not listed as if they did.
+        (UNIT_DIR / f"{unit}.service").write_text(f"""# Written by moses-publish — project {pid}, at example.com{prefix}/
+[Unit]
+Description=Moses-published app {pid} at example.com{prefix}
+After=network-online.target
+
+[Service]
+WorkingDirectory={src}
+Environment=PORT={port}
+Environment=HOST=127.0.0.1
+EnvironmentFile=-{src}/.env
+ExecStart=/usr/bin/env PORT={port} HOST=127.0.0.1 {' '.join(shlex.quote(c) for c in cmd)}
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""")
+        run([*SYSTEMCTL, "daemon-reload"])
+        rc, out = run([*SYSTEMCTL, "enable", "--now", f"{unit}.service"])
+        if rc != 0:
+            raise Stop(f"the service did not start: {out[-300:]}")
+        run([*SYSTEMCTL, "restart", f"{unit}.service"])
+        say(f"⚙️ Running as the user service {unit} on 127.0.0.1:{port}.")
+
+        # 4. Local.
+        status = 0
+        for _ in range(int(os.environ.get("MOSES_PUBLISH_WAIT", "60"))):
+            status, _body = get(f"http://127.0.0.1:{port}/", timeout=3)
+            if 0 < status < 500:
+                break
+            time.sleep(1)
+        if not 0 < status < 500:
+            raise Stop(f"the app did not answer on 127.0.0.1:{port} within a minute (last: {status or 'no answer'}). "
+                       f"Nothing public was changed; see journalctl --user -u {unit}.")
+        say(f"✅ It answers locally ({status}).")
+        problem = listener_ok(port, unit) or exposes_secrets(port)
+        if problem:
+            run([*SYSTEMCTL, "disable", "--now", f"{unit}.service"])
+            raise Stop(f"{problem}. The service was stopped; nothing public was changed.")
+        say("🔒 Loopback only, owned by its service, and it does not serve its .env or .git.")
+
+        # 5. Route.
+        entries[prefix] = {"port": port, "project": pid, "since": time.strftime("%Y-%m-%d")}
+        write_apps(entries)
+        say(f"🔀 example.com{prefix}/ now goes to it.")
+
+        # 6. Public.
+        status, body = get(f"{PUBLIC}{prefix}/", timeout=20)
+        public_ok = status == 200
+        if public_ok:
+            say(f"🌐 Live: {PUBLIC}{prefix}/")
+        else:
+            # NOT LIVE IS NOT LIVE (review of 2026-10-17): this used to warn, return 0 and record the
+            # address on the tracker, so nothing ever tried again. The route stays (it is harmless and
+            # the next try reuses it); the tracker is not told it is live; the exit says it failed.
+            say(f"⚠️ The public address answered {status or 'nothing'}, so it is NOT live yet. The route is "
+                "in place; the site server may need the published-apps change, or a restart.")
+
+        # 7. Landings keep it current.
+        live = f"cd {src} && {{ [ ! -x ./prep.sh ] || ./prep.sh; }} && systemctl --user restart {unit}"
+        check = f"{Path(__file__).resolve()} --verify {pid}"
+        if set_live(env_file, live, check):
+            top = Path(run(["git", "-C", str(TARGETS), "rev-parse", "--show-toplevel"])[1])
+            rel = str(env_file.resolve().relative_to(top.resolve()))
+            run(["git", "-C", str(top), "add", "--", rel])
+            rc, out = run(["git", "-C", str(top), "commit", "-q", "-m",
+                           f"Knight target {pid}: landings restart the published app (moses-publish)", "--", rel])
+            say("🔁 Every landing now re-runs prep, restarts the app and checks it is up."
+                if rc == 0 else f"⚠️ The target was updated but not committed: {out[-200:]}")
+
+        # 8. Tracker — only for an address that answered.
+        if not public_ok:
+            return 1
+        try:
+            reg.update(pid, "deploy", f"{PUBLIC}{prefix}/")
+        except Exception as e:                                  # noqa: BLE001
+            say(f"⚠️ Published, but the tracker was not updated: {e}")
+        return 0
+    except Stop as e:
+        print(f"⚠️ {e}", flush=True)
+        if done:
+            print("Done before it stopped:\n" + "\n".join(f"  {x}" for x in done), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

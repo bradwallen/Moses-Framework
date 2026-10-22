@@ -12,6 +12,10 @@
 # API blipped would be the false positive that gets the whole mechanism switched off, so
 # "unverified" is pinned as loudly as "broken".
 set -uo pipefail
+# NO TEST POSTS TO SLACK. Everything this suite runs — and anything those scripts hand off to, like
+# knight-next after a landing — inherits this. test-land once did not, and its scratch target "t1"
+# posted "Stopped" cards into Brad's channel on every run (2026-10-18). test-notify.sh checks every suite.
+export KNIGHT_SLACK_CHANNEL="" KNIGHT_SLACK_ENV=/nonexistent
 cd "$(dirname "$0")"
 pass=0; fail=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$*"; pass=$((pass+1)); }

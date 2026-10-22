@@ -12,6 +12,8 @@
   moses-project promote [<id>] <code|n>              that candidate becomes a milestone
   moses-project unidea [<id>] <code|n>               decided against
   moses-project done [<id>] <code|n> [--undo]
+  moses-project block <id> "<text>"                  something is in the way
+  moses-project unblock <id> <n|text>                it no longer is
   moses-project rm <id>
 
 Every milestone, idea and proposal has a code: the project's letters plus a number that is never
@@ -77,6 +79,10 @@ def main(argv: list[str]) -> int:
             undo = "--undo" in rest
             rest = [r for r in rest if r != "--undo"]
             print(projects.complete_milestone(*_target(rest), undo=undo))
+        elif cmd == "block" and len(rest) >= 2:
+            print(projects.add_blocker(rest[0], " ".join(rest[1:])))
+        elif cmd == "unblock" and len(rest) >= 2:
+            print(projects.remove_blocker(rest[0], " ".join(rest[1:])))
         elif cmd == "rm" and rest:
             p = projects.find(projects.load(), rest[0])
             if input(f"remove '{p['name']}'? [y/N] ").strip().lower() != "y":

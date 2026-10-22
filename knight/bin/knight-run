@@ -112,6 +112,11 @@ else
 fi
 
 commits=$(git -C "$REPO" rev-list --count FETCH_HEAD.."$BRANCH" 2>/dev/null || echo 0)
+CARD="$(dirname "$(readlink -f "$0")")/../lib/card.py"
+if [ "$rc" -eq 0 ] && [ "$commits" -gt 0 ]; then
+    "$CARD" "$DIR" checking "Knight finished ($commits commit(s)); running the checks." \
+        --next "Review, then it lands or waits for you." >/dev/null 2>&1 || true
+fi
 report=$(python3 -c "
 import json
 try: print(json.load(open('$DIR/result.json')).get('result') or '')
@@ -132,30 +137,11 @@ esac
 # merges a branch as this makes before it pushes one. Two copies would drift, and the drift would
 # be invisible until a branch landed that this runner would have blocked.
 source "$(dirname "$0")/../lib/review-verdict.sh"
+source "$(dirname "$0")/../lib/examples.sh"     # Brad's confirmed examples are tests (#3)
 # The stalled-job diagnosis — measured against the real mainline, so a blocked report carries a
 # verdict (re-run vs genuine human merge, with the files) rather than a guess. See the lib's header.
 source "$(dirname "$0")/../lib/diagnose-branch.sh"
 
-# ── Back to whoever asked ────────────────────────────────────────────────────
-# Brad, 2026-09-11, in #the_4_horsemen: "Ping me here when Knight is done." Moses promised it twice
-# and nothing could deliver it — this runner reported to #viatica-dev and nowhere else. Now, when the
-# listener recorded the conversation that started the job (agent/knight_notify.py writes
-# notify.json), the outcome goes back there too: the SAME headline as the full report, so the two can
-# never disagree, and a pointer to it.
-#
-# A FUNCTION so test-notify.sh drives the real payload. Prints nothing when there is nobody to tell,
-# including when the conversation IS the report channel's top level — the report is already there.
-notify_payload() {
-    local nfile=$1 headline=$2 report_chan=$3 job=$4
-    [ -r "$nfile" ] || return 0
-    jq -ce --arg h "$headline" --arg rc "$report_chan" --arg j "$job" '
-        select((.channel // "") != "" and (.channel != $rc or (.thread_ts // "") != ""))
-        | {channel, username: "Knight", icon_emoji: ":crossed_swords:", unfurl_links: false,
-           text: ((if (.user // "") != "" then "<@\(.user)> " else "" end)
-                  + "Knight finished `\($j)`\n\($h)"
-                  + (if $rc != "" and $rc != .channel then "\n_Full report in <#\($rc)>._" else "" end))}
-        + (if (.thread_ts // "") != "" then {thread_ts} else {} end)' "$nfile" 2>/dev/null || true
-}
 
 run_review() {
     # Extracted 2026-09-04 so it can run on BOTH paths. It used to live inside the
@@ -178,7 +164,7 @@ run_review() {
     # A REVIEW THAT COULD NOT RUN BLOCKS. Not "could not look, therefore fine" — that is the
     # failure this whole estate keeps paying for. If the reviewer times out, crashes or
     # returns something unparseable, nothing ships and the report says exactly why.
-    review_ok=1; review_why=""; plausible=""
+    review_ok=1; review_why=""; plausible=""; unchecked=""
     if [ "${regate:-1}" -eq 1 ]; then
         # THREE dots: from the merge-base, i.e. only what this branch changed. Two dots compares the
         # two trees, so on a branch behind the mainline — exactly the failed-rebase case, where this
@@ -234,47 +220,19 @@ except Exception: pass" > "$DIR/review.txt" 2>/dev/null
             [ "${review_noverdict:-0}" -eq 1 ] && review_why="$review_why, even after being asked twice"
         fi
 
-        # ── Zryachiy says it himself, in the channel ──────────────────
-        # His verdict used to reach Brad only as a clause inside Knight's report, which is
-        # the builder announcing his own review. Brad, 2026-09-04: put him in the dev
-        # channel. Posted BEFORE the push, so what the room sees is the decision that gated
-        # it — and a block is visible even though no report follows.
-        ZENV=$MOSES_CONFIG_DIR/knight.env
-        if [ -r "$ZENV" ]; then
-            # shellcheck disable=SC1090
-            ztok=$(. "$ZENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
-            # Overridable so the suite does not post into the real channel — see bin/knight for why
-            # this is an override and not a "do not post" flag.
-            if [ -n "${KNIGHT_SLACK_CHANNEL+x}" ]; then zchan=$KNIGHT_SLACK_CHANNEL; else
-                zchan=$(. "$ZENV"; printf '%s' "${SLACK_KNIGHT_CHANNEL:-}"); fi
-            if [ -n "$ztok" ] && [ -n "$zchan" ]; then
-                if [ "$review_ok" -eq 1 ] && [ -z "$plausible" ]; then
-                    zmsg=":white_check_mark: *clean* — no defects, and it meets what was asked."
-                elif [ "$review_ok" -eq 1 ]; then
-                    zmsg=":warning: *passing, with a note recorded on the commit*
-\`\`\`
-$plausible
-\`\`\`"
-                else
-                    zmsg=":no_entry: *blocked — nothing was pushed*
-$review_why"
-                fi
-                # Say when the verdict is advisory. On a failed rebase nothing lands
-                # regardless, and a green tick with no deploy behind it is exactly the kind
-                # of report that trains people to skim past the ones that mean something.
-                [ "${rebase_failed:-0}" -eq 1 ] && zmsg="$zmsg
-_(advisory — the branch could not be rebased, so nothing lands from this run either way)_"
-                curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
-                    -H "Authorization: Bearer $ztok" \
-                    -H 'Content-type: application/json; charset=utf-8' \
-                    --data "$(jq -n --arg c "$zchan" \
-                                    --arg t "$(printf '_reviewing %s on *%s*_\n%s' "$BRANCH" "$TARGET" "$zmsg")" \
-                                '{channel:$c,text:$t,username:"Zryachiy",icon_emoji:":eye:"}')" \
-                    > "$DIR/zryachiy-slack.json" 2>&1
-                jq -e '.ok == true' "$DIR/zryachiy-slack.json" >/dev/null 2>&1 \
-                    || echo "zryachiy_post=FAILED" >> "$DIR/gate.log"
-            fi
+        # ── The review, as one line on the run's status card ─────────────────
+        # Zryachiy used to post his own message (2026-09-04, "put him in the dev channel"). Brad,
+        # 2026-10-17: too many messages from too many agents, each a black box until the next. His
+        # verdict is now a line on the ONE card the run keeps (lib/card.py), said in plain words.
+        if [ "$review_ok" -eq 1 ] && [ -z "$plausible" ]; then
+            zline="Review: clean — no defects, and it does what was asked."
+        elif [ "$review_ok" -eq 1 ]; then
+            zline="Review: passes, with $(printf '%s\n' "$plausible" | grep -c .) note(s) recorded on the commit."
+        else
+            zline="Review blocked it: $(printf '%s' "$review_why" | head -c 220)"
         fi
+        [ "${rebase_failed:-0}" -eq 1 ] && zline="$zline (advisory — the branch could not be rebased, so nothing lands from this run)"
+        "$(dirname "$(readlink -f "$0")")/../lib/card.py" "$DIR" reviewing "$zline" >/dev/null 2>&1 || true
     fi
 }
 
@@ -290,6 +248,20 @@ else
     # Every command from the target's KT_GATE, in order, first red wins. Named in the failure so the
     # report says which check failed rather than "the gate failed" — Brad reads the report, not the log.
     : > "$DIR/gate.log"
+    # PREP AGAIN WHEN THE JOB CHANGED WHAT PREP INSTALLS. Prep runs before the agent starts, outside
+    # his sandbox, because only it has network. The first GIS job (2026-10-17) wrote a prep.sh that
+    # installs TypeScript, but prep had already run — the placeholder one — so the gate's type check
+    # found no TypeScript, went red, and 901 lines of tested work never reached a branch. Re-run only
+    # when a dependency or setup file changed: Viatica's prep is a full install, and running it on
+    # every job would double the wait for nothing.
+    if git -C "$REPO" diff --name-only "$(git -C "$REPO" merge-base FETCH_HEAD "$BRANCH" 2>/dev/null)" "$BRANCH" 2>/dev/null \
+        | grep -qE '(^|/)(prep\.sh|package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|Pipfile(\.lock)?|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$'; then
+        echo "== prep again: the job changed a dependency or setup file ==" >> "$DIR/gate.log"
+        for step in ${KT_PREP+"${KT_PREP[@]}"}; do
+            ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ) \
+                || echo "== prep step failed: $step (the gate will say what that broke) ==" >> "$DIR/gate.log"
+        done
+    fi
     gate_ok=1
     for step in "${KT_GATE[@]}"; do
         echo "== gate: $step ==" >> "$DIR/gate.log"
@@ -304,6 +276,19 @@ else
             break
         fi
     done
+    # THE CONFIRMED EXAMPLES ARE PART OF THE GATE (#3). Each example Brad agreed to before the build must
+    # be named by a test in the branch; the gate above ran those tests. One with no test is a missed
+    # requirement, so the job is held and knight-next follows it up with this line as what held it.
+    if [ "$gate_ok" -eq 1 ] && [ -s "$DIR/examples.txt" ]; then
+        ex_missing=$(examples_missing "$REPO" "$DIR/examples.txt")
+        if [ -n "$ex_missing" ]; then
+            gate_ok=0
+            gate_why="a confirmed example has no test that names it: $ex_missing"
+            echo "== confirmed examples: NO TEST names: $ex_missing ==" >> "$DIR/gate.log"
+        else
+            echo "== confirmed examples: each one has a test ($(wc -l < "$DIR/examples.txt")) ==" >> "$DIR/gate.log"
+        fi
+    fi
 fi
 
 # ── Push, only on green ──────────────────────────────────────────────────────
@@ -341,6 +326,14 @@ if [ "$gate_ok" -eq 1 ]; then
 
 Review (unconfirmed, recorded rather than blocking):
 $plausible" 2>>"$DIR/gate.log" || true
+                fi
+                # UNCHECKED travels the same way: what the review could not judge from a diff, for
+                # whoever checks the live thing. Recorded, never mistaken for a pass.
+                if [ -n "${unchecked:-}" ]; then
+                    git -C "$REPO" commit -q --amend --no-edit -m "$(git -C "$REPO" log -1 --pretty=%B)
+
+Not checkable from the diff (for whoever checks it live):
+$unchecked" 2>>"$DIR/gate.log" || true
                 fi
                 git -C "$REPO" remote add push-target "$KT_PUSH_REMOTE" 2>/dev/null
                 # WHERE GREEN WORK LANDS — the one difference between the two modes, and it is read
@@ -701,7 +694,14 @@ date +%Y-%m-%dT%H:%M:%S%z > "$DIR/ended"
 # The delivery format Brad already reads from every Viatica push: what shipped, what was decided,
 # what is blocked, what is left. He does not read the diff, so the report IS the deliverable —
 # a vague one is a failed delivery even when the code is fine.
-if [ -r "$OPTENV" ]; then
+# QUIET JOBS (started by knight-next) skip their report ONLY when the outcome is one knight-next
+# speaks for: pushed (it lands it or follows up) or held with work committed (it follows up or asks
+# Brad). EVERY other outcome — failed, timeout, rolled-back, deploy-broken, anything new — is posted
+# as it always was. Review of 2026-10-17: "quiet" had hidden failure, which is never quiet's job.
+_qst=$(cat "$DIR/status" 2>/dev/null)
+_quiet_ok=0
+[ -e "$DIR/quiet" ] && { [ "$_qst" = pushed ] || { [ "$_qst" = done-not-pushed ] && [ "${commits:-0}" -gt 0 ]; }; } && _quiet_ok=1
+if [ -r "$OPTENV" ] && [ "$_quiet_ok" = 0 ]; then
     # shellcheck disable=SC1090
     tok=$(. "$OPTENV"; printf '%s' "${SLACK_BOT_TOKEN:-}")
     # Overridable so the suite does not post into the real channel — see bin/knight for why
@@ -834,27 +834,60 @@ else:
     print(t.strip()[:1500])
 CONV
 )
-        body="$head
+        # THE REPORT GOES UNDER THE RUN'S CARD, as one reply — not as its own channel post, and not a
+        # second post to the conversation that asked (the card lives there). lib/card.py.
+        printf '%s\n\n> %s\n\n%s\n' "$head" "$task" "$slack_report" > "$DIR/report-slack.txt"
+        REPORT_REPLY=(--reply-file "$DIR/report-slack.txt")
+    fi
+fi
 
-> $task
+# ── This job's outcome on the run's status card ─────────────────────────────
+# Every outcome updates the card. It PINGS Brad (a reply under the card; edits notify nobody) only when
+# the outcome is final or needs him — not when knight-next is about to land it or follow it up, since
+# knight-next then says what happened and pings if it comes to that.
+# Whether knight-next runs is decided ONCE, here, and the launch below uses the same answer: when the two
+# were computed separately, a held job with KNIGHT_FIXUP_ROUNDS=0 skipped its ping AND got no knight-next
+# (review, 2026-10-17) — an outcome nobody was told about.
+_fst=$(cat "$DIR/status" 2>/dev/null)
+_held=0
+[ "$_fst" = done-not-pushed ] && [ "${commits:-0}" -gt 0 ] && [ "${KNIGHT_FIXUP_ROUNDS:-2}" -gt 0 ] && _held=1
+_next_will=0
+{ [ "${KT_AUTO_LAND:-0}" = 1 ] && [ "$_fst" = pushed ]; } && _next_will=1
+{ [ "${KT_CONTINUE:-0}" = 1 ] && [ "$_fst" = done-not-pushed ]; } && _next_will=1
+[ "$_held" = 1 ] && _next_will=1
+case "$_fst" in
+    pushed)
+        if [ "$_next_will" = 1 ]; then _cs=landing; _cn="It lands by itself if the project allows it; otherwise it waits for you."
+        else _cs=waiting; _cn="Say \"merge it\" to Moses to land it."; fi ;;
+    live)                  _cs=live;    _cn="Nothing — it is live." ;;
+    awaiting-verification) _cs=live;    _cn="Some requirements need a look on the live site." ;;
+    done-not-pushed)       _cs=stopped
+                           if [ "$_next_will" = 1 ]; then _cn="A follow-up job, or a question for you."
+                           else _cn="It waits for you: tell Moses what to do with it."; fi ;;
+    *)                     _cs=failed;  _cn="Tell Moses what to do." ;;
+esac
+_cping=(); [ "$_next_will" = 0 ] && _cping=(--ping)
+"$CARD" "$DIR" "$_cs" "$(printf '%s' "${head:-$_fst}" | head -1 | cut -c1-300)" --next "$_cn" \
+    "${_cping[@]}" ${REPORT_REPLY+"${REPORT_REPLY[@]}"} >/dev/null 2>&1 || true
 
-$slack_report"
-        curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
-            -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
-            --data "$(jq -nc --arg c "$chan" --arg t "$body" \
-                '{channel:$c,text:$t,username:"Knight",icon_emoji:":crossed_swords:"}')" \
-            > "$DIR/slack.json" 2>&1
-        jq -e '.ok == true' "$DIR/slack.json" >/dev/null 2>&1 || echo "slack_post=FAILED" >> "$DIR/summary"
-
-        # And to the conversation that asked, when there was one. Inside this block on purpose: the
-        # suites empty the channel to post nowhere, and that must silence this too.
-        npay=$(notify_payload "$DIR/notify.json" "$head" "$chan" "$(basename "$DIR")")
-        if [ -n "$npay" ]; then
-            curl -sS --max-time 15 -X POST https://slack.com/api/chat.postMessage \
-                -H "Authorization: Bearer $tok" -H 'Content-type: application/json; charset=utf-8' \
-                --data "$npay" > "$DIR/notify-slack.json" 2>&1
-            jq -e '.ok == true' "$DIR/notify-slack.json" >/dev/null 2>&1 \
-                || echo "notify_post=FAILED" >> "$DIR/summary"
-        fi
+# ── What happens next (Brad, 2026-10-17: "build away") ───────────────────────
+# A project started with his one-time code carries KT_AUTO_LAND; knight-next decides whether this job
+# lands by itself and, after a landing, briefs the next one. DETACHED, as its own transient unit: this
+# run is still the job's process, and Knight runs one job at a time, so the next job must not be its
+# child. Every override this script was given is handed over, because a transient unit starts clean.
+# done-not-pushed too, when the project keeps building: that is how a job that found the scope
+# already covered (SCOPE COMPLETE, nothing changed) ends, and the run of jobs should say it finished.
+# And a HELD job, on any target: built and committed but stopped by its gate or its review. knight-next
+# turns that into a follow-up job (KNIGHT_FIXUP_ROUNDS, default 2) instead of a wait for Brad.
+if [ "$_next_will" = 1 ]; then
+    nxenv=(--setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}")
+    for v in KNIGHT_HOME KNIGHT_JOBS KNIGHT_TARGETS KNIGHT_LAND_LOG KNIGHT_SLACK_ENV KNIGHT_SLACK_CHANNEL KNIGHT_MFA_CMD MOSES_REGISTRY KNIGHT_START_BIN KNIGHT_LAND_BIN MOSES_MCP_DIR MOSES_PUBLISH_BIN KNIGHT_GLANCE_BIN KNIGHT_LIVE_PROBE KNIGHT_NOTES_DIR KNIGHT_DONE_CHECK_SEC MOSES_STATE; do
+        [ -n "${!v+x}" ] && nxenv+=(--setenv="$v=${!v}")
+    done
+    nxbin="$(dirname "$(readlink -f "$0")")/knight-next"
+    if ! { command -v systemd-run >/dev/null 2>&1 \
+           && systemd-run --user --collect --quiet --unit="knight-next-$(basename "$DIR")" "${nxenv[@]}" \
+                "$nxbin" "$(basename "$DIR")" 2>>"$DIR/next.log"; }; then
+        setsid "$nxbin" "$(basename "$DIR")" >> "$DIR/next.log" 2>&1 < /dev/null &
     fi
 fi

@@ -50,6 +50,19 @@ record() {
 # Posts to the conversation that asked (notify.json, written by the listener) and, failing that, to
 # Knight's own channel. Same two destinations knight-run uses, for the same reason: the person who
 # said "merge it" should not have to go and look somewhere else for the answer.
+# Every outcome is a line on the run's status card (lib/card.py); failures ping Brad. The old post
+# stays as the fallback when the card cannot run.
+card_or_say() {  # card_or_say <stage> <ping 0|1> <card line> <fallback text>
+    local extra=(); [ "$2" = 1 ] && extra+=(--ping)
+    # The card's "Next" moves too: a live card still read "Say \"merge it\" to Moses" (2026-10-18).
+    case "$1" in
+        live)   extra+=(--next "Nothing — it is live.") ;;
+        failed) extra+=(--next "Tell Moses what to do about it.") ;;
+    esac
+    if [ -x "$KNIGHT/lib/card.py" ]; then "$KNIGHT/lib/card.py" "$DIR" "$1" "$3" "${extra[@]}" >/dev/null 2>&1 || slack_say "$4"
+    else slack_say "$4"; fi
+}
+
 slack_say() {
     local text=$1 tok chan thread
     [ -r "$OPTENV" ] || return 0
@@ -95,7 +108,7 @@ fi
 
 if ! out=$(eval "$KT_LIVE_CMD" 2>&1); then
     record "merged-not-live" "$out"
-    slack_say ":warning: *Merged, but NOT live* · \`$BRANCH\`
+    card_or_say failed 1 "Merged, but making it live failed — the running copy is still the old code: $(printf '%s' "$out" | head -1 | cut -c1-160)" ":warning: *Merged, but NOT live* · \`$BRANCH\`
 The merge is in \`${KT_BRANCH:-main}\`, but making it live failed, so the running copy is still the old code.
 \`\`\`
 $(printf '%s' "$out" | head -5)
@@ -109,7 +122,7 @@ if [ -n "$KT_LIVE_CHECK" ]; then
     sleep 3
     if ! out=$(eval "$KT_LIVE_CHECK" 2>&1); then
         record "restarted-not-up" "$out"
-        slack_say ":rotating_light: *Restarted, and it did not come back* · \`$BRANCH\`
+        card_or_say failed 1 "Merged and restarted, but it did not come back up: $(printf '%s' "$out" | head -1 | cut -c1-160)" ":rotating_light: *Restarted, and it did not come back* · \`$BRANCH\`
 Merged into \`${KT_BRANCH:-main}\`${SHA:+ (\`$SHA\`)} and restarted, but the service is not up. This needs a person.
 \`\`\`
 $(printf '%s' "$out" | head -5)
@@ -119,6 +132,8 @@ $(printf '%s' "$out" | head -5)
 fi
 
 record "landed" "live ${SHA}"
-slack_say ":white_check_mark: *Landed and live* · \`$BRANCH\`
+# A job from a quiet run (knight-next started it) is not announced on success — the run ends in one
+# message. Failure above is always said.
+card_or_say live 0 "Merged${SHA:+ (\`$SHA\`)}, restarted, and confirmed up." ":white_check_mark: *Landed and live* · \`$BRANCH\`
 Merged into \`${KT_BRANCH:-main}\`${SHA:+ · \`$SHA\`}, restarted, and confirmed up."
 exit 0

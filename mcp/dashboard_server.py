@@ -531,6 +531,62 @@ def _board_html(cols: dict) -> str:
     return "".join(out)
 
 
+# WHAT KNIGHT IS DOING, ON THE PROJECT (#1, 2026-10-18). Brad: "There's no real way for me to know
+# the status of what's being built." Every run keeps one status card (knight/lib/card.py), saved as
+# card.json in the run's first job; the newest one for a project, if it moved in the last week, is its
+# line here — the same words as the Slack card, read from the same file, so the two cannot disagree.
+KNIGHT_JOBS = _pl.Path(os.environ.get("KNIGHT_JOBS", str(_env.ROOT / "knight" / "jobs")))
+RUN_FRESH = 7 * 24 * 3600
+try:
+    sys.path.insert(0, str(_env.ROOT / "knight" / "lib"))
+    import card as _card_mod                                       # noqa: E402 — the stage names, one copy
+    RUN_STAGES = _card_mod.STAGES
+except Exception:                                                  # noqa: BLE001 — a label is not worth a 500
+    RUN_STAGES = {}
+
+
+_RUN_INDEX = {"at": 0.0, "by": {}}
+
+
+def _run_index() -> dict:
+    """target → its newest fresh card.json. ONE pass over the job directories, reused for a few seconds,
+    so a page with sixteen projects reads them once rather than twice per project."""
+    now = time.time()
+    if now - _RUN_INDEX["at"] < 5:
+        return _RUN_INDEX["by"]
+    by: dict = {}
+    try:
+        for f in KNIGHT_JOBS.glob("*/card.json"):
+            try:
+                m = f.stat().st_mtime
+                if now - m > RUN_FRESH:
+                    continue
+                t = (f.parent / "target").read_text().strip()
+            except OSError:
+                continue
+            if t not in by or m > by[t][0]:
+                by[t] = (m, f)
+    except OSError:
+        pass
+    _RUN_INDEX.update(at=now, by=by)
+    return by
+
+
+def run_status(pid: str) -> dict | None:
+    best = _run_index().get(pid)
+    if not best:
+        return None
+    try:
+        c = json.loads(best[1].read_text())
+    except (OSError, ValueError):
+        return None
+    lines = c.get("lines") or []
+    return {"stage": RUN_STAGES.get(c.get("stage", ""), c.get("stage", "")),
+            "when": datetime.fromtimestamp(best[0]).strftime("%a %H:%M"),
+            "line": lines[-1][1] if lines and len(lines[-1]) > 1 else "", "next": c.get("next", ""),
+            "title": c.get("title", "")}
+
+
 def _summary_html(p: dict, cols: dict) -> str:
     """The always-visible line. Must say enough that collapsing it loses nothing important."""
     ms = p.get("milestones") or []
@@ -554,6 +610,9 @@ def _summary_html(p: dict, cols: dict) -> str:
         live = live_state.summary()
         if live:
             bits.append(f'<span class="live">{_esc(live)}</span>')
+    run = run_status(p.get("id", ""))
+    if run:
+        bits.append(f'<span class="chip run" title="{_esc(run["title"])}">Knight: {_esc(run["stage"])} · {_esc(run["when"])}</span>')
     left = _days(p.get("target", ""))
     if left is not None:
         cls = "over" if left < 0 else "soon" if left <= 7 else ""
@@ -573,6 +632,11 @@ def _project_block(p: dict) -> str:
     inner = _board_html(cols)
     for b in p.get("blockers") or []:
         inner += f'<p class="blocked">⚠ Blocked: {_esc(b)}</p>'
+    run = run_status(p.get("id", ""))
+    if run:
+        inner += (f'<p class="meta run"><b>Knight now:</b> {_esc(run["stage"])} · {_esc(run["when"])}'
+                  f'{" — " + _esc(run["line"]) if run["line"] else ""}'
+                  f'{"<br><b>Then:</b> " + _esc(run["next"]) if run["next"] else ""}</p>')
     if p.get("next"):
         inner += f'<p class="meta"><b>Next:</b> {_esc(p["next"])}</p>'
     # The id is what lets an in-place update put back what was open — see shell().

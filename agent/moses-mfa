@@ -1,0 +1,408 @@
+#!/usr/bin/python3 -I
+"""moses-mfa — the one-time code that authorizes a brand-new build. Root-owned, sudo-invoked.
+
+    sudo moses-mfa challenge new-build <project>     open the one challenge; prints JSON
+    printf %s 123456 | sudo moses-mfa verify <id> [--who <label>]
+                                                     the code is read from STDIN, never argv
+    sudo moses-mfa authorized new-build <project>    exit 0 + the authorization id if one is waiting
+    sudo moses-mfa consume <authorization-id>        the build used it; it cannot be used again
+    sudo moses-mfa status                            enrolled? locked? an open challenge?
+    sudo moses-mfa enroll [--rotate]                 make the seed; the operator, with a password
+
+WHY (Brad, 2026-10-16, #14): "once I provide the green light for a project to be built from the
+Projects tracker Moses should then prompt me for an MFA code and once I provide the code that should
+unlock Moses/Knight to create a new directory for the project". Creating a Knight target is what
+opens a repository to an unattended builder, so it is the thing that takes a code. Editing an
+existing target does not (Brad's call, same night). agent/docs/ARCHITECTURE.md §5b has the flow.
+
+WHY ROOT HOLDS EVERYTHING. The listener and every agent run as the operator. If the challenge's
+purpose lived in a file the operator can write, a process could swap the project between Brad
+reading the prompt and typing the code. So the purpose, the seed, the replay counter and the ledger
+all live where only root writes, and this file is stdlib-only and installed root-owned (§7b: root
+runs nothing the operator can write). `-I` on the shebang keeps a planted json.py beside the script
+or in the cwd from being imported.
+
+THE OVERRIDES ARE FOR TESTS AND ARE IGNORED AS ROOT. MOSES_MFA_SEED, MOSES_MFA_STATE,
+MOSES_MFA_NOW and MOSES_MFA_PAUSE let mfa_test.py run THIS script against a scratch directory. Honored as root, they
+would let a sudo caller point verify at a seed they made themselves, so as root the paths are fixed.
+
+THE CODE NEVER TOUCHES ARGV OR A LOG. sudo writes the command line to the auth log and argv is
+readable in `ps` while this runs. The code arrives on stdin, is compared in constant time, and no
+output or ledger row ever contains it. The seed is printed once, at enrollment, to the terminal of
+the person enrolling.
+
+Exit codes: 0 done · 1 refused (and why, on stderr) · 2 COULD NOT CHECK — no seed, unreadable state.
+"Could not check" is never reported as "checked and refused", and never as success.
+"""
+import base64
+import fcntl
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import struct
+import sys
+import time
+
+STEP = 30                     # RFC 6238 time step, seconds
+DIGITS = 6
+WINDOW = 1                    # accept the step before and after: a phone a few seconds off still works
+CHALLENGE_TTL = 300           # a challenge is answerable for 5 minutes
+TRIES = 3                     # wrong codes before a challenge is dead
+LOCK_FAILS = 5                # failures across all challenges, within LOCK_SPAN, that lock verify…
+LOCK_SPAN = 86400             # …for this long. 5 guesses a day ≈ 0.55% a year of nonstop guessing.
+AUTH_TTL = 1800               # a verified authorization must be used within 30 minutes
+KINDS = ("new-build",)        # what a code can authorize. Nothing else exists.
+NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")   # a tracker project id; also a directory name
+
+ROOT = os.geteuid() == 0
+SEED = "/etc/moses/mfa/totp.seed"
+STATE = "/var/lib/moses/mfa"
+if not ROOT:
+    SEED = os.environ.get("MOSES_MFA_SEED", SEED)
+    STATE = os.environ.get("MOSES_MFA_STATE", STATE)
+STATE_FILE = os.path.join(STATE, "state.json")
+LEDGER = os.path.join(STATE, "audit.jsonl")
+LOCK = os.path.join(STATE, ".lock")
+
+
+def now() -> float:
+    if not ROOT and os.environ.get("MOSES_MFA_NOW"):
+        return float(os.environ["MOSES_MFA_NOW"])
+    return time.time()
+
+
+def iso(t: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
+
+
+def caller() -> str:
+    return os.environ.get("SUDO_USER") or (os.environ.get("USER") or str(os.getuid()))
+
+
+class Refused(Exception):
+    pass
+
+
+class CouldNotCheck(Exception):
+    pass
+
+
+# ── TOTP (RFC 6238 over RFC 4226), stdlib only ───────────────────────────────
+def hotp(key: bytes, counter: int) -> str:
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    off = mac[-1] & 0x0F
+    n = (struct.unpack(">I", mac[off:off + 4])[0] & 0x7FFFFFFF) % (10 ** DIGITS)
+    return str(n).zfill(DIGITS)
+
+
+def b32decode(s: str) -> bytes:
+    s = re.sub(r"\s", "", s).upper()
+    return base64.b32decode(s + "=" * (-len(s) % 8))
+
+
+def read_seed() -> bytes:
+    try:
+        with open(SEED) as f:
+            key = b32decode(f.read())
+    except FileNotFoundError:
+        raise CouldNotCheck(f"no seed at {SEED} — not enrolled. Nothing was checked; run `sudo moses-mfa enroll`.")
+    except (OSError, ValueError) as e:
+        raise CouldNotCheck(f"cannot read the seed at {SEED} ({e.__class__.__name__}). Nothing was checked.")
+    if len(key) < 16:
+        raise CouldNotCheck(f"the seed at {SEED} is too short to trust. Nothing was checked.")
+    return key
+
+
+def match_counter(key: bytes, code: str, t: float) -> int | None:
+    """The time step the code belongs to, or None. Every step in the window is compared, so how long
+    this takes does not say which one matched."""
+    base = int(t // STEP)
+    found = None
+    for c in range(base - WINDOW, base + WINDOW + 1):
+        if hmac.compare_digest(hotp(key, c), code) and found is None:
+            found = c
+    return found
+
+
+# ── State: one JSON file, rewritten whole, under a lock ──────────────────────
+# A lock rather than hope: two verifies racing on the same code would each read the old replay
+# counter and both pass.
+class Store:
+    def __enter__(self):
+        try:
+            os.makedirs(STATE, exist_ok=True)
+            os.chmod(STATE, 0o755)            # the umask is 077; the ledger in here is meant to be readable
+            self.lock = open(LOCK, "a")
+        except OSError as e:
+            raise CouldNotCheck(f"cannot open the state at {STATE} ({e.strerror}). Nothing was checked; run me with sudo.")
+        fcntl.flock(self.lock, fcntl.LOCK_EX)
+        try:
+            with open(STATE_FILE) as f:
+                self.d = json.load(f)
+        except FileNotFoundError:
+            self.d = {}
+        except (OSError, ValueError) as e:
+            raise CouldNotCheck(f"cannot read {STATE_FILE} ({e.__class__.__name__}). Nothing was checked.")
+        self.d.setdefault("last_counter", -1)
+        self.d.setdefault("failures", [])
+        self.d.setdefault("locked_until", 0)
+        self.d.setdefault("challenge", None)
+        self.d.setdefault("authorizations", [])
+        # TESTS ONLY, and never as root: hold the state open so racing callers really do overlap. Without
+        # it, four processes almost never meet inside this window and a missing lock passes by luck.
+        if not ROOT and os.environ.get("MOSES_MFA_PAUSE"):
+            time.sleep(float(os.environ["MOSES_MFA_PAUSE"]))
+        return self
+
+    def save(self):
+        # One temp file per process. A shared name made racing writers crash each other, which hid a
+        # missing lock: safe by accident is not safe. The lock is what serializes writers.
+        tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(self.d, f, indent=1)
+        os.replace(tmp, STATE_FILE)
+
+    def __exit__(self, *exc):
+        self.lock.close()
+        return False
+
+
+def record(op: str, outcome: str, **fields) -> None:
+    """Every attempt, allowed or refused. Readable by anyone (0644), writable by root alone. The code
+    and the seed are never among the fields; callers pass neither."""
+    row = {"at": iso(now()), "by": caller(), "op": op, "outcome": outcome, **fields}
+    try:
+        fd = os.open(LEDGER, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        os.fchmod(fd, 0o644)                  # the umask would have made it 0600
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps(row) + "\n")
+    except OSError as e:
+        # The ledger is part of the control. If it cannot be written, say so — never carry on quietly.
+        raise CouldNotCheck(f"cannot write the audit ledger at {LEDGER} ({e.strerror}).")
+
+
+def purpose_of(kind: str, name: str) -> str:
+    if kind not in KINDS:
+        raise Refused(f"'{kind}' is not something a code can authorize. Have: {', '.join(KINDS)}")
+    if not NAME.match(name or ""):
+        raise Refused(f"'{name}' is not a project id (lowercase letters, digits and dashes)")
+    return f"{kind}:{name}"
+
+
+def check_lock(s: Store, t: float) -> None:
+    if s.d["locked_until"] > t:
+        raise Refused(f"locked after {LOCK_FAILS} wrong codes — verify reopens at {iso(s.d['locked_until'])}. "
+                      "Every attempt is in the audit ledger.")
+
+
+def fail(s: Store, t: float) -> None:
+    s.d["failures"] = [f for f in s.d["failures"] if f > t - LOCK_SPAN] + [t]
+    if len(s.d["failures"]) >= LOCK_FAILS:
+        s.d["locked_until"] = t + LOCK_SPAN
+        s.d["failures"] = []
+        s.d["challenge"] = None
+
+
+# ── Operations ───────────────────────────────────────────────────────────────
+def op_challenge(args: list[str]) -> int:
+    if len(args) != 2:
+        raise Refused("usage: moses-mfa challenge new-build <project>")
+    purpose = purpose_of(*args)
+    read_seed()                                   # no seed, no challenge: Brad would be asked for nothing
+    t = now()
+    with Store() as s:
+        check_lock(s, t)
+        old = s.d["challenge"]
+        # ONE OPEN CHALLENGE, AND IT CANNOT BE SWAPPED. If a new one replaced it, a second request
+        # arriving while Brad reads the first ("build #13", then anyone's "build #20") would make his
+        # code authorize the project he did NOT read. The same project may be asked again (a new id,
+        # a fresh five minutes); a different one waits until this one is answered or expires.
+        if old and old["expires"] > t:
+            if old["purpose"] != purpose:
+                record("challenge", "refused", purpose=purpose, detail=f"{old['purpose']} is still open")
+                raise Refused(f"a code request for {old['purpose']} is still open until {iso(old['expires'])}. "
+                              "Answer it, or let it expire, before asking for another.")
+            record("challenge", "superseded", challenge=old["id"], purpose=old["purpose"])
+        c = {"id": secrets.token_hex(4), "purpose": purpose, "opened": t, "expires": t + CHALLENGE_TTL, "tries": 0}
+        s.d["challenge"] = c
+        s.save()
+        record("challenge", "opened", challenge=c["id"], purpose=purpose)
+    print(json.dumps({"challenge": c["id"], "purpose": purpose, "expires": iso(c["expires"])}))
+    return 0
+
+
+def op_verify(args: list[str]) -> int:
+    who = ""
+    if "--who" in args:
+        i = args.index("--who")
+        who = (args[i + 1] if i + 1 < len(args) else "")[:80]
+        args = args[:i] + args[i + 2:]
+    if len(args) != 1:
+        raise Refused("usage: printf %s <code> | moses-mfa verify <challenge> [--who <label>]")
+    cid = args[0]
+    code = sys.stdin.read(64).strip()
+    key = read_seed()
+    t = now()
+    with Store() as s:
+        check_lock(s, t)
+        c = s.d["challenge"]
+        if not c or c["id"] != cid:
+            record("verify", "refused", challenge=cid, who=who, detail="no such open challenge")
+            raise Refused(f"no open challenge '{cid}' — it was answered, superseded, or never opened.")
+        if c["expires"] <= t:
+            s.d["challenge"] = None
+            s.save()
+            # The code is not even compared: an expired challenge answers nothing, right or wrong.
+            record("verify", "refused", challenge=cid, purpose=c["purpose"], who=who, detail="expired")
+            raise Refused(f"challenge '{cid}' expired at {iso(c['expires'])}. Ask again for a new one.")
+        counter = match_counter(key, code, t) if re.fullmatch(r"[0-9]{%d}" % DIGITS, code) else None
+        if counter is not None and counter <= s.d["last_counter"]:
+            detail = "code already used"          # a replay: right code, spent time step
+            counter = None
+        else:
+            detail = "wrong code"
+        if counter is None:
+            c["tries"] += 1
+            left = TRIES - c["tries"]
+            if left <= 0:
+                s.d["challenge"] = None
+            fail(s, t)
+            s.save()
+            locked = s.d["locked_until"] > t
+            record("verify", "refused", challenge=cid, purpose=c["purpose"], who=who, detail=detail,
+                   tries=c["tries"], locked=locked)
+            if locked:
+                raise Refused(f"{detail}. That is {LOCK_FAILS} wrong codes in a day — verify is locked until "
+                              f"{iso(s.d['locked_until'])}.")
+            raise Refused(f"{detail}. " + (f"{left} tr{'y' if left == 1 else 'ies'} left on this challenge."
+                                            if left > 0 else "That was the last try; the challenge is closed."))
+        a = {"id": secrets.token_hex(6), "purpose": c["purpose"], "challenge": cid, "at": t,
+             "expires": t + AUTH_TTL, "consumed": None, "who": who}
+        s.d["last_counter"] = counter
+        s.d["challenge"] = None
+        s.d["failures"] = []
+        s.d["authorizations"] = [x for x in s.d["authorizations"] if x["expires"] > t - 30 * 86400] + [a]
+        s.save()
+        record("verify", "authorized", challenge=cid, purpose=a["purpose"], authorization=a["id"], who=who)
+    print(json.dumps({"authorized": a["purpose"], "authorization": a["id"], "expires": iso(a["expires"])}))
+    return 0
+
+
+def op_authorized(args: list[str]) -> int:
+    if len(args) != 2:
+        raise Refused("usage: moses-mfa authorized new-build <project>")
+    purpose = purpose_of(*args)
+    t = now()
+    with Store() as s:
+        live = [a for a in s.d["authorizations"]
+                if a["purpose"] == purpose and not a["consumed"] and a["expires"] > t]
+    if not live:
+        print(f"no unused authorization for {purpose}", file=sys.stderr)
+        return 1
+    print(live[-1]["id"])
+    return 0
+
+
+def op_consume(args: list[str]) -> int:
+    if len(args) != 1:
+        raise Refused("usage: moses-mfa consume <authorization>")
+    t = now()
+    with Store() as s:
+        a = next((x for x in s.d["authorizations"] if x["id"] == args[0]), None)
+        if not a or a["consumed"] or a["expires"] <= t:
+            why = "no such authorization" if not a else ("already used" if a["consumed"] else "expired")
+            record("consume", "refused", authorization=args[0], detail=why)
+            raise Refused(f"authorization '{args[0]}': {why}.")
+        a["consumed"] = t
+        s.save()
+        record("consume", "consumed", authorization=a["id"], purpose=a["purpose"])
+    print(a["purpose"])
+    return 0
+
+
+def op_status(args: list[str]) -> int:
+    t = now()
+    try:
+        read_seed()
+        enrolled = True
+    except CouldNotCheck:
+        enrolled = False
+    with Store() as s:
+        c = s.d["challenge"] if s.d["challenge"] and s.d["challenge"]["expires"] > t else None
+        out = {"enrolled": enrolled,
+               "locked_until": iso(s.d["locked_until"]) if s.d["locked_until"] > t else None,
+               "failures_today": len([f for f in s.d["failures"] if f > t - LOCK_SPAN]),
+               "open_challenge": {"id": c["id"], "purpose": c["purpose"], "expires": iso(c["expires"])} if c else None,
+               "waiting": [a["purpose"] for a in s.d["authorizations"] if not a["consumed"] and a["expires"] > t]}
+    print(json.dumps(out))
+    return 0
+
+
+def op_enroll(args: list[str]) -> int:
+    """Make the seed, show it ONCE, and keep it only after a code from the new seed checks out —
+    so a mistyped scan never becomes a seed nobody's phone can answer."""
+    if os.path.exists(SEED) and "--rotate" not in args:
+        raise Refused(f"already enrolled ({SEED}). `--rotate` replaces the seed; the old phone entry stops working.")
+    key = secrets.token_bytes(20)
+    secret = base64.b32encode(key).decode().rstrip("=")
+    uri = f"otpauth://totp/Moses:new-builds?secret={secret}&issuer=Moses&algorithm=SHA1&digits={DIGITS}&period={STEP}"
+    print("Add this to your authenticator app (scan the QR, or type the secret):\n", flush=True)
+    # The QR comes from /usr/bin/qrencode by absolute path (root runs nothing the operator can write),
+    # with the URI on STDIN: as an argument, the secret would be readable in `ps` while it draws.
+    if os.path.exists("/usr/bin/qrencode"):
+        try:
+            import subprocess
+            subprocess.run(["/usr/bin/qrencode", "-t", "ANSIUTF8"], input=uri, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    print(f"  secret: {secret}\n  uri:    {uri}\n", flush=True)
+    prompt = "Code from the app, to confirm: "
+    code = (getpass.getpass(prompt) if sys.stdin.isatty() else (print(prompt, flush=True) or sys.stdin.readline())).strip()
+    t = now()
+    if not re.fullmatch(r"[0-9]{%d}" % DIGITS, code) or match_counter(key, code, t) is None:
+        with Store():
+            record("enroll", "refused", detail="confirmation code did not match; nothing was saved")
+        raise Refused("that code does not match the new seed. Nothing was saved; run enroll again.")
+    os.makedirs(os.path.dirname(SEED), mode=0o700, exist_ok=True)
+    tmp = SEED + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(secret + "\n")
+    os.replace(tmp, SEED)
+    with Store() as s:
+        # A new seed starts a new count. The confirmation code is spent, so it cannot authorize anything.
+        s.d.update(last_counter=match_counter(key, code, t), failures=[], locked_until=0, challenge=None)
+        s.save()
+        record("enroll", "rotated" if "--rotate" in args else "enrolled")
+    print("Enrolled. Codes from this app now authorize new builds.")
+    return 0
+
+
+OPS = {"challenge": op_challenge, "verify": op_verify, "authorized": op_authorized,
+       "consume": op_consume, "status": op_status, "enroll": op_enroll}
+
+
+def main(argv: list[str]) -> int:
+    os.umask(0o077)
+    op, args = (argv[0] if argv else ""), argv[1:]
+    fn = OPS.get(op)
+    if not fn:
+        print(f"moses-mfa: unknown op '{op}'. Have: {', '.join(OPS)}", file=sys.stderr)
+        return 1
+    try:
+        return fn(args)
+    except Refused as e:
+        print(f"moses-mfa: {e}", file=sys.stderr)
+        return 1
+    except CouldNotCheck as e:
+        print(f"moses-mfa: COULD NOT CHECK — {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
