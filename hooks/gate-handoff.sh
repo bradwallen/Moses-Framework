@@ -170,7 +170,6 @@ HANDOFF = [
     # case of `sudo /usr/local/bin/...` or `sudo /opt/...`, so a real handoff walked through it.
     r"\bsudo\s+/[a-z]",
     r"\b(go|head) to\b.*\b(dashboard|console|settings)\b",
-    r"\b(in|open)\b.*\b(Railway|Cloudflare|Anthropic|Resend|Stripe|Zero Trust|GitHub|Vercel|Hostinger)\b.*\b(dashboard|console|settings|panel)\b",
     # A UI PATH IS A HANDOFF even with no verb in front of it. On 2026-08-15 this gate let through
     # "Two minutes in Settings → Branches → add a rule for master" — no "go to", no "click", and
     # GitHub was not in the vendor list above, so nothing matched and Brad was sent to configure a
@@ -178,14 +177,70 @@ HANDOFF = [
     # (c) was unnecessary, because the same guarantee was reachable from a file already in the repo.
     # The arrow is the tell: it only ever appears when describing somebody else's console.
     r"(?:^|\s)(Settings|Preferences|Dashboard|Console)\s*(?:→|->|›|»|>)\s*\w",
-    # Naming a vendor's settings area at all, however politely it is phrased.
-    r"\b(GitHub|Railway|Cloudflare|Anthropic|Resend|Stripe|Vercel|Hostinger)\b[^.\n]{0,40}\b(repo|repository|branch|account|project)?\s*settings\b",
+    # Naming a vendor's settings area at all, however politely it is phrased. The possessive form
+    # ("Railway's settings") is in ADDRESSED below: it is how a report describes the vendor's state.
+    r"\b(GitHub|Railway|Cloudflare|Anthropic|Resend|Stripe|Vercel|Hostinger)\b(?!['’]s\b)[^.\n]{0,40}\b(repo|repository|branch|account|project)?\s*settings\b",
     r"\bclick\b.*\b(save|create|add|connect|generate)\b",
     r"\bpaste\b.*\b(token|key|secret|value)\b",
     r"\brun (this|the following|it) (command|script)\b",
     r"\bcan you (check|confirm|verify|look)\b",
-    r"\b(check|confirm) (whether|that|if)\b.*\b(dashboard|console|Railway|Cloudflare|Resend)\b",
+    # Bounded to one clause. Unbounded, "confirm that one in the build log, because I can't read
+    # Railway's logs" matched on the vendor named in the REASON (2026-10-29).
+    r"\b(check|confirm) (whether|that|if)\b[^.,;:\n]*\b(dashboard|console|Railway|Cloudflare|Resend)\b",
 ]
+
+# A PLACE NAMED IS NOT A PLACE SENT TO. These name a vendor's dashboard, its settings or a menu path,
+# with no verb of their own. On 2026-10-29 the first two blocked seven replies in one session that asked for nothing:
+# "Railway's own settings now have the test gate", "the log in Railway's dashboard is the only direct
+# proof". A report describes where things live as often as an ask sends someone there. So these count
+# only when a sentence the match touches is aimed at the operator: it says "you", or one of its clauses
+# opens with an imperative. "In Railway's dashboard, add the variable" still blocks; the reports pass.
+ADDRESSED = [
+    r"\b(in|open)\b.*\b(Railway|Cloudflare|Anthropic|Resend|Stripe|Zero Trust|GitHub|Vercel|Hostinger)\b.*\b(dashboard|console|settings|panel)\b",
+    r"\b(GitHub|Railway|Cloudflare|Anthropic|Resend|Stripe|Vercel|Hostinger)['’]s\b[^.\n]{0,40}\bsettings\b",
+    # The ask that started this gate: "in Railway, confirm the variable is spelled ...". Until
+    # 2026-10-29 it was caught only by accident ("check that settles it: in Railway" read as a verb),
+    # and bounding that rule to one clause exposed it. This is the shape itself: the vendor as a
+    # lead-in, comma, then the step. It also caught "In Railway, open the bucket's Credentials tab and
+    # copy the new keys", which the old rules missed. Without the comma it fired on a lesson in a
+    # report ("check what in Cloudflare still points at it").
+    r"\bin\s+(?:the\s+)?(Railway|Cloudflare|Anthropic|Resend|Stripe|Zero Trust|GitHub|Vercel|Hostinger)\s*,",
+    # A menu path of two or more steps, whatever it starts with. A full Cloudflare walkthrough
+    # ("In Access controls → MCP Portals → MCP servers tab, delete moses") matched no rule on its
+    # merits; the old gate caught it only because "check that ... Cloudflare" ran across a full stop.
+    r"(?:→|›|»)[^\n→›».]{1,40}(?:→|›|»)",
+]
+IMPERATIVE = set("""open go head visit navigate log sign click tap select choose pick set change add remove
+delete flip toggle turn enable disable update edit paste copy enter type fill create generate rotate
+check confirm verify look find make put switch save connect approve review read watch run install
+restart deploy push grant revoke allow""".split())
+LEAD = re.compile(r"^[\s\-•>#\d.)\]]*(?:(?:then|now|next|first|finally|just|also|and|so|but|please)\b[\s,]*)*", re.I)
+
+def aimed_at_operator(sentence):
+    if re.search(r"\byou\b", sentence, re.I):
+        return True
+    for clause in re.split(r"[,;:—–]", sentence):
+        words = LEAD.sub("", clause.replace("*", "")).split()
+        if words and words[0].lower() in IMPERATIVE:
+            return True
+    return False
+
+def addressed_match(pat, s):
+    m = re.search(pat, s, re.I)
+    if not m:
+        return False
+    # Every sentence the match touches, so an ask split as "Open Stripe. Then flip ..." still counts.
+    start = max(s.rfind("\n", 0, m.start()), *(s.rfind(p, 0, m.start()) for p in (". ", "! ", "? ")))
+    ends = [i for i in (s.find(c, m.end()) for c in ("\n", ". ", "! ", "? ")) if i >= 0]
+    span = s[start + 1:min(ends) + 1 if ends else len(s)]
+    return any(aimed_at_operator(x) for x in re.split(r"(?<=[.!?])\s+", span))
+
+# A FENCED BLOCK IS NOT PROSE. Output pasted as evidence, a diff, or a prompt for another session can
+# name a dashboard without asking anything (2026-10-29: a prompt in a ```text fence was blocked for its
+# own example sentence). The prose rules skip fences. The sudo rules still read them, because a fenced
+# command is exactly what the operator is expected to paste.
+FENCE = r"(?ms)^\s*```[^\n]*\n.*?^\s*```[ \t]*$"
+CMD_RULES = 2   # HANDOFF[:2] are the sudo rules
 # TALKING ABOUT AN ASK IS NOT MAKING ONE. Within an hour of the UI-path pattern shipping, this gate
 # blocked a response whose entire subject was the gate's own false-negative — it quoted the offending
 # sentence to explain what had been fixed, and the quote matched. That is the documented way these
@@ -209,7 +264,11 @@ def strip_quoted(s):
 
 
 def is_handoff(s):
-    return any(re.search(p, strip_quoted(s), re.I) for p in HANDOFF)
+    if any(re.search(p, strip_quoted(s), re.I) for p in HANDOFF[:CMD_RULES]):
+        return True
+    prose = strip_quoted(re.sub(FENCE, " ", s))
+    return (any(re.search(p, prose, re.I) for p in HANDOFF[CMD_RULES:])
+            or any(addressed_match(p, prose) for p in ADDRESSED))
 
 # Accept the marker in any ordinary markdown form: bold, a heading, or bare. The first version
 # took only the bold form and blocked a response whose diligence was present and correct but
