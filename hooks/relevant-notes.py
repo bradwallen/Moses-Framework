@@ -44,6 +44,8 @@ MEMORY = Path(os.environ.get("RELEVANT_NOTES_MEMORY") or os.environ.get("MOSES_M
 LOG = Path(os.environ.get("RELEVANT_NOTES_LOG", Path.home() / ".local/state/moses/relevant-notes.log"))
 
 MAX_NOTES = 3
+MAX_JOBS = 1           # a job note gets its own slot, ahead of the notes, never one of their three
+MAX_LOCKED = 1         # so does a locked decision: crowded out is exactly how one gets overturned
 MAX_DOCS = 2
 MIN_TERMS = 2          # distinct prompt words a result must contain
 CUTOFF = float(os.environ.get("RELEVANT_NOTES_CUTOFF", "7.0"))
@@ -97,9 +99,14 @@ def _frontmatter(text: str) -> tuple[dict, str]:
         return {}, text
     meta = {}
     for line in text[3:end].splitlines():
-        m = re.match(r"^(name|description):\s*(.*)$", line)
+        m = re.match(r"^(name|description|locked):\s*(.*)$", line)
         if m:
-            meta[m.group(1)] = m.group(2).strip().strip('"')
+            v = m.group(2).strip()
+            # Strip only the one pair of YAML quotes: strip('"') also ate the escaped quote a
+            # description ends on ("never \"beautiful\"" printed as never "beautiful\).
+            if len(v) >= 2 and v[0] == v[-1] == '"':
+                v = v[1:-1]
+            meta[m.group(1)] = v.replace('\\"', '"')
     return meta, text[end + 4:]
 
 
@@ -117,8 +124,18 @@ def load_notes() -> list[dict]:
             continue
         head = terms(name.replace("-", " ").replace("_", " ") + " " + meta["description"])
         docs.append({"kind": "note", "label": name, "desc": meta["description"], "path": str(p),
-                     "head": head, "body": terms(body)})
+                     "head": head, "body": terms(body), "job": name.startswith("job-"),
+                     "chain": boot_chain(body), "locked": meta.get("locked", "")})
     return docs
+
+
+def boot_chain(body: str) -> list[str]:
+    """The [[notes]] a job note's "## Boot chain" section names, in order. A job note is one note per
+    recurring operation that says exactly what to read for it (adopted 2026-10-29 from a comparison
+    with jaredrhod/ai-memory-vault). Printing the chain in the hook's line means the reading list is
+    in front of the session even if it never opens the job note."""
+    m = re.search(r"(?ms)^## Boot chain[^\n]*\n(.*?)(?=^## |\Z)", body)
+    return list(dict.fromkeys(re.findall(r"\[\[([^\]|]+)", m.group(1)))) if m else []
 
 
 def load_doc_sections(cwd: str | None) -> list[dict]:
@@ -196,9 +213,14 @@ def score(query: str, corpus: list[dict]) -> list[tuple[float, int, dict]]:
 
 
 def pick(query: str, cwd: str | None) -> list[tuple[float, int, dict]]:
-    notes = score(query, load_notes())[:MAX_NOTES]
+    # Scored as ONE corpus, so a job note faces the same bar and the same word weights as every other
+    # note; only the slots differ. A job comes first because it is the one that says what to read.
+    ranked = score(query, load_notes())
+    jobs = [r for r in ranked if r[2]["job"]][:MAX_JOBS]
+    locked = [r for r in ranked if r[2]["locked"] and not r[2]["job"]][:MAX_LOCKED]
+    notes = [r for r in ranked if not r[2]["job"] and r not in locked][:MAX_NOTES]
     docs = score(query, load_doc_sections(cwd))[:MAX_DOCS]
-    return notes + docs
+    return jobs + locked + notes + docs
 
 
 def render(picked) -> str:
@@ -208,7 +230,17 @@ def render(picked) -> str:
         "you depart from it):"
     ]
     for _, _, d in picked:
-        if d["kind"] == "note":
+        if d["kind"] == "note" and d.get("job"):
+            chain = f" Boot chain: {', '.join(d['chain'])}." if d["chain"] else ""
+            lines.append(f"- JOB NOTE {d['label']} — this is a recurring job with written steps: read it "
+                         f"end to end before starting.{chain} {d['desc'][:220]}  [{d['path']}]")
+        elif d["kind"] == "note" and d.get("locked"):
+            # A locked decision is one Brad settled on purpose. The words are loud because the failure
+            # is quiet: a later request contradicts it and nobody notices the contradiction.
+            lines.append(f"- LOCKED DECISION {d['label']} — do not act against it without asking Brad "
+                         f"\"are you changing this, or is it a one-time exception?\" Locked: "
+                         f"{d['locked'][:160]}. {d['desc'][:220]}  [{d['path']}]")
+        elif d["kind"] == "note":
             lines.append(f"- {d['label']} — {d['desc'][:220]}  [{d['path']}]")
         else:
             lines.append(f"- {d['label']}  [{d['path']}]")

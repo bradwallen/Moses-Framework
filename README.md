@@ -114,6 +114,16 @@ deterministic half keeps answering.
 Ubuntu, Python 3.11+, and the [`claude` CLI](https://claude.com/claude-code) logged in as the user
 who will run this.
 
+**The guided way.** Clone it and let Claude walk you through it. It looks at what you already have
+first, keeps your existing rules and memory, asks a few questions, runs `bootstrap.sh` with you, and
+proves each piece works before it says so. [`SETUP.md`](SETUP.md) is the script it follows.
+
+```bash
+git clone <your-fork> ~/moses && cd ~/moses && claude "set me up"
+```
+
+**By hand:**
+
 ```bash
 git clone <your-fork> ~/moses
 cd ~/moses

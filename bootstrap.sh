@@ -3,6 +3,7 @@
 #
 #   ./bootstrap.sh            do it
 #   ./bootstrap.sh --check    say what it WOULD do, change nothing
+#   ./bootstrap.sh --replace-unit   also replace an existing moses.service that differs (shown first)
 #
 # WHAT IT WILL NOT DO: ask for sudo, write outside your home, start anything before you have given it
 # a token, or claim a step succeeded without testing it. Every phase below prints what it observed,
@@ -11,7 +12,10 @@
 set -uo pipefail
 cd "$(dirname "$0")"
 ROOT=$(pwd)
-CHECK=0; [ "${1:-}" = "--check" ] && CHECK=1
+CHECK=0; REPLACE_UNIT=0
+for a in "$@"; do
+  case "$a" in --check) CHECK=1 ;; --replace-unit) REPLACE_UNIT=1 ;; esac
+done
 
 say()  { printf '  %-42s %s\n' "$1" "$2"; }
 step() { printf '\n── %s %s\n' "$1" "$(printf '─%.0s' $(seq 1 $((52 - ${#1}))))"; }
@@ -132,12 +136,28 @@ UNITDIR="$HOME/.config/systemd/user"
 do_or_show mkdir -p "$UNITDIR"
 # The SAME unit its author runs (agent/systemd/moses.service), pointed at wherever this checkout and
 # its venv are. %h is systemd's own "your home", so only the two locations need rewriting.
-if [ "$CHECK" = 0 ]; then
-  sed -e "s|%h/moses-venv|$ROOT/.venv|g" -e "s|%h/Projects/moses|$ROOT|g" \
-      agent/systemd/moses.service > "$UNITDIR/moses.service"
-  systemctl --user daemon-reload 2>/dev/null || true
+#
+# AN EXISTING UNIT THAT DIFFERS IS KEPT. This used to overwrite it every run, so running bootstrap from
+# a second checkout (a test copy, a fork) silently pointed the LIVE service at that copy, and Moses
+# broke at its next restart. Found 2026-10-29 by the guided install's own dry run. Replacing a unit
+# that is not ours to replace is now a decision you make with --replace-unit, after seeing the diff.
+UNIT="$UNITDIR/moses.service"
+NEWUNIT=$(sed -e "s|%h/moses-venv|$ROOT/.venv|g" -e "s|%h/Projects/moses|$ROOT|g" agent/systemd/moses.service)
+if [ -f "$UNIT" ] && [ "$(cat "$UNIT")" = "$NEWUNIT" ]; then
+  say "moses.service" "already current — $UNIT"
+elif [ -f "$UNIT" ] && [ "$REPLACE_UNIT" = 0 ]; then
+  say "moses.service" "KEPT — yours differs from this checkout's; not replaced"
+  diff <(cat "$UNIT") <(printf '%s\n' "$NEWUNIT") | head -12 | sed 's/^/      /'
+  say "" "replace it only if this checkout should run Moses: ./bootstrap.sh --replace-unit"
+else
+  if [ "$CHECK" = 0 ]; then
+    printf '%s\n' "$NEWUNIT" > "$UNIT"
+    systemctl --user daemon-reload 2>/dev/null || true
+    say "moses.service" "written — $UNIT"
+  else
+    echo "  would: write $UNIT"
+  fi
 fi
-say "moses.service" "$UNITDIR/moses.service"
 # Lingering is what makes a user unit survive logout. Without it Moses dies when you close the shell,
 # which looks exactly like a crash.
 if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" = "yes" ]; then
