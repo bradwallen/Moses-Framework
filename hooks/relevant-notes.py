@@ -247,6 +247,49 @@ def render(picked) -> str:
     return "\n".join(lines)
 
 
+# ── For a build job (Knight's builder and Zryachiy's reviewer, via claude-run --job-notes) ────────
+# Those jobs run with none of the operator's settings, so this hook never fires for them, and their file
+# access is sandboxed to their clone, so a path to a note is a pointer they cannot follow. Added
+# 2026-10-29 so the job notes and locked decisions reach the agents that build, not only the sessions.
+#
+# Matched against the TASK, never the whole brief: replayed over 57 past Knight jobs, a full brief's
+# template words diluted every match to nothing. And a locked decision gets NO reserved slot here: it
+# must place in the top MAX_NOTES on its own score. A task is long, so many notes clear the bar, and on
+# those 57 jobs the reserved slot put Viatica's group-trips decision on a GIS job and the Stripe one on
+# a probe change (both ranked 4th), while the two that belonged ranked 1st and 2nd.
+MAX_JOB_BODY = 4000
+
+
+def pick_for_job(query: str) -> list[tuple[float, int, dict]]:
+    ranked = score(query, load_notes())
+    jobs = [r for r in ranked if r[2]["job"]][:MAX_JOBS]
+    locked = [r for r in [r for r in ranked if not r[2]["job"]][:MAX_NOTES] if r[2]["locked"]][:MAX_LOCKED]
+    return jobs + locked
+
+
+def render_for_job(picked) -> str:
+    operator = os.environ.get("MOSES_OPERATOR") or "the operator"
+    descs = {d["label"]: d["desc"] for d in load_notes()}
+    lines = [f"MEMORY NOTES FOR THIS JOB ({operator}'s notes, matched to the task by the same code that "
+             "serves his own sessions. You cannot open the notes from your sandbox, so what matters is "
+             "printed here. Judge relevance yourself; if one covers this work, follow it, and say in your "
+             "report where you departed from it.)"]
+    for _, _, d in picked:
+        if d["job"]:
+            body = _frontmatter(Path(d["path"]).read_text(errors="ignore"))[1].strip()
+            if len(body) > MAX_JOB_BODY:
+                body = body[:MAX_JOB_BODY].rstrip() + "\n[... cut at {} characters]".format(MAX_JOB_BODY)
+            lines.append(f"\nJOB NOTE {d['label']} — a recurring job with written steps:\n{body}")
+            if d["chain"]:
+                lines.append("Its boot chain, as summaries:")
+                lines += [f"- {n} — {descs.get(n, '(no such note)')[:220]}" for n in d["chain"]]
+        else:
+            lines.append(f"\nLOCKED DECISION {d['label']} — {operator} settled this on purpose. Work that acts "
+                         f"against it is wrong unless the task says he is changing it; if the task needs "
+                         f"that, stop and say so in your report. Locked: {d['locked'][:300]}. {d['desc'][:300]}")
+    return "\n".join(lines)
+
+
 def log(picked, n_terms: int) -> None:
     try:
         LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -259,6 +302,16 @@ def log(picked, n_terms: int) -> None:
 
 
 def main() -> int:
+    if "--for-job" in sys.argv:
+        # The task on stdin; prints the block, or nothing when no job note or locked decision matches.
+        # A corpus that is not there is an error, not "nothing matched": the two must not look alike.
+        if not MEMORY.is_dir():
+            print(f"no memory corpus at {MEMORY}", file=sys.stderr)
+            return 2
+        picked = pick_for_job(sys.stdin.read())
+        if picked:
+            print(render_for_job(picked))
+        return 0
     if "--query" in sys.argv:
         i = sys.argv.index("--query")
         query = sys.argv[i + 1]
