@@ -110,6 +110,39 @@ grep -q 'source "$(dirname "$0")/../lib/examples.sh"' "$HERE/bin/knight-run" \
     && ok "knight-run holds the job (gate red) when an example has no test — after the gate runs, before any push" \
     || bad "knight-run holds the job (gate red) when an example has no test — after the gate runs, before any push"
 
+# Out of scope (2026-10-29): job 1993898 was held after a green gate because four rules about what the
+# build must not DO were filed as exclusions, and no test can name a change that was not made.
+SACC="$TMP/scope-acceptance.txt"
+cat > "$SACC" <<'A'
+Option-like tokens are never taken as project names
+
+CONFIRMED EXAMPLES (Brad agreed to these before the build):
+- It INCLUDES: `moses-project add -x` → error naming `-x`
+
+OUT OF SCOPE (Brad agreed the build must NOT make these changes):
+- Out of scope: Switching the CLI to a different argument-parsing library
+- Out of scope: Changing project ids, codes or the registry file format
+A
+( . "$LIB"; examples_extract "$SACC" "$TMP/s-ex.txt"; scope_extract "$SACC" "$TMP/s-scope.txt"
+  [ "$(wc -l < "$TMP/s-ex.txt")" -eq 1 ] && ! grep -q "argument-parsing" "$TMP/s-ex.txt" ) \
+    && ok "an out-of-scope rule is not read as an example" || bad "an out-of-scope rule is not read as an example" "$(cat "$TMP/s-ex.txt" 2>/dev/null)"
+( . "$LIB"; [ "$(wc -l < "$TMP/s-scope.txt")" -eq 2 ] && head -1 "$TMP/s-scope.txt" | grep -qx "Switching the CLI to a different argument-parsing library" ) \
+    && ok "and scope_extract reads both rules" || bad "and scope_extract reads both rules" "$(cat "$TMP/s-scope.txt" 2>/dev/null)"
+SREPO="$TMP/scope-repo"; git init -q "$SREPO"; mkdir -p "$SREPO/tests"
+printf 'it("`moses-project add -x` → error naming `-x`")\n' > "$SREPO/tests/cli.test.ts"
+git -C "$SREPO" add -A && git -C "$SREPO" -c user.email=t@t -c user.name=t commit -qm t
+( . "$LIB"; [ -z "$(examples_missing "$SREPO" "$TMP/s-ex.txt")" ] ) \
+    && ok "a build that tests its examples and has out-of-scope rules is not held for them" \
+    || bad "a build that tests its examples and has out-of-scope rules is not held for them"
+( . "$LIB"; b=$(scope_brief "$TMP/s-scope.txt"); r=$(scope_review_brief "$TMP/s-scope.txt")
+  grep -q "^- Switching the CLI" <<<"$b" && grep -q "MISSED" <<<"$r" ) \
+    && ok "the builder is told the rules, and the reviewer judges them from the diff" \
+    || bad "the builder is told the rules, and the reviewer judges them from the diff"
+grep -q 'scope_extract "$dir/acceptance.txt" "$dir/out-of-scope.txt"' "$HERE/bin/knight" \
+    && grep -q 'scope_brief "$dir/out-of-scope.txt"' "$HERE/bin/knight" \
+    && grep -q 'scope_review_brief "$dir/out-of-scope.txt"' "$HERE/bin/knight" \
+    && ok "bin/knight writes out-of-scope rules into both briefs" || bad "bin/knight writes out-of-scope rules into both briefs"
+
 # Watch each guard fail: a copy of the lib with it removed must get a case wrong.
 MUT="$TMP/mut.sh"
 watch_fail() {  # watch_fail <label> <case=outcome it must produce> <sed expression>

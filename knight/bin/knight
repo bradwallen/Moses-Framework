@@ -59,6 +59,8 @@ OPTENV=$MOSES_CONFIG_DIR/knight.env
 source "$KNIGHT_HOME/guards.env"
 # Brad's confirmed examples become tests (#3): written into the job and the brief here, checked by knight-run.
 source "$(dirname "$(readlink -f "$0")")/../lib/examples.sh"
+# Every prep and gate step runs in a bubblewrap sandbox: the clone, no home, no secrets (#17 MF7).
+source "$(dirname "$(readlink -f "$0")")/../lib/sandbox.sh"
 mkdir -p "$JOBS"
 
 die() { echo "knight: $*" >&2; exit 1; }
@@ -198,9 +200,10 @@ load_target() {
         die "no such target '$name'. Knight works on: $(known_targets | tr '\n' ' ')
 Add one in $TARGETS (see $TARGETS/README.md). A repository that is not in the registry is not one Knight touches."
     fi
-    KT_DESC=""; KT_SOURCE=""; KT_BRANCH=""; KT_PUSH_MODE=""; KT_PUSH_REMOTE=""; KT_PREP=(); KT_GATE=()
+    KT_DESC=""; KT_SOURCE=""; KT_BRANCH=""; KT_PUSH_MODE=""; KT_PUSH_REMOTE=""; KT_PREP=(); KT_GATE=(); KT_SANDBOX_RW=""; KT_SANDBOX_RO=""; KT_SANDBOX_ENV=""
     # shellcheck disable=SC1090
     source "$f"
+    runner_git_hardening    # after the target file (sourced shell), so no line in it can undo this
     TARGET="$name"
     REPO="$REPOS/$name"
     [ -n "$KT_SOURCE" ]        || die "target '$name': no KT_SOURCE"
@@ -226,6 +229,12 @@ ensure_repo() {
         git -C "$REPO" remote remove origin 2>/dev/null
     fi
     git -C "$REPO" remote | grep -q . && die "Knight's $TARGET clone has a remote — refusing to run until it is removed"
+    # Before this run's fetch and checkout read it: a setting left by an earlier, refused job could make
+    # git run a command (a filter, a url rewrite, an ssh command) the moment the clone is touched.
+    local odd_cfg
+    odd_cfg=$(git_config_unexpected "$REPO") \
+        || die "could not read Knight's $TARGET clone's .git/config, so it cannot be shown safe — refusing to run"
+    [ -z "$odd_cfg" ] || die "Knight's $TARGET clone's .git/config holds a setting no job should write ($(printf '%s' "$odd_cfg" | head -3 | tr '\n' ' ')) — refusing to run until a person looks at $REPO/.git/config"
 
     # READ FROM WHERE WE WRITE. This fetched KT_SOURCE — Brad's own working checkout — while the
     # push goes to its origin. The two diverge the instant Knight pushes, and he then starts his
@@ -280,7 +289,7 @@ ensure_repo() {
     # prep line is written to be idempotent, so this is cheap when there is nothing to do.
     local step
     for step in ${KT_PREP+"${KT_PREP[@]}"}; do
-        if ! ( cd "$REPO" && bash -c "$step" >/dev/null 2>&1 ); then
+        if ! ( sandbox_run prep "$REPO" "$step" >/dev/null 2>&1 ); then
             echo "  ⚠️  prep step failed: $step"
             echo "      Knight may not be able to build or test. Continuing — the gate will say so plainly."
         fi
@@ -364,6 +373,8 @@ check without reading the diff. Not a restatement of the task — the observable
     printf '%s\n' "$acceptance" > "$dir/acceptance.txt"
     # Brad's confirmed examples, one per line: the builder must test each, and the runner checks (#3).
     examples_extract "$dir/acceptance.txt" "$dir/examples.txt"
+    # Changes the build must not make: told to the builder, checked by the reviewer, never a test.
+    scope_extract "$dir/acceptance.txt" "$dir/out-of-scope.txt"
     printf '%s\n' "$branch" > "$dir/branch"
     printf '%s\n' "$TARGET" > "$dir/target"
     [ -n "$incident" ] && printf '%s\n' "$incident" > "$dir/incident"
@@ -437,6 +448,9 @@ SPEC
         printf 'Run that whole gate yourself with this ONE command, exactly as written — it runs the steps\n'
         printf 'above in order, the same way the runner will, and is the only way to run them all here:\n'
         printf '  %s/knight/bin/knight-gate\n' "$MOSES_ROOT"
+        printf 'To run ONE test file from that gate (to watch a new test fail, or re-check one fix), use:\n'
+        printf '  %s/knight/bin/knight-gate --only <path>\n' "$MOSES_ROOT"
+        printf 'It takes seconds where the whole gate takes minutes. Run the whole gate before you commit.\n'
         printf 'Shell loops, script files and sh -c are refused, so do not try them. Fix what you break.\n\n'
 
         # The incident, if this job came from one. Deliberately just the id and a sentence: the agent
@@ -507,6 +521,7 @@ SPEC
         printf '%s\n\n' "$fw_build"
         printf 'TASK:\n%s\n' "$task"
         examples_brief "$dir/examples.txt"
+        scope_brief "$dir/out-of-scope.txt"
     } > "$dir/brief.txt"
 
     # ── The reviewer's brief — written here, read by the runner, never by the builder ──────────
@@ -595,6 +610,7 @@ REVIEWSPEC
             "$(cat "$dir/acceptance.txt" 2>/dev/null)"
         printf '\nThe job directory is: %s\n' "$dir"
         examples_review_brief "$dir/examples.txt"
+        scope_review_brief "$dir/out-of-scope.txt"
     } > "$dir/review-brief.txt"
 
     # Detached, in its own process group so `cancel` kills the whole tree. The worker is a separate
@@ -789,7 +805,7 @@ cmd_provision() {
     local step rc=0
     for step in "${KT_GATE[@]}"; do
         printf '    %s\n' "$step"
-        if ( cd "$REPO" && bash -c "$step" >"$glog" 2>&1 ); then
+        if ( sandbox_run gate "$REPO" "$step" >"$glog" 2>&1 ); then
             echo "      green"
         else
             echo "      RED — this target cannot ship work until this passes:"

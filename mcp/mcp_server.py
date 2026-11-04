@@ -431,12 +431,17 @@ def tagilla_queue(hours: int = 24) -> str:
                 "`will_exclude` (one per line: real cases it must not). Use real titles and cases, never a "
                 "category label (\"GIS Analyst Intern\" and \"Civil Engineering Intern that mentions ArcGIS\", "
                 "not \"civil and water\"). Post the reply as it is; Brad says yes (or ✅) and code starts the "
-                "build with those examples as acceptance criteria. If he asks for a change, propose again."
+                "build with those examples as acceptance criteria. If he asks for a change, propose again. "
+                "`out_of_scope` (one per line) is for CHANGES THE BUILD MUST NOT MAKE — \"switching to another "
+                "parsing library\", \"changing the registry format\" — which no test can name. Each example "
+                "becomes a test; out-of-scope lines go to Knight and the reviewer instead. A fix with no real "
+                "excluded case can leave `will_exclude` empty if `out_of_scope` says where the line is."
 )
-def knight_propose(task: str, acceptance: str, will_include: str, will_exclude: str, target: str = "") -> str:
+def knight_propose(task: str, acceptance: str, will_include: str, will_exclude: str = "", target: str = "",
+                   out_of_scope: str = "") -> str:
     try:
         import build_spec as _bs
-        return _bs.propose(task, acceptance, will_include, will_exclude, target)
+        return _bs.propose(task, acceptance, will_include, will_exclude, target, out_of_scope)
     except Exception as e:                                    # noqa: BLE001
         return f"⚠️ The proposal could not be recorded ({type(e).__name__}). Nothing was proposed."
 
@@ -1153,6 +1158,44 @@ def remediate(op: str = "ops", target: str = "") -> str:
     if target:
         argv.append(target)
     return _run(argv, limit=3000)
+
+
+@server.tool(
+    description="Run one of the fixes the standup OFFERED for something it flagged — the lines that say "
+                "\"↳ I can fix this (`<op>`)\". Only when Brad has asked you to, in the thread or directly; "
+                "never on your own reading of the standup. Call with op='ops' to see the list. A fix runs "
+                "in the background (a sync takes several minutes) and posts its own result — DONE, or "
+                "REFUSED / COULD NOT RUN with the reason — as a reply under the standup. So tell Brad it "
+                "has started and that the result will appear there; do not claim it worked, and do not "
+                "start it twice."
+)
+def fix_drift(op: str = "ops") -> str:
+    """Start agent/moses-fix <op> --notify as the operator, detached. The op list, gates and log live there.
+
+    Detached, not waited on: a Moses turn is cut off at MOSES_CHAT_TIMEOUT (two minutes) and a sync
+    runs the framework's whole test suite (92s measured 2026-11-03) on top of the copy and the push.
+    Waiting would kill the turn and lose the answer. The result is delivered by moses-fix itself
+    (--notify posts under the standup), so the promise this tool tells Moses to make is kept by code.
+    No tool argument reaches a shell — `op` is one argv element, and moses-fix refuses anything not on
+    its own list, so 'ops' and an unknown op are answered here and now.
+    """
+    fix = str(_env.ROOT / "agent" / "moses-fix")
+    env = {**os.environ, "MOSES_ROOT": str(_env.ROOT)}
+    try:
+        listed = subprocess.run([fix, "ops"], capture_output=True, text=True, timeout=30, env=env).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"COULD NOT RUN — moses-fix did not answer: {type(e).__name__}"
+    known = [l.split()[0] for l in listed.splitlines()[1:] if l.strip()]
+    if op == "ops" or op not in known:
+        return (f"'{op}' is not a fix on the list.\n" if op != "ops" else "") + listed.strip()
+    out_dir = Path(os.environ.get("MOSES_STATE") or Path.home() / ".local" / "state" / "moses")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with open(out_dir / f"fix-{op}.out", "w") as out:
+        p = subprocess.Popen([fix, op, "--notify"], stdout=out, stderr=subprocess.STDOUT,
+                             stdin=subprocess.DEVNULL, env=env, start_new_session=True)
+    return (f"STARTED — {op} is running in the background (pid {p.pid}). It posts its own result as a "
+            "reply under the standup when it finishes: DONE, or REFUSED / COULD NOT RUN with the reason. "
+            "It has not worked yet — say only that it has started.")
 
 
 # ── Profiles: how much of Moses a given listener exposes ─────────────────────

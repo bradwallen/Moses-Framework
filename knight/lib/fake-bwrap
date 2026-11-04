@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# fake-bwrap — a TEST stand-in for bwrap, used only when a suite that drives the runner is itself
+# already running inside a sandbox (the moses gate, or Knight's knight-gate), where Reserve cannot start
+# a second one. It applies the environment and the working directory, and confines NOTHING: the box
+# around the whole suite is what confines. sandbox_use_stand_in_if_nested decides when it is used, and
+# sandbox_run prints a line whenever it is. knight/test-sandbox.sh tests the real thing.
+env_args=(); chdir=.
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        --clearenv) env_args=(-i "${env_args[@]}"); shift ;;
+        --setenv) env_args+=("$2=$3"); shift 3 ;;
+        --chdir) chdir=$2; shift 2 ;;
+        --bind|--ro-bind|--dev-bind) shift 3 ;;
+        --tmpfs|--dir|--dev|--proc) shift 2 ;;
+        *) shift ;;
+    esac
+done
+cd "$chdir" || exit 2
+exec env "${env_args[@]}" "$@"

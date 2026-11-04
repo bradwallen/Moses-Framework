@@ -7,6 +7,10 @@
     claude-run --app APP ... --print-argv                          the command, as JSON, instead of running it
     claude-run --classify result.json                              ok | degraded: <refused tools> | failed
     claude-run --list                                              every profile, as JSON
+    claude-run --job-notes task.txt                                the memory notes the task matches, for a brief
+
+--job-notes prints the block, or nothing. When the lookup cannot run it prints one line saying so and
+exits 3, so the caller can put that in the brief instead of a silence that reads as "nothing matched".
 
 It EXECS the CLI, so the caller's `timeout` and kill signals reach the CLI itself, and stdout is the
 CLI's own output: result.json and session.jsonl keep exactly the shape they had.
@@ -37,7 +41,22 @@ def main() -> int:
     ap.add_argument("--print-argv", action="store_true")
     ap.add_argument("--classify", metavar="RESULT_JSON")
     ap.add_argument("--list", action="store_true")
+    ap.add_argument("--job-notes", metavar="TASK_FILE")
     a = ap.parse_args()
+
+    if a.job_notes:
+        try:
+            with open(a.job_notes, encoding="utf-8") as fh:
+                block, why = R.job_notes(fh.read())
+        except OSError as e:
+            block, why = "", f"cannot read {a.job_notes} ({e})"
+        if why:
+            print(f"MEMORY NOTES: the lookup could not run, so no job note or locked decision was checked "
+                  f"for this task ({why}).")
+            return 3
+        if block:
+            print(block)
+        return 0
 
     if a.list:
         print(json.dumps({app: R.describe(app) for app in R.APPS}, indent=2))

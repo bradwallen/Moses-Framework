@@ -924,11 +924,27 @@ finally:
     conversation._invoke = _saved_invoke2
 check("FAIL through reply(): the channel reads the real reason", "Prompt is too long" in _said2 and "couldn't finish" not in _said2)
 
-check("FORENSICS reports timestamps and never token material", (lambda f: (
-        isinstance(f, dict)
-        and not any(k.lower().endswith("token") for k in f)
-        and not any(isinstance(v, str) and len(v) > 60 for v in f.values())
-      ))(conversation.credential_facts()))
+# Against a FAKE login file with token material in it, never the real one: the gate runs with no home
+# directory (knight/lib/sandbox.sh), and a check that read the live file passed or failed on whatever
+# the operator's login held that day, without ever holding a token it could catch leaking.
+import tempfile as _tf
+_cred_dir = _P(_tf.mkdtemp())
+(_cred_dir / "credentials.json").write_text(json.dumps({"claudeAiOauth": {
+    "accessToken": "sk-ant-oat01-FAKEACCESS" + "x" * 80, "refreshToken": "sk-ant-ort01-FAKEREFRESH" + "y" * 80,
+    "expiresAt": 1893456000000, "refreshTokenExpiresAt": 1893456000, "subscriptionType": "pro"}}),
+    encoding="utf-8")
+_saved_cred = conversation.CREDENTIALS_PATH
+conversation.CREDENTIALS_PATH = str(_cred_dir / "credentials.json")
+_facts = conversation.credential_facts()
+conversation.CREDENTIALS_PATH = _saved_cred
+check("FORENSICS reports timestamps and never token material", (
+        isinstance(_facts, dict) and "expiresAt" in _facts and "refreshTokenExpiresAt" in _facts
+        and "cred_error" not in _facts
+        and "FAKE" not in json.dumps(_facts)
+        and not any(k.lower().endswith("token") for k in _facts)))
+conversation.CREDENTIALS_PATH = str(_cred_dir / "missing.json")
+check("FORENSICS a missing login file is reported, not raised", "cred_error" in conversation.credential_facts())
+conversation.CREDENTIALS_PATH = _saved_cred
 
 # ── The safety summary at the top of the file must stay TRUE ──────────────────
 # That paragraph said the MCP tools were "not loaded into a chat that needs none of them" for eleven

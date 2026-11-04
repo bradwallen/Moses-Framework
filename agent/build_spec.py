@@ -19,6 +19,15 @@ else Brad says there ends it (expire_on_reply), and the listener checks no other
 Only a check mark on the spec's own message, never a 👍, and never after the TTL. And only a spec the
 Slack turn's own MCP server recorded (`port`): a knight_propose from the iOS app, which reaches the
 public server, is never claimed by whichever Slack turn happens to end next.
+
+OUT OF SCOPE IS NOT AN EXAMPLE (2026-10-29). Each example becomes a test that must name it (#3). Job
+1993898 (M38) was held because its "will not include" list held four rules about what the BUILD must
+not do ("Switching the CLI to a different argument-parsing library"), and no test can name a change
+that was not made. Moses put them there because a spec needed at least one exclusion, and a CLI fix
+has no excluded case. So a spec now has a third list, out_of_scope: changes the build must not make.
+Knight is told about them and the reviewer checks the diff against them, but no test is asked for.
+A spec needs includes plus either excluded cases or out-of-scope rules. An exclusion that reads as a
+change to the code (SCOPE_RULE) is moved to out of scope, which the spec Brad confirms shows.
 """
 from __future__ import annotations
 
@@ -78,35 +87,52 @@ def _lines(value) -> list[str]:
     return [re.sub(r"^[\s•*-]+", "", str(x)).strip() for x in items if str(x).strip()]
 
 
-def propose(task: str, acceptance: str, will_include, will_exclude, target: str = "") -> str:
-    """Record a spec and return the text Moses posts. Refuses a spec without examples on both sides."""
+# An exclusion that starts like this is a change the build must not MAKE, not a case it must leave out.
+# The four in job 1993898 began "Deleting", "Switching", "Adding" and "Changing".
+SCOPE_RULE = re.compile(r"^(?:adding|altering|changing|converting|deleting|downgrading|dropping|editing|"
+                        r"introducing|migrating|modifying|moving|refactoring|reformatting|removing|renaming|"
+                        r"replacing|restructuring|rewriting|switching|touching|updating|upgrading|"
+                        r"do not|don't|never)\b", re.I)
+
+
+def propose(task: str, acceptance: str, will_include, will_exclude, target: str = "", out_of_scope="") -> str:
+    """Record a spec and return the text Moses posts. Refuses a spec with no line drawn on the far side."""
     task, acceptance = (task or "").strip(), (acceptance or "").strip()
     inc, exc = _lines(will_include), _lines(will_exclude)
+    moved = [x for x in exc if SCOPE_RULE.match(x)]
+    exc = [x for x in exc if x not in moved]
+    oos = _lines(out_of_scope) + [x for x in moved if x not in _lines(out_of_scope)]
     if len(task) < 15 or len(acceptance) < 15:
         return "A spec needs a real task and acceptance criteria. Nothing was proposed."
-    if not inc or not exc:
-        return ("A spec needs concrete EXAMPLES on both sides — at least one thing it will include and one it "
-                "will not — so Brad can see where the line is before anything is built. Nothing was proposed.")
+    if not inc or not (exc or oos):
+        return ("A spec needs concrete EXAMPLES of what it will include, and a line on the other side: a case it "
+                "will NOT include, or a change it must not make (out_of_scope), so Brad can see where the line "
+                "is before anything is built. Nothing was proposed.")
     with _Locked():
         d = _load()
         sid = secrets.token_hex(3)
         d["specs"] = [s for s in d["specs"] if time.time() - s.get("created", 0) < TTL]
         d["specs"].append({"id": sid, "task": task, "acceptance": acceptance, "include": inc, "exclude": exc,
-                           "target": (target or _env.setting("KNIGHT_DEFAULT_TARGET")).strip(), "created": time.time(), "status": "pending",
+                           "out_of_scope": oos, "target": (target or _env.setting("KNIGHT_DEFAULT_TARGET")).strip(), "created": time.time(), "status": "pending",
                            "port": os.environ.get("MOSES_MCP_PORT", "")})
         _save(d)
     # Moses does not have to paste this: the listener posts the spec itself, so what Brad confirms is
     # what was recorded, word for word, whatever the reply around it says.
-    return (render(d["specs"][-1]) + "\n\n(This spec is posted to Brad for you, exactly as above. Do not "
-            "paste it; say in a line or two what you drafted and that it is waiting on his yes.)")
+    note = (f"\n\n(Moved to out of scope, because they are changes not to make rather than cases to leave "
+            f"out: {'; '.join(moved)}.)" if moved else "")
+    return (render(d["specs"][-1]) + note + "\n\n(This spec is posted to Brad for you, exactly as above. Do "
+            "not paste it; say in a line or two what you drafted and that it is waiting on his yes.)")
 
 
 def render(spec: dict) -> str:
     inc = "\n".join(f"   ✅ {x}" for x in spec["include"])
     exc = "\n".join(f"   ❌ {x}" for x in spec["exclude"])
+    oos = "\n".join(f"   🚫 {x}" for x in spec.get("out_of_scope", []))
     return (f"📝 *Here's what I'll have Knight build* (`{spec['id']}`, on {spec['target']}):\n{spec['task']}\n\n"
-            f"*Will include*, for example:\n{inc}\n*Will not include*, for example:\n{exc}\n\n"
-            "_Reply *yes* (or ✅ this) to start it, or tell me what to change._")
+            f"*Will include*, for example:\n{inc}\n"
+            + (f"*Will not include*, for example:\n{exc}\n" if exc else "")
+            + (f"*Out of scope* — the build must not:\n{oos}\n" if oos else "")
+            + "\n_Reply *yes* (or ✅ this) to start it, or tell me what to change._")
 
 
 def claim(before: set[str], *, channel: str, thread_ts: str = "", user: str = "", message_ts: str = "",
@@ -216,8 +242,13 @@ def _take(sid: str) -> bool:
 def start(spec: dict, user: str = "") -> str:
     """Start the confirmed build. The examples become criteria the reviewer judges from the change."""
     acc = (spec["acceptance"] + "\n\nCONFIRMED EXAMPLES (Brad agreed to these before the build):\n"
-           + "\n".join(f"- It INCLUDES: {x}" for x in spec["include"]) + "\n"
-           + "\n".join(f"- It does NOT include: {x}" for x in spec["exclude"]))
+           + "\n".join([f"- It INCLUDES: {x}" for x in spec["include"]]
+                       + [f"- It does NOT include: {x}" for x in spec["exclude"]]))
+    # Out of scope rides in the acceptance under its own prefix, which examples_extract does not read:
+    # the reviewer judges the diff against it, and no test is asked to name it.
+    if spec.get("out_of_scope"):
+        acc += ("\n\nOUT OF SCOPE (Brad agreed the build must NOT make these changes):\n"
+                + "\n".join(f"- Out of scope: {x}" for x in spec["out_of_scope"]))
     # Claim it FIRST, under the lock: two yeses (or a yes and a ✅) start one build, not two.
     if not _take(spec["id"]):
         was = get(spec["id"]) or {}

@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""moses-vulncheck — the ops persona's weekly check for known vulnerabilities, posted in the ops channel.
+
+    moses-vulncheck            check everything and post the report as the ops persona (named in the roster)
+    moses-vulncheck --save     check and save the result for the standup, post nothing (the timer, Mon 07:40)
+    moses-vulncheck --section  print the standup's section from the saved result (agent/local-standup)
+    moses-vulncheck --print    check and print the report, post nothing
+    moses-vulncheck --json     check and print the findings as JSON, post nothing
+
+PART OF THE 08:00 STANDUP (Brad, 2026-10-23: "part of the 0800 stand-up, not after at 8:30"). The timer
+runs the check at 07:40 on the check day and saves it; the standup prints it. On the check day a missing
+or old result is SAID ("did not run this morning"), so a dead timer cannot read as a quiet week.
+
+WHY THIS EXISTS (Brad, 2026-10-23). Stripe emailed: the product's production server was running a Node.js
+with a critical remote-code-execution bug. Nothing here had looked. The same morning's look found four
+more: the Node on Reserve, code-server's bundled Node, a critical Next.js bug and a high one in sharp.
+Every one was public for days, and every one had a fix. "I want Moses (or maybe Birdeye as Ops?) to run
+these sorts of vulnerability checks weekly."
+
+WHAT IT CHECKS, and where each answer comes from — never from memory:
+  1. EVERY NODE.JS RUNTIME: each node binary on this machine (system, code-server's bundled copy, nvm),
+     and the Node the deployed app actually runs, read from its /api/state (app.node). Each is compared against
+     nodejs.org's own release list, which marks every security release, and Node's release schedule for
+     end-of-life lines. Vulnerable = its line has a security release newer than it; dead = past end of life.
+  2. PACKAGES: `npm audit` in every project under the projects folder that has a package-lock.json,
+     split into what ships (--omit=dev) and what is build tooling only.
+  3. THE OPERATING SYSTEM: apt's pending updates from the security pocket, and pending updates of the
+     software that faces the internet here (the Cloudflare tunnel, Tailscale, SSH), whatever pocket.
+  4. CODE-SERVER: whether a newer release exists than the one installed.
+
+A check that could not run is SAID, by name, never read as "nothing found" — commandment 3. The report is
+posted every week, all clear included, so a week with no post is itself a signal.
+
+No privilege needed: runs as the operator under a systemd user timer, like moses-drift.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import moses_env as _env  # noqa: E402
+import persona as _persona  # noqa: E402
+
+UA = "moses-vulncheck/1 (+operator's own machine)"   # Cloudflare refuses Python's default agent
+NODE_INDEX = "https://nodejs.org/dist/index.json"
+NODE_SCHEDULE = "https://raw.githubusercontent.com/nodejs/Release/main/schedule.json"
+CODE_SERVER_LATEST = "https://api.github.com/repos/coder/code-server/releases/latest"
+PROJECTS = Path(_env.setting("MOSES_PROJECTS_DIR") or _env.ROOT.parent)
+CHANNEL = _env.setting("MOSES_VULNCHECK_CHANNEL") or _env.setting("MOSES_LIVENESS_CHANNEL")
+STATE = _env.STATE / "vulncheck.json"
+# The deployed app whose Node is checked through its /api/state: its name (a setting, so the framework
+# names no one's product) and the file holding its address and the token that reads its state.
+APP_NAME = _env.setting("MOSES_APP_NAME") or "the app"
+APP_ENV = Path(_env.setting("MOSES_CUSTOMS_ENV") or _env.CONFIG / "customs.env")
+# Software here that the internet reaches: an update to any of these is worth taking promptly whatever
+# pocket it comes from. The tunnel publishes the operator's sites; Tailscale and SSH are the way in.
+INTERNET_FACING = ("cloudflared", "tailscale", "openssh-server", "openssh-client", "nodejs", "code-server")
+# Where a node binary is found besides PATH: code-server bundles its own, and nvm keeps one per version.
+NODE_PLACES = ("/usr/lib/code-server/lib/node", "/usr/local/bin/node")
+
+
+# ── Pure decisions (driven by vulncheck_test.py with fixed data) ─────────────────────────────────
+
+def _v(s: str) -> tuple[int, int, int]:
+    m = re.match(r"v?(\d+)\.(\d+)\.(\d+)", s or "")
+    return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)  # type: ignore[return-value]
+
+
+def node_verdict(version: str, index: list[dict], schedule: dict, today: dt.date) -> dict:
+    """What a running Node version needs. `index` is nodejs.org/dist/index.json, `schedule` the release
+    schedule. Returns {state: ok | vulnerable | end-of-life | unknown, fix, why}."""
+    run = _v(version)
+    if run == (0, 0, 0):
+        return {"state": "unknown", "fix": "", "why": f"could not read a version from {version!r}"}
+    line = run[0]
+    sched = schedule.get(f"v{line}") or {}
+    end = sched.get("end")
+    in_line = [r for r in index if _v(r.get("version", ""))[0] == line]
+    latest = max((r["version"] for r in in_line), key=_v, default="")
+    if end and dt.date.fromisoformat(end) < today:
+        return {"state": "end-of-life", "fix": "move to a supported line",
+                "why": f"Node {line} reached end of life on {end} and gets no security fixes"}
+    newer_security = sorted((r for r in in_line if r.get("security") and _v(r["version"]) > run),
+                            key=lambda r: _v(r["version"]))
+    if newer_security:
+        first = newer_security[0]
+        return {"state": "vulnerable", "fix": latest.lstrip("v"),
+                "why": f"{len(newer_security)} security release(s) since, first {first['version'].lstrip('v')} on {first.get('date', '?')}"}
+    if not in_line:
+        return {"state": "unknown", "fix": "", "why": f"nodejs.org lists no Node {line} releases"}
+    return {"state": "ok", "fix": "", "why": f"no security release in Node {line} is newer"}
+
+
+def parse_apt(text: str) -> list[dict]:
+    """`apt list --upgradable` → [{pkg, suites, new, old}]. A package in several pockets lists them all
+    ("noble-updates,noble-security"), which is how a security fix is recognized."""
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^([^/\s]+)/(\S+)\s+(\S+)\s+\S+\s+\[upgradable from: ([^\]]+)\]", line)
+        if m:
+            out.append({"pkg": m.group(1), "suites": m.group(2).split(","), "new": m.group(3), "old": m.group(4)})
+    return out
+
+
+def apt_findings(upgradable: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(security updates, internet-facing updates that are not already in the first list)."""
+    sec = [u for u in upgradable if any(s.endswith("-security") for s in u["suites"])]
+    facing = [u for u in upgradable if u["pkg"] in INTERNET_FACING and u not in sec]
+    return sec, facing
+
+
+def summarize_audit(report: dict) -> dict:
+    """npm audit --json → counts by severity, and the critical/high packages with their fix."""
+    counts = (report.get("metadata") or {}).get("vulnerabilities") or {}
+    worst = []
+    for name, v in (report.get("vulnerabilities") or {}).items():
+        if v.get("severity") in ("critical", "high"):
+            fix = v.get("fixAvailable")
+            fix = f"{fix.get('name')}@{fix.get('version')}" if isinstance(fix, dict) else ("yes" if fix else "none yet")
+            title = next((i.get("title", "") for i in v.get("via", []) if isinstance(i, dict)), "")
+            worst.append({"pkg": name, "severity": v["severity"], "direct": bool(v.get("isDirect")),
+                          "fix": fix, "title": title[:90]})
+    worst.sort(key=lambda w: (w["severity"] != "critical", not w["direct"], w["pkg"]))
+    return {"critical": int(counts.get("critical", 0)), "high": int(counts.get("high", 0)),
+            "moderate": int(counts.get("moderate", 0)), "worst": worst}
+
+
+def code_server_verdict(installed: str, latest_tag: str) -> dict:
+    inst, lat = _v(installed), _v(latest_tag)
+    if inst == (0, 0, 0) or lat == (0, 0, 0):
+        return {"state": "unknown", "why": f"installed {installed or '?'}, latest {latest_tag or '?'}"}
+    if lat > inst:
+        return {"state": "behind", "why": f"{'.'.join(map(str, inst))} installed, {latest_tag.lstrip('v')} released"}
+    return {"state": "ok", "why": f"{'.'.join(map(str, inst))} is the latest"}
+
+
+def render(r: dict) -> str:
+    """The Slack post. Findings first, each with what fixes it; could-not-check said by name."""
+    lines, n = [], 0
+    for rt in r.get("runtimes", []):
+        v = rt["verdict"]
+        if v["state"] in ("vulnerable", "end-of-life"):
+            n += 1
+            fix = f" → update to *{v['fix']}*" if v["state"] == "vulnerable" else f" → {v['fix']}"
+            lines.append(f"🔴 *Node {rt['version'].lstrip('v')}* — {rt['where']}: {v['why']}{fix}")
+    for p in r.get("projects", []):
+        prod, allp = p.get("prod"), p.get("all")
+        if not prod:
+            continue
+        if prod["critical"] or prod["high"]:
+            n += 1
+            top = "; ".join(f"{w['pkg']} ({w['severity']}, fix {w['fix']})" for w in prod["worst"][:3])
+            lines.append(f"🔴 *{p['name']}* ships {prod['critical']} critical, {prod['high']} high: {top}")
+        elif allp and (allp["critical"] or allp["high"]):
+            lines.append(f"🟡 *{p['name']}*: build tooling only — {allp['critical']} critical, {allp['high']} high "
+                         f"(nothing that ships). `npm audit fix` when convenient")
+    sec, facing = r.get("apt_security", []), r.get("apt_facing", [])
+    if sec:
+        n += 1
+        lines.append(f"🔴 *{len(sec)} security update(s) pending on {r.get('host', 'this machine')}*: "
+                     + ", ".join(f"{u['pkg']} {u['new']}" for u in sec[:8]) + (" …" if len(sec) > 8 else ""))
+    if facing:
+        n += 1
+        lines.append("🟠 *Internet-facing software has updates*: "
+                     + ", ".join(f"{u['pkg']} {u['old']} → {u['new']}" for u in facing))
+    cs = r.get("code_server")
+    if cs and cs["state"] == "behind":
+        lines.append(f"🟡 *code-server* is behind: {cs['why']} (it bundles its own Node)")
+    blind = r.get("could_not_check", [])
+    head = (f"🦅 *Weekly vulnerability check* — {n} thing(s) need fixing" if n
+            else f"🦅 *Weekly vulnerability check* — nothing found, but {len(blind)} check(s) could not run" if blind
+            else "🦅 *Weekly vulnerability check* — all clear")
+    # WHAT WAS LOOKED AT AND PASSED, every week: a short report is only reassuring if it says what it covered.
+    fine = [f"{rt['where']} (Node {rt['version'].lstrip('v')})" for rt in r.get("runtimes", [])
+            if rt["verdict"]["state"] == "ok"]
+    clean = [p["name"] for p in r.get("projects", [])
+             if p.get("prod") and not (p["prod"]["critical"] or p["prod"]["high"])
+             and not (p.get("all") and (p["all"]["critical"] or p["all"]["high"]))]
+    if clean:
+        fine.append(f"packages in {', '.join(clean)}")
+    if not (sec or facing) and "apt" not in " ".join(blind):
+        fine.append("system updates")
+    if cs and cs["state"] == "ok":
+        fine.append("code-server")
+    body = "\n".join(lines) if lines else "Nothing known and unpatched."
+    ok_line = f"\n✅ Checked and fine: {'; '.join(fine)}." if fine else ""
+    tail = ("\n⚠️ *Could not check* (not the same as clear): " + "; ".join(blind)) if blind else ""
+    return f"{head}\n{body}{ok_line}{tail}"
+
+
+# ── The outside world (each failure becomes a could-not-check line, never an exception) ──────────
+
+def _get_json(url: str, headers: dict | None = None, timeout: int = 30):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _run(argv: list[str], timeout: int = 180, cwd: str | None = None) -> tuple[int, str]:
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def node_binaries() -> list[tuple[str, str]]:
+    """(where, path) for every distinct node binary: PATH, the known extra places, and nvm's."""
+    seen, out = set(), []
+    cands = []
+    for d in os.environ.get("PATH", "/usr/bin").split(":") + ["/usr/bin", "/usr/local/bin"]:
+        cands.append(os.path.join(d, "node"))
+    cands += list(NODE_PLACES)
+    cands += [str(p) for p in (_env.HOME / ".nvm" / "versions" / "node").glob("*/bin/node")]
+    for c in cands:
+        if not os.path.isfile(c) or not os.access(c, os.X_OK):
+            continue
+        real = os.path.realpath(c)
+        if real in seen:
+            continue
+        seen.add(real)
+        where = ("code-server's bundled Node" if "code-server" in real else
+                 "nvm" if "/.nvm/" in real else f"this machine ({c})")
+        out.append((where, real))
+    return out
+
+
+def app_node() -> tuple[str, str]:
+    """(version, why-not) for the Node the deployed app runs, from its /api/state (app.node)."""
+    env = {}
+    try:
+        for line in APP_ENV.read_text().splitlines():
+            m = re.match(r"\s*(?:export\s+)?([A-Z_]+)=(.*)$", line)
+            if m:
+                env[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    except OSError:
+        return "", f"{APP_NAME} — no {APP_ENV.name} to read its address from"
+    url, secret = env.get("MOSES_APP_URL") or env.get("VIATICA_APP_URL", ""), env.get("CRON_SECRET", "")
+    if not url or not secret:
+        return "", f"{APP_NAME} — {APP_ENV.name} lacks MOSES_APP_URL (or VIATICA_APP_URL) or CRON_SECRET"
+    try:
+        app = _get_json(f"{url.rstrip('/')}/api/state", {"Authorization": f"Bearer {secret}"}).get("app") or {}
+    except Exception as e:  # noqa: BLE001
+        return "", f"{APP_NAME} — /api/state did not answer ({type(e).__name__})"
+    if not app.get("node"):
+        return "", f"{APP_NAME} — /api/state does not report app.node"
+    return str(app["node"]), ""
+
+
+def projects_with_lockfiles() -> list[Path]:
+    try:
+        return sorted(d for d in PROJECTS.iterdir() if (d / ".git").is_dir() and (d / "package-lock.json").is_file())
+    except OSError:
+        return []
+
+
+def audit(project: Path, omit_dev: bool) -> tuple[dict | None, str]:
+    npm = shutil.which("npm")
+    if not npm:
+        return None, "npm is not installed"
+    rc, out = _run([npm, "audit", "--json", *(["--omit=dev"] if omit_dev else [])], cwd=str(project))
+    try:
+        return summarize_audit(json.loads(out)), ""     # npm audit exits 1 when it FINDS something
+    except ValueError:
+        return None, f"npm audit gave no report (exit {rc})"
+
+
+def collect(today: dt.date) -> dict:
+    r: dict = {"checked_at": dt.datetime.now().isoformat(timespec="seconds"), "host": os.uname().nodename,
+               "runtimes": [], "projects": [], "apt_security": [], "apt_facing": [], "code_server": None,
+               "could_not_check": []}
+    blind = r["could_not_check"]
+
+    # 1. Node runtimes.
+    try:
+        index, schedule = _get_json(NODE_INDEX), _get_json(NODE_SCHEDULE)
+    except Exception as e:  # noqa: BLE001
+        index = schedule = None
+        blind.append(f"Node.js advisories (nodejs.org did not answer: {type(e).__name__})")
+    found = [(where, _run([path, "-v"], timeout=20)[1].strip()) for where, path in node_binaries()]
+    vv, why = app_node()
+    if vv:
+        found.append((f"{APP_NAME} in production", vv))
+    elif why:
+        blind.append(why)
+    if index is not None:
+        for where, version in found:
+            r["runtimes"].append({"where": where, "version": version,
+                                  "verdict": node_verdict(version, index, schedule, today)})
+
+    # 2. Packages.
+    for proj in projects_with_lockfiles():
+        prod, why1 = audit(proj, omit_dev=True)
+        allp, why2 = audit(proj, omit_dev=False)
+        if prod is None:
+            blind.append(f"{proj.name} packages ({why1})")
+            continue
+        r["projects"].append({"name": proj.name, "prod": prod, "all": allp})
+
+    # 3. The operating system.
+    rc, out = _run(["apt", "list", "--upgradable"], timeout=60)
+    if rc != 0:
+        blind.append(f"apt (exit {rc}; the package lists may be stale)")
+    else:
+        r["apt_security"], r["apt_facing"] = apt_findings(parse_apt(out))
+
+    # 4. code-server.
+    if shutil.which("code-server"):
+        rc, out = _run(["code-server", "--version"], timeout=30)
+        try:
+            tag = _get_json(CODE_SERVER_LATEST).get("tag_name", "")
+        except Exception as e:  # noqa: BLE001
+            tag = ""
+            blind.append(f"code-server releases (GitHub did not answer: {type(e).__name__})")
+        if tag:
+            r["code_server"] = code_server_verdict(out.split()[0] if out.strip() else "", tag)
+    return r
+
+
+def post(text: str) -> str:
+    """As the ops persona (name and emoji from the roster), in the ops channel. Returns "" or why it could not."""
+    if not CHANNEL:
+        return "no channel (MOSES_VULNCHECK_CHANNEL or MOSES_LIVENESS_CHANNEL)"
+    token = ""
+    try:
+        for line in (_env.CONFIG / "slack.env").read_text().splitlines():
+            m = re.match(r"\s*(?:export\s+)?SLACK_BOT_TOKEN=(.*)$", line)
+            if m:
+                token = m.group(1).strip().strip('"').strip("'")
+    except OSError:
+        pass
+    if not token:
+        return "no SLACK_BOT_TOKEN in slack.env"
+    body = {"channel": CHANNEL, "text": text, "username": _persona.name_of("birdeye"),
+            "icon_emoji": _persona.emoji_of("birdeye", ":eagle:"), "unfurl_links": False}
+    req = urllib.request.Request("https://slack.com/api/chat.postMessage", data=json.dumps(body).encode(),
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json; charset=utf-8"})
+    try:
+        resp = json.load(urllib.request.urlopen(req, timeout=20))
+    except Exception as e:  # noqa: BLE001
+        return f"Slack did not answer ({type(e).__name__})"
+    return "" if resp.get("ok") else f"Slack refused: {resp.get('error')}"
+
+
+CHECK_DAY = (_env.setting("MOSES_VULNCHECK_DAY") or "Mon")[:3].title()   # the timer's day, said if missed
+
+
+def section(saved: dict | None, now: dt.datetime, check_day: str = CHECK_DAY) -> str:
+    """The standup's lines. Today's saved report when there is one; on the check day without one, say the
+    check did not run; any other day, nothing."""
+    try:
+        at = dt.datetime.fromisoformat(saved["checked_at"]) if saved else None
+    except (KeyError, TypeError, ValueError):
+        at = None
+    if saved and at and at.date() == now.date() and saved.get("report"):
+        return saved["report"]
+    if now.strftime("%a") == check_day:
+        last = at.strftime("%a %b %-d") if at else "never"
+        return (f"🦅 *Weekly vulnerability check* — did not run this morning (last run: {last}). "
+                "Run `moses-vulncheck --print` to see it now.")
+    return ""
+
+
+def main(argv: list[str]) -> int:
+    if "--section" in argv:
+        try:
+            saved = json.loads(STATE.read_text())
+        except (OSError, ValueError):
+            saved = None
+        out = section(saved, dt.datetime.now())
+        if out:
+            print(out)
+        return 0
+    r = collect(dt.date.today())
+    text = render(r)
+    try:
+        STATE.parent.mkdir(parents=True, exist_ok=True)
+        STATE.write_text(json.dumps({**r, "report": text}, indent=1))   # for Moses to answer from
+    except OSError:
+        pass
+    if "--json" in argv:
+        print(json.dumps(r, indent=1))
+        return 0
+    if "--print" in argv:
+        print(text)
+        return 0
+    if "--save" in argv:
+        print("saved:", text.splitlines()[0])
+        return 0
+    why = post(text)
+    if why:
+        print(f"moses-vulncheck: could not post — {why}\n\n{text}", file=sys.stderr)
+        return 1
+    print("posted:", text.splitlines()[0])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

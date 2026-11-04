@@ -11,6 +11,7 @@
 # Written after the first live provision of this code printed "glog: unbound variable" at exit and
 # left its marker behind: no suite ran provision itself.
 set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/sandbox.sh"; sandbox_use_stand_in_if_nested
 . "$(dirname "$(readlink -f "$0")")/../agent/lib/moses-env.sh"
 HERE=$MOSES_ROOT/knight
 pass=0; fail=0

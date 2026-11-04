@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""moses-fix — the short list of fixes Moses may run for what the standup flags, on Brad's say-so.
+
+    agent/moses-fix ops                 what is on the list
+    agent/moses-fix framework-push      publish the framework commits that are not on GitHub yet
+    agent/moses-fix framework-sync      bring the public framework level with this tree, then publish
+    agent/moses-fix <op> --notify       …and post the result in the latest standup's thread
+
+--notify IS HOW A FIX STARTED FROM SLACK REPORTS BACK. A Moses turn is cut off at two minutes
+(MOSES_CHAT_TIMEOUT) and a sync runs the framework's whole test suite, so fix_drift starts this in the
+background and returns at once. The result then has to arrive by something that exists — not by
+Moses "remembering" to say it (2026-09-11: he promised "I'll ping you when it lands" with nothing able
+to deliver it). So this posts it itself, as a reply under the standup that offered the fix.
+
+WHY (Brad, 2026-11-03): "I'm glad it gets reported, but then I'll read it and just come back to ask
+you about it when Moses should be able to fix the issue." The standup flagged "the public framework
+is behind" for two weeks and "has commits nobody pushed" for five days; each time the fix was a
+procedure someone had to come and run. Now the drift line says Moses can fix it, Brad answers in the
+thread, and Moses calls this.
+
+A NAMED LIST, NOT A SHELL — the same reasoning as moses-remediate. Each op does one thing and refuses
+everything else by name. It runs as the operator (git pushes with the operator's keys), never as root,
+and every attempt — done, refused or failed — goes to $MOSES_STATE/fixes.jsonl.
+
+PUBLISHING IS THE RISK, so every path to GitHub goes through the same three gates, in order:
+  1. the framework checkout is clean (nothing half-done gets swept into a commit);
+  2. no ADDED line matches framework.private-words — Brad's private topics, which the secret scanner
+     does not know about. Without that file the op refuses: a check that could not run is not a pass;
+  3. the framework's own tools/scan-secrets.sh --all passes.
+A sync also runs the framework's tests before it commits. Anything that refuses stops the op and says
+why, so Moses can tell Brad what needs him instead of guessing.
+
+Exit codes: 0 done (or nothing to do), 1 refused, 2 could not run.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+FRAMEWORK = Path(os.environ.get("MOSES_FRAMEWORK") or REPO.parent / "moses-framework")
+PRIVATE_WORDS = Path(os.environ.get("MOSES_PRIVATE_WORDS") or REPO / "framework.private-words")
+SYNC = Path(os.environ.get("MOSES_FRAMEWORK_SYNC") or REPO / "agent" / "moses-framework-sync")
+STATE = Path(os.environ.get("MOSES_STATE") or Path.home() / ".local" / "state" / "moses")
+STANDUPS = Path(os.environ.get("MOSES_STANDUPS") or "/var/lib/moses/standups")
+SLACK_ENV = Path(os.environ.get("MOSES_CONFIG_DIR") or Path.home() / ".config" / "moses") / "slack.env"
+BRANCH = "main"
+
+OPS = {
+    "framework-push": "publish the framework commits that are not on GitHub yet "
+                      "(checks private topics and secrets first)",
+    "framework-sync": "copy what changed in Moses into the public framework, run its tests, commit and "
+                      "publish (checks private topics and secrets first)",
+}
+
+
+class Refused(Exception):
+    """The op looked and said no — Brad needs to decide something."""
+
+
+class CouldNotRun(Exception):
+    """The op could not look. Never reported as done."""
+
+
+def log(op: str, result: str, detail: str) -> None:
+    try:
+        STATE.mkdir(parents=True, exist_ok=True)
+        with open(STATE / "fixes.jsonl", "a") as f:
+            f.write(json.dumps({"at": _dt.datetime.now().isoformat(timespec="seconds"), "op": op,
+                                "result": result, "detail": detail[:2000]}) + "\n")
+    except OSError:
+        pass
+
+
+def git(*args: str, check: bool = True) -> str:
+    r = subprocess.run(["git", "-C", str(FRAMEWORK), *args], capture_output=True, text=True, timeout=300)
+    if check and r.returncode != 0:
+        raise CouldNotRun(f"git {' '.join(args)} failed: {(r.stderr or r.stdout).strip()[:400]}")
+    return r.stdout
+
+
+def private_patterns() -> list[re.Pattern]:
+    if not PRIVATE_WORDS.is_file():
+        raise CouldNotRun(f"no private-topics list at {PRIVATE_WORDS}, so nothing can be checked before "
+                          "publishing — refusing rather than publishing unchecked")
+    pats = []
+    for n, line in enumerate(PRIVATE_WORDS.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pats.append(re.compile(line, re.IGNORECASE))
+        except re.error as e:
+            raise CouldNotRun(f"{PRIVATE_WORDS.name} line {n} is not a valid pattern ({e})")
+    if not pats:
+        raise CouldNotRun(f"{PRIVATE_WORDS.name} has no patterns in it — refusing to publish unchecked")
+    return pats
+
+
+def added_lines(diff: str) -> list[tuple[str, str]]:
+    """(file, line) for every line a unified diff adds."""
+    out, cur = [], "?"
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            cur = line[6:] if line.startswith("+++ b/") else line[4:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            out.append((cur, line[1:]))
+    return out
+
+
+def check_private(lines: list[tuple[str, str]]) -> None:
+    pats = private_patterns()
+    hits = []
+    for f, text in lines:
+        for p in pats:
+            m = p.search(text)
+            if m:
+                hits.append(f"{f}: \"{m.group(0)}\" (rule: {p.pattern})")
+                break
+    if hits:
+        more = f" … and {len(hits) - 8} more" if len(hits) > 8 else ""
+        raise Refused("it would publish a private topic:\n  " + "\n  ".join(hits[:8]) + more +
+                      f"\nEither take it out of the change, or if it is fine to publish, adjust "
+                      f"{PRIVATE_WORDS.name}. Nothing was committed or pushed.")
+
+
+def check_clean() -> None:
+    dirty = git("status", "--porcelain").strip()
+    if dirty:
+        n = len(dirty.splitlines())
+        raise Refused(f"the framework checkout has {n} uncommitted change(s) nobody made through me — "
+                      f"I won't sweep them into a public commit:\n  " + "\n  ".join(dirty.splitlines()[:6]))
+
+
+def check_secrets() -> None:
+    scan = FRAMEWORK / "tools" / "scan-secrets.sh"
+    if not scan.is_file():
+        raise CouldNotRun(f"the framework's secret scanner is missing ({scan})")
+    r = subprocess.run(["bash", str(scan), "--all"], cwd=FRAMEWORK, capture_output=True, text=True, timeout=600)
+    if r.returncode != 0:
+        raise Refused("the framework's secret scanner rejected it:\n" + (r.stdout + r.stderr).strip()[-1200:])
+
+
+def test_python() -> str:
+    """The framework's own venv, else the one Moses runs in, else this interpreter.
+
+    Found 2026-11-03 before the first real run: the framework checkout has no .venv, and this script's
+    own interpreter is the system python3 (its shebang), which lacks slack_sdk — so five framework test
+    files failed on imports and every sync would have been refused for a reason that was not the code.
+    """
+    for c in (os.environ.get("MOSES_TEST_PYTHON"), FRAMEWORK / ".venv" / "bin" / "python",
+              Path.home() / "moses-venv" / "bin" / "python"):
+        if c and Path(c).exists():
+            return str(c)
+    return sys.executable
+
+
+def run_tests() -> str:
+    tests = sorted((FRAMEWORK / "agent").glob("*_test.py"))
+    py = test_python()
+    failed = []
+    for t in tests:
+        r = subprocess.run([py, str(t)], cwd=FRAMEWORK, capture_output=True, text=True, timeout=900,
+                           env={k: v for k, v in os.environ.items() if k != "MOSES_ROOT"})
+        if r.returncode != 0:
+            failed.append(f"{t.name}: " + (r.stdout + r.stderr).strip().splitlines()[-1][:200]
+                          if (r.stdout + r.stderr).strip() else t.name)
+    if failed:
+        raise Refused("the framework's tests failed after the sync, so I did not commit it "
+                      "(the copied files are left in the framework checkout to look at):\n  " + "\n  ".join(failed))
+    return f"{len(tests)} test file(s) passed"
+
+
+def framework_push() -> str:
+    check_clean()
+    git("fetch", "origin", BRANCH)
+    ahead = int(git("rev-list", "--count", f"origin/{BRANCH}..HEAD").strip() or 0)
+    if ahead == 0:
+        return "nothing to publish: the framework on GitHub already has every commit"
+    behind = int(git("rev-list", "--count", f"HEAD..origin/{BRANCH}").strip() or 0)
+    if behind:
+        raise Refused(f"GitHub has {behind} commit(s) this checkout does not — someone pushed from "
+                      "elsewhere. That needs a person to merge; I won't force anything.")
+    check_private(added_lines(git("diff", f"origin/{BRANCH}..HEAD")))
+    check_secrets()
+    subjects = git("log", "--format=%s", f"origin/{BRANCH}..HEAD").strip().splitlines()
+    git("push", "origin", f"HEAD:{BRANCH}")
+    git("fetch", "origin", BRANCH)
+    left = int(git("rev-list", "--count", f"origin/{BRANCH}..HEAD").strip() or 0)
+    if left:
+        raise CouldNotRun(f"the push reported success but {left} commit(s) are still not on GitHub")
+    return f"published {ahead} commit(s) to GitHub:\n  " + "\n  ".join(subjects[:10])
+
+
+def framework_sync() -> str:
+    check_clean()
+    r = subprocess.run([sys.executable, str(SYNC), "--framework", str(FRAMEWORK)],
+                       capture_output=True, text=True, timeout=900)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode != 0:
+        # The sync's own refusals (an unclassified file, a scrubbed name left behind, portability going
+        # up) are decisions for Brad, said in its own words.
+        raise Refused("the sync itself stopped:\n" + out[-1500:])
+    # --untracked-files=all: plain porcelain folds a brand-new directory into one "?? agent/" line,
+    # and the files inside it would then skip the private-topic check below. Found by the test.
+    changed = [l for l in git("status", "--porcelain", "--untracked-files=all").splitlines() if l.strip()]
+    if not changed:
+        return "already in step — nothing to copy.\n" + framework_push()
+
+    paths = [l[3:].split(" -> ")[-1] for l in changed]
+    # AGAINST HEAD, staged and unstaged alike. moses-framework-sync STAGES what it copies, and the first
+    # version of this read plain `git diff` (working tree vs index), which is empty for staged files:
+    # the trial run on 2026-11-03 committed a test file full of private words, and only the second
+    # check, at push time, stopped it. Untracked files have no diff at all, so they are read whole.
+    diff = git("diff", "HEAD")
+    for p in git("ls-files", "--others", "--exclude-standard").splitlines():
+        f = FRAMEWORK / p
+        if f.is_file():
+            try:
+                diff += f"\n+++ b/{p}\n" + "".join(f"+{l}\n" for l in f.read_text(errors="replace").splitlines())
+            except OSError:
+                pass
+    check_private(added_lines(diff))
+    check_secrets()
+    tests = run_tests()
+
+    git("add", "--", *paths)
+    names = ", ".join(Path(p).name for p in paths[:5]) + (f" and {len(paths) - 5} more" if len(paths) > 5 else "")
+    git("commit", "-q", "-m", f"Sync from the running tree: {names}\n\n"
+        f"{len(paths)} file(s), by moses-fix framework-sync on Brad's yes in the standup thread.\n"
+        f"Checked for private topics and secrets; {tests}.")
+    return f"synced {len(paths)} file(s) ({names}); {tests}.\n" + framework_push()
+
+
+def notify(op: str, verdict: str, msg: str) -> str:
+    """Post the outcome under the most recent standup. Returns what happened, never raises."""
+    text = f"*{op}* — {verdict}\n{msg}"[:3500]
+    try:
+        recs = sorted((d for d in STANDUPS.iterdir() if (d / "slack.json").is_file()), reverse=True)
+        posted = json.loads((recs[0] / "slack.json").read_text()) if recs else {}
+    except OSError:
+        posted = {}
+    channel, ts = posted.get("channel"), posted.get("ts")
+    if not channel:
+        return "could not report: no standup post on record to reply under"
+    payload = {"channel": channel, "thread_ts": ts, "text": text, "unfurl_links": False}
+    if os.environ.get("MOSES_FIX_NOTIFY_LOG"):         # tests: record the post instead of sending it
+        with open(os.environ["MOSES_FIX_NOTIFY_LOG"], "a") as f:
+            f.write(json.dumps(payload) + "\n")
+        return "reported (test log)"
+    token = ""
+    try:
+        for line in SLACK_ENV.read_text().splitlines():
+            if line.startswith("SLACK_BOT_TOKEN="):
+                token = line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    if not token:
+        return f"could not report: no SLACK_BOT_TOKEN in {SLACK_ENV}"
+    import urllib.request
+    req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+                                 data=json.dumps(payload).encode(),
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json; charset=utf-8"})
+    try:
+        r = json.load(urllib.request.urlopen(req, timeout=20))
+        return "reported in the standup thread" if r.get("ok") else f"could not report: Slack said {r.get('error')}"
+    except Exception as e:                                           # noqa: BLE001
+        return f"could not report: {type(e).__name__}"
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:] if not a.startswith("--notify")]
+    op = args[0] if args else "ops"
+    if op in ("ops", "--list", "-h", "--help"):
+        print("Fixes I can run when Brad says so:")
+        for k, v in OPS.items():
+            print(f"  {k:16} {v}")
+        return 0
+    if op not in OPS:
+        log(op, "refused", "not on the list")
+        print(f"moses-fix: '{op}' is not on the list. Have: {', '.join(OPS)}", file=sys.stderr)
+        return 1
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "fix.lock", "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            print("moses-fix: another fix is already running", file=sys.stderr)
+            return 2
+        try:
+            msg = {"framework-push": framework_push, "framework-sync": framework_sync}[op]()
+            verdict, result, rc = "DONE", "done", 0
+        except Refused as e:
+            msg, verdict, result, rc = str(e), "REFUSED", "refused", 1
+        except CouldNotRun as e:
+            msg, verdict, result, rc = str(e), "COULD NOT RUN", "could-not-run", 2
+        except Exception as e:                                       # noqa: BLE001
+            msg, verdict, result, rc = f"{type(e).__name__}: {e}", "COULD NOT RUN", "could-not-run", 2
+    log(op, result, msg)
+    print(f"{verdict} — {msg}")
+    if "--notify" in sys.argv:
+        said = notify(op, verdict, msg)
+        log(op, "notify", said)
+        print(f"({said})")
+    return rc
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

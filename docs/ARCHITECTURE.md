@@ -49,6 +49,11 @@ three ways.
                             │         │  cloudflared.service      (system)                │
                             │         │    tunnel "Reserve", the only inbound path        │
                             │         │                                                   │
+                            │         │  snap.canonical-livepatch.canonical-livepatchd    │
+                            │         │    (system) Ubuntu Pro Livepatch, attached        │
+                            │         │    2026-11-03; kernel CVE patches without a       │
+                            │         │    reboot, supported to 2027-11-15                │
+                            │         │                                                   │
                             │         │  /home/brad/.claude/memory   ← the corpus         │
                             │         │  ~/.config/moses/roster.json      ← the roster         │
                             │         │  /var/lib/moses/             ← standup state      │
@@ -480,6 +485,35 @@ measured against, so **silence is a failure with a name on it** rather than an a
 Moses stamps its own heartbeat too (`/var/lib/moses/last-standup`), so a morning that never ran is
 reported by the next one instead of vanishing.
 
+### 3a. The weekly vulnerability check — Birdeye, Mondays (2026-10-23)
+
+Stripe emailed that the product's production server ran a Node.js with a critical remote-code-execution
+bug; nothing here had looked, and the same morning's look found four more. So once a week:
+
+```
+  Mondays 07:40 America/Chicago
+  moses-vulncheck.timer (user) ──▶ agent/moses-vulncheck --save   (checks, saves, posts nothing)
+     │
+     ├─ every node binary here (PATH, code-server's bundled copy, nvm) ─┐
+     ├─ the deployed app's Node: GET <app>/api/state → app.node ─────────┤  vs nodejs.org/dist/index.json
+     │    (address + CRON_SECRET from customs.env; name: MOSES_APP_NAME)  │  (marks security releases) and
+     │                                                                   ┘  the release schedule (end of life)
+     ├─ npm audit --omit=dev, and again in full, in every git repo under the projects folder with a lockfile
+     ├─ apt list --upgradable: the -security pocket, plus internet-facing packages from any pocket
+     │    (cloudflared, tailscale, openssh, nodejs, code-server)
+     └─ code-server --version vs its latest GitHub release
+     ▼
+  STATE/vulncheck.json ──▶ 08:00 standup: agent/local-standup → moses-vulncheck --section
+  in the standup, every Monday, all clear included; findings first, each with its fix; "checked and
+  fine" says what was covered; a check that could not run is named, never read as clear; on Monday a
+  missing or old result says "did not run this morning"
+```
+
+Callers: the timer (--save) and the standup (--section). By hand: `moses-vulncheck --print` or `--json`
+(no post), or with no flag to post the report as Birdeye in #ops. It reads
+nodejs.org, raw.githubusercontent.com, api.github.com, the app's `/api/state`, and npm's registry through
+`npm audit`. Nothing needs root. Tests: `agent/vulncheck_test.py` (each guard watched failing).
+
 ---
 
 ## 4. Data flow — where state lives and how it survives
@@ -833,6 +867,15 @@ mcp/dashboard_board_test.py.
        Slack: "🔎 not built — what the     prepended to the builder's brief
        code actually holds"                       │
                                                   ▼
+                    ┌── THE MEMORY NOTES (2026-10-29) ──────────────────────────────┐
+                    │  agent/claude-run --job-notes task.txt → the framework's      │
+                    │  hooks/relevant-notes.py --for-job, matched on the TASK only: │
+                    │  the job note (steps inlined) + a locked decision that ranks  │
+                    │  top-3 on its own. → notes.txt, prepended to BOTH briefs      │
+                    │  (builder and reviewer). Can't run → the brief says so; the   │
+                    │  job goes on. No match → nothing added.                       │
+                    └───────────────┬───────────────────────────────────────────────┘
+                                    ▼
               agent/claude-run --app knight-builder   (the one runner; lists from guards.env)
                 → claude -p --model opus --effort high --restricted --permission-mode acceptEdits
                   --tools and --allowedTools built from one declaration
@@ -983,6 +1026,53 @@ would open that, so it is never passed. **This is also why a target must be a re
 and not a path handed in per job**: Knight can only work on what he has a clone of, and the registry
 is what decides that. The permission lists are bash arrays; as plain strings, word-splitting shredded
 every multi-word pattern (`Bash(git push:*)` → `Bash(git` + `push:*)`).
+
+### The gate sandbox — Knight's code never runs as Brad (2026-11-04, #17 MF7)
+
+Claude Code's sandbox covers the **agent session**. It ends when the session does. After that the
+runner itself runs Knight's work (prep, the gate, the re-gate after a rebase) and its own git. Until
+2026-11-04 all of that ran as brad, with network and the whole home directory. Now:
+
+```
+  knight start ──► ensure_repo: .git/config holds only allowed keys? ── no ──► refuse the job
+       │            (git_config_unexpected — a refused job's plant cannot reach the next one)
+       ▼
+  prep steps ──────► sandbox_run prep   bwrap: / read-only · /home /tmp /mnt /opt /run … empty
+       │                                 clone rw · network ON · package cache rw · clean env
+       ▼
+  knight-run: fingerprint .git/config ─► agent (Claude Code sandbox) ─► config unchanged? ── no ──► refused
+       ▼
+  re-prep / gate / re-gate ──► sandbox_run prep|gate   gate: network OFF · .git read-only
+       ▼
+  config unchanged? ─► target's pre-push hook ─► sandbox_run gate ─► git push (hooks off:
+                        (the MAINLINE's copy when tracked)             GIT_CONFIG_COUNT core.hooksPath=/dev/null)
+```
+
+- **What a step sees** is the filesystem read-only, the clone, and the target's declared extras:
+  `KT_SANDBOX_RW` (beside the clone; writable in prep, read-only in the gate), `KT_SANDBOX_RO`
+  (absolute, read-only) and `KT_SANDBOX_ENV`. The Moses targets expose `moses.env`, `roster.json` and
+  `~/.config/systemd/user`. None of those holds a credential, and the `.env` files beside them stay
+  hidden. These are single-line values, and `knight-land` refuses any branch that changes them.
+- **All of /run is hidden.** `/run/tailscale/tailscaled.sock` and sshd's socket are mode 666, and a
+  read-only file system does not stop a connect(). The review of 2026-11-04 caught the gate reaching
+  the tailnet that way. Only `/run/systemd/resolve` comes back, so prep can resolve DNS.
+- **No fallback.** If bwrap is missing or can't start, the step fails and says why. `SANDBOX_BWRAP`
+  (the test stand-in, `lib/fake-bwrap`) is honored only inside an existing sandbox, and is refused
+  anywhere else. The hardening runs after the target file is sourced, and a target file may hold only
+  `KT_` settings (`target-shape.py`), so no target can turn either back on.
+- **A declared read-only extra that is missing** (say, during an `npm ci`) is named in the log and
+  skipped. The test that needs it fails by name, rather than every gate going red.
+- **.git must be a plain directory.** A `.git` file, a symlink or a `commondir` would make git read a
+  config these checks never see, so all three are refused.
+- **Nesting doesn't work on Reserve.** bwrap can't start inside another sandbox ("No permissions to
+  create a new namespace"). So `knight-gate`, run by Knight inside Claude Code's sandbox, runs the gate
+  steps directly, and `knight/test-sandbox.sh` checks the box it is in when it runs inside the gate.
+  The full suite runs daily in `moses-selftest`, outside any sandbox, and watches each confinement
+  check fail with the sandbox removed.
+- **Why the git half exists:** the runner commits, rebases and pushes in the clone. git runs hooks,
+  and it runs commands named in `.git/config` (`core.sshCommand`, `credential.helper`, filters, merge
+  drivers, `remote.*.receivepack`, `gpg.program`). Knight could write both, and Viatica's own
+  `npm install` points `core.hooksPath` at the in-repo `.githooks`.
 
 ---
 

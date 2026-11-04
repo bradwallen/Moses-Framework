@@ -12,6 +12,7 @@ Every target answers the same four questions:
 | `KT_SOURCE` | which repository he clones from — his sandbox is a clone of it, never the original |
 | `KT_PREP` | what has to exist in the clone before an agent can build and test (deps, generated code) |
 | `KT_GATE` | the objective check the **runner** runs after he commits. Green is the only thing that ships work |
+| `KT_SANDBOX_RW` / `KT_SANDBOX_RO` / `KT_SANDBOX_ENV` | what prep and gate steps can see beyond the clone. They run in bwrap (`lib/sandbox.sh`) with no home directory, no secrets, and no network in the gate. Single-line values; a branch that changes them is refused |
 | `KT_PUSH_MODE` | where green work lands: `direct` onto the mainline, or `branch` for a human to merge |
 
 ## The line of demarcation

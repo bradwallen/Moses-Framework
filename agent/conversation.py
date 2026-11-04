@@ -38,7 +38,7 @@ WHAT IS STRIPPED FROM THE CALL, and why each matters:
                           turn — `directed and not reactive`, so another agent cannot unlock them by
                           asking, and a turn that fetched a web page has none at all.
                           ACT_TOOLS: knight_propose (a build starts only on Brad's yes to its
-                          examples — the listener starts it, #2), knight_land, zryachiy_explore, resolve_incident, add_idea, remediate,
+                          examples — the listener starts it, #2), knight_land, zryachiy_explore, resolve_incident, add_idea, remediate, fix_drift (the fixes the standup offers),
                           verification_record, and the project registry — project_add,
                           project_update, project_add_milestone, project_complete_milestone,
                           project_promote_idea, project_remove_idea, project_remove,
@@ -238,6 +238,11 @@ ACT_TOOLS = [
     "resolve_incident",
     "add_idea",
     "remediate",         # the named, root-owned repair ops — see moses-remediate
+    # THE FIXES THE STANDUP OFFERS (Brad, 2026-11-03). A drift line Moses can fix says so, Brad answers
+    # in the thread, and this runs it — see agent/moses-fix. Same gate as everything here: a person
+    # asked. It publishes to the PUBLIC framework, so the gates that matter (private topics, secrets,
+    # tests) are in moses-fix itself and cannot be talked past.
+    "fix_drift",
     # OPENING WORK IS NOT CLOSING IT. project_add was withheld with the rest of the registry writes
     # under one rule — "an agent that can edit it can make its own report come true" — and that rule
     # is right about editing and wrong about creating. A new project cannot make an existing report
@@ -594,7 +599,9 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
             f"- `{q('knight_propose')}` — hand code work to Knight, by PROPOSING it. You cannot start a "
             "build directly: you propose the task, the acceptance criteria and CONCRETE EXAMPLES of what it "
             "WILL include and what it WILL NOT (real titles, real cases — 'GIS Analyst Intern: yes; Civil "
-            "Engineering Intern that mentions ArcGIS: no' — never a category label he has to decode). Put "
+            "Engineering Intern that mentions ArcGIS: no' — never a category label he has to decode). Changes "
+            "the build must not MAKE (another library, a new file format) go in `out_of_scope`, not "
+            "`will_exclude`: an example becomes a test, and no test can name a change nobody made. Put "
             "the tool's reply in your message as it is. Brad answers yes (or ✅) and code starts it; if he "
             "says change something, propose again with the change. Never say a build has started.\n"
             "  Pass `target` to say WHICH repo: the product (the default, and the only one where a "
@@ -621,7 +628,12 @@ def _capability_text(directed: bool, reading: bool = False) -> str:
             "person to read that row has only your sentence. Never close one just to tidy the queue.\n"
             f"- `{q('remediate')}` — the short list of repairs you may make yourself. Call it with "
             "op='ops' to see what is on the list. Anything not on it is refused by name; that is not "
-            "a failure, it is the boundary.\n\n"
+            "a failure, it is the boundary.\n"
+            f"- `{q('fix_drift')}` — run a fix the standup OFFERED: a line under a flagged item that says "
+            "\"↳ I can fix this … (`<op>`)\". When Brad answers in that thread (\"go ahead\", \"do the "
+            "framework one\"), start that op; it posts its own result under the standup when it finishes, so say it has started, not that it worked. Only what he accepted, never on your "
+            "own reading of the standup. It checks for private topics and secrets itself; if it says "
+            "REFUSED or COULD NOT RUN, tell him its reason and what it needs from him, and stop.\n\n"
             "Do not say you cannot do something without trying the tool. If a call is refused, say "
             "exactly what was refused and what it said." + _framework_actions_text() + _local_actions_text())
 
@@ -893,6 +905,12 @@ def looks_like_auth_failure(data: dict) -> bool:
     return bool(_AUTH_TROUBLE.search(str(data.get("result_head") or data.get("result") or "")))
 
 
+# Where the CLI keeps its login. A module setting so the test can point it at a fake file: Knight's gate
+# runs in a sandbox with no home directory (2026-11-04), and a test that reads the real login file to
+# prove it leaks no token material was reading a real token to do it.
+CREDENTIALS_PATH = "~brad/.claude/.credentials.json"
+
+
 def credential_facts() -> dict:
     """Timestamps ONLY, never token material — the instrument that settles the next occurrence.
 
@@ -904,7 +922,7 @@ def credential_facts() -> dict:
     """
     out: dict = {}
     try:
-        path = os.path.expanduser("~brad/.claude/.credentials.json")
+        path = os.path.expanduser(CREDENTIALS_PATH)
         out["cred_mtime"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(os.path.getmtime(path)))
         with open(path, encoding="utf-8") as fh:
             oauth = (json.load(fh) or {}).get("claudeAiOauth") or {}

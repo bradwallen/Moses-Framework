@@ -20,6 +20,16 @@
 # test-guards.sh covers the permission boundary; this covers the runner mechanics.
 
 set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/sandbox.sh"; sandbox_use_stand_in_if_nested
+# INSIDE KNIGHT'S GATE SANDBOX (2026-11-04) two kinds of check here cannot run: reaching the real push
+# targets (no network) and reading the live memory corpus (no home directory). They are said as
+# skipped, by name, and covered outside: `knight doctor` (Therapist, daily) reaches every push target,
+# and relevant-notes-selftest (moses-gate-selftest, weekly) runs against the live corpus. The suite's
+# other jobs get an empty corpus, so "no note matched" stays distinguishable from "could not look".
+IN_GATE_SANDBOX=${KNIGHT_SANDBOX:-}
+if [ -n "$IN_GATE_SANDBOX" ]; then
+    MOSES_MEMORY_DIR=$(mktemp -d "${TMPDIR:-/tmp}/knight-empty-corpus.XXXXXX"); export MOSES_MEMORY_DIR
+fi
 . "$(dirname "$(readlink -f "$0")")/../agent/lib/moses-env.sh"   # whose home, where Moses lives, the operator's settings
 
 KNIGHT=$MOSES_ROOT/knight/bin/knight
@@ -253,7 +263,9 @@ hdr "Push target — the remote must authenticate before an hour of work depends
 # REAL targets only: the suite's own throwaway targets (zzz-*) would pass without any credentials,
 # which is exactly the blindness described above.
 real_targets=$(ls "$TARGETS"/*.env 2>/dev/null | xargs -r -n1 basename | sed 's/\.env$//' | grep -v '^zzz-' || true)
-if [ -z "$real_targets" ]; then
+if [ -n "$IN_GATE_SANDBOX" ]; then
+    echo "  skip  doctor reaching every real push target — no network inside the gate sandbox; knight doctor checks it daily"
+elif [ -z "$real_targets" ]; then
     bad "COULD NOT CHECK a real push target — none is registered in $TARGETS (see its README.md)"
 else
     unreachable=""
@@ -621,6 +633,56 @@ else
     bad "the could-not-check job never finished"
 fi
 
+hdr "Memory notes — a job note and locked decisions reach both briefs (2026-10-29)"
+# These runs load no plugins and are sandboxed away from the corpus, so the runner puts the matching
+# notes in the brief. Against the LIVE corpus, like relevant-notes-selftest: renaming the job note
+# fails this by name. The cap is raised because these are fake runs that spend nothing, and by
+# here the suite has already used the day's real allowance of 8.
+job=$(start_job env KNIGHT_MAX_PER_DAY=99 KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='GROUNDED\nFILES: agent/moses-framework-sync' \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" \
+      "Sync the public framework: it is 5 files behind this tree. Run agent/moses-framework-sync, read the diff, commit.") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$IN_GATE_SANDBOX" ]; then
+    echo "  skip  the sync job's note reaching both briefs — the live corpus is not in the gate sandbox; relevant-notes-selftest checks it weekly"
+    [ -n "$job" ] && wait_done "$job" >/dev/null
+elif [ -n "$job" ] && wait_done "$job"; then
+    grep -q "^JOB NOTE job-sync-moses-framework" "$JOBS/$job/brief.txt" && grep -q "moses-framework-sync --check" "$JOBS/$job/brief.txt" \
+        && ok "a framework sync briefs Knight with its job note, steps included" \
+        || bad "the sync job's note never reached Knight's brief"
+    grep -q "^JOB NOTE job-sync-moses-framework" "$JOBS/$job/review-brief.txt" \
+        && ok "and Zryachiy's review brief carries it too" || bad "the reviewer was not given the job note"
+    grep -q "^PRE-CHECK.*GROUNDED" "$JOBS/$job/brief.txt" \
+        && ok "the scout's findings are still in the brief" || bad "the notes pushed out the pre-check"
+else
+    bad "the framework-sync job never finished"
+fi
+
+job=$(start_job env KNIGHT_MAX_PER_DAY=99 KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='GROUNDED\nFILES: agent/diagnose.py' \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" "add a mail probe to the diagnosis") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$job" ] && wait_done "$job"; then
+    grep -q "MEMORY NOTES" "$JOBS/$job/brief.txt" \
+        && bad "a task no job note covers was given notes anyway: $(head -c 200 "$JOBS/$job/notes.txt")" \
+        || ok "a task no note covers gets no notes block"
+else
+    bad "the no-notes job never finished"
+fi
+
+job=$(start_job env KNIGHT_MAX_PER_DAY=99 KNIGHT_FAKE_AGENT=1 KNIGHT_FAKE_SCOUT='GROUNDED\nFILES: agent/moses-framework-sync' \
+      MOSES_MEMORY_DIR=/nonexistent/memory \
+      "$KNIGHT" start --acceptance "the job reaches a terminal status" \
+      "Sync the public framework: it is 5 files behind this tree. Run agent/moses-framework-sync, read the diff, commit.") || job=""
+[ -n "$job" ] && cleanup+=("$job")
+if [ -n "$job" ] && wait_done "$job"; then
+    [ "$(cat "$JOBS/$job/status")" != "failed" ] \
+        && ok "a notes lookup that cannot run does not stop the job" || bad "the notes lookup's outage failed the job"
+    grep -q "MEMORY NOTES: the lookup could not run" "$JOBS/$job/brief.txt" \
+        && ok "but the brief says no note was checked, and why" \
+        || bad "a failed lookup reached Knight as silence, which reads as nothing matched"
+else
+    bad "the broken-lookup job never finished"
+fi
+
 hdr "knight-gate — the whole gate as one permitted command (2026-10-01)"
 # The brief told Knight to run the gate, and on the Python targets the gate is a loop he may not run.
 KG=$MOSES_ROOT/knight/bin/knight-gate
@@ -641,6 +703,75 @@ grep -q 'knight/bin/knight-gate)"' "$MOSES_ROOT/knight/guards.env" \
     && ok "and Knight is permitted to run it" || bad "knight-gate is not on Knight's allow list"
 grep -q 'knight-gate' "$KNIGHT" \
     && ok "and his brief tells him to use it" || bad "the brief still asks for gate commands he cannot run"
+
+# --only (2026-10-29): one file from the gate, with the gate's own command. Job 1993898 spent twenty
+# minutes in five whole-gate runs, two of them only to watch one new test fail.
+if [ -d "$SUITE_CLONE/.git" ]; then
+    cp "$TARGETS/zzz-suite.env" "$SUITE/zzz-suite.env.saved"
+    cat >> "$TARGETS/zzz-suite.env" <<'ONLY_ENV'
+KT_GATE=(
+  'true'
+  'fail=0; for t in $(ls zzz-*_check.sh | sort); do [ -z "${GATE_ONLY:-}" ] || [ "${t#./}" = "${GATE_ONLY#./}" ] || continue; case "$t" in zzz-skip_check.sh) echo "== $t — not run here"; continue ;; esac; echo "== $t"; bash "$t" || fail=1; done; exit $fail'
+)
+ONLY_ENV
+    printf 'echo green-ran\n' > "$SUITE_CLONE/zzz-green_check.sh"
+    printf 'echo red-ran; exit 1\n' > "$SUITE_CLONE/zzz-red_check.sh"
+    printf 'echo skip-ran\n' > "$SUITE_CLONE/zzz-skip_check.sh"
+    printf 'not a test\n' > "$SUITE_CLONE/zzz-other.txt"
+    out=$(cd "$SUITE_CLONE" && "$KG" --only zzz-green_check.sh 2>&1); rc=$?
+    [ "$rc" -eq 0 ] && grep -q "green-ran" <<<"$out" && ! grep -q "red-ran" <<<"$out" \
+        && ok "--only runs that one file with the gate's own command, and nothing else" \
+        || bad "--only did not run just the one file (exit $rc): $(tail -2 <<<"$out" | tr '\n' ' ')"
+    out=$(cd "$SUITE_CLONE" && "$KG" --only ./zzz-red_check.sh 2>&1); rc=$?
+    [ "$rc" -eq 1 ] && grep -q "ONE TEST RED" <<<"$out" \
+        && ok "a failing file reads red" || bad "a failing file under --only did not read red (exit $rc)"
+    out=$(cd "$SUITE_CLONE" && "$KG" --only zzz-skip_check.sh 2>&1); rc=$?
+    [ "$rc" -eq 3 ] && ! grep -q "skip-ran" <<<"$out" && grep -q "NOTHING RAN" <<<"$out" \
+        && ok "a file the gate skips is not run under --only either, and that is said" \
+        || bad "--only ran, or went quiet on, a file the gate skips (exit $rc)"
+    out=$(cd "$SUITE_CLONE" && "$KG" --only zzz-other.txt 2>&1); rc=$?
+    [ "$rc" -eq 3 ] && grep -q "NOTHING RAN" <<<"$out" \
+        && ok "a file the gate does not run is refused as tested-nothing, never green" \
+        || bad "--only on a file outside the gate's list read as (exit $rc): $(tail -1 <<<"$out")"
+    out=$(cd "$SUITE_CLONE" && "$KG" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && grep -q "green-ran" <<<"$out" && grep -q "red-ran" <<<"$out" \
+        && ok "without --only, the same loop still runs every file" \
+        || bad "the GATE_ONLY clause changed the whole gate (exit $rc)"
+    rm -f "$SUITE_CLONE"/zzz-*_check.sh "$SUITE_CLONE/zzz-other.txt"
+    mv "$SUITE/zzz-suite.env.saved" "$TARGETS/zzz-suite.env"
+else
+    bad "the suite's clone was never provisioned, so --only could not be exercised"
+fi
+for t in moses moses-framework; do
+    grep -q 'GATE_ONLY' "$TARGETS/$t.env" \
+        && ok "the $t gate's loops honor --only" || bad "the $t gate has no GATE_ONLY clause, so --only runs nothing there"
+done
+grep -q 'knight-gate --only:\*)"' "$MOSES_ROOT/knight/guards.env" \
+    && ok "Knight is permitted to run --only" || bad "--only is not on Knight's allow list"
+grep -q 'knight-gate --only' "$KNIGHT" \
+    && ok "and his brief tells him about it" || bad "the brief does not mention --only"
+
+hdr "The moses target refreshes Knight's framework clone at job start (2026-10-29)"
+# Job 1993898's gate went red because knight/repo/moses-framework was 35 minutes behind the framework
+# the live runner uses. Runs the REAL prep line from moses.env against a scratch pair of repositories.
+step=$( . "$TARGETS/moses.env"; for s in ${KT_PREP+"${KT_PREP[@]}"}; do case "$s" in *moses-framework*) printf '%s' "$s" ;; esac; done )
+if [ -z "$step" ]; then
+    bad "moses.env has no prep line that refreshes ../moses-framework"
+else
+    FW=$(mktemp -d /tmp/knight-test-fw-XXXXXX); scratch_dirs+=("$FW")
+    git init -q -b main "$FW/src"
+    git -C "$FW/src" -c user.email=t@t.test -c user.name=t commit -q --allow-empty -m A
+    mkdir -p "$FW/repo/moses"
+    git clone -q "$FW/src" "$FW/repo/moses-framework" && git -C "$FW/repo/moses-framework" remote remove origin
+    echo leftover > "$FW/repo/moses-framework/stray.txt"; git -C "$FW/repo/moses-framework" add stray.txt
+    git -C "$FW/src" -c user.email=t@t.test -c user.name=t commit -q --allow-empty -m B
+    (cd "$FW/repo/moses" && MOSES_FRAMEWORK="$FW/src" bash -c "$step" >/dev/null 2>&1)
+    [ "$(git -C "$FW/repo/moses-framework" rev-parse HEAD)" = "$(git -C "$FW/src" rev-parse HEAD)" ] \
+        && ok "prep moves the sibling framework clone to the live framework's tip, past a previous job's leftovers" \
+        || bad "the sibling framework clone was left at $(git -C "$FW/repo/moses-framework" log --format=%s -1)"
+    git -C "$FW/repo/moses-framework" remote | grep -q . \
+        && bad "the refresh added a remote to Knight's clone" || ok "and it adds no remote"
+fi
 
 # ── Verdict ─────────────────────────────────────────────────────────────────
 hdr "Result"

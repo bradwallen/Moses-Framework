@@ -86,6 +86,28 @@ def commandments_text() -> str:
     return text
 
 
+# ── The memory notes a build job matches (2026-10-29) ───────────────────────
+# The same --setting-sources "" that kept the commandments out kept the relevant-notes hook out too, so
+# a Knight job to sync the framework never saw the job note written for exactly that. The notes depend
+# on the task, so they go in the BRIEF (knight-run puts them there), not in a profile's system prompt.
+# An ENHANCEMENT, unlike the commandments: a lookup that fails returns the reason, and the job runs.
+NOTES_HOOK = FRAMEWORK / "hooks" / "relevant-notes.py"
+
+
+def job_notes(task: str) -> tuple[str, str]:
+    """(the block to put in the brief, or "") and (why the lookup could not run, or "")."""
+    env = dict(os.environ, MOSES_MEMORY_DIR=str(_env.MEMORY),
+               MOSES_OPERATOR=_env.setting("MOSES_OWNER_NAME") or "the operator")
+    try:
+        r = subprocess.run(["python3", str(NOTES_HOOK), "--for-job"], input=task, capture_output=True,
+                           text=True, timeout=15, env=env)
+    except Exception as e:
+        return "", f"{NOTES_HOOK} did not run ({e})"
+    if r.returncode != 0:
+        return "", f"{NOTES_HOOK} exited {r.returncode}: {r.stderr.strip()[-300:]}"
+    return r.stdout.strip(), ""
+
+
 class ProfileError(Exception):
     """A profile that cannot be built, or a caller asking for something its profile does not allow."""
 

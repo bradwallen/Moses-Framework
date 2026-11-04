@@ -11,6 +11,7 @@ check must go red.
 """
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -268,6 +269,37 @@ def suite(verbose):
     build_spec._save(d)
     react(BRAD, d["specs"][-1].get("message_ts", ""))
     check("a ✅ on a spec past its TTL starts nothing", started() == [], started())
+
+    # Out of scope is not an example (2026-10-29). Job 1993898's four exclusions, verbatim: each is a change
+    # the build must not make, no test could name one, and the job was held after a green gate.
+    m38 = ["Deleting or renaming the existing project literally named `--help` (Brad's call, not the build's)",
+           "Switching the CLI to a different argument-parsing library",
+           "Adding a `--` escape so a name starting with a dash can be forced",
+           "Changing project ids, codes or the registry file format"]
+    reset()
+    out = build_spec.propose("Fix moses-project CLI argument handling", "Option-like tokens are never project names",
+                             "`moses-project add -x` → error naming `-x`", "\n".join(m38), "moses")
+    spec = (build_spec._load()["specs"] or [{}])[-1]
+    check("a change-not-to-make filed as an exclusion is moved to out of scope",
+          spec.get("out_of_scope") == m38 and spec.get("exclude") == [], spec)
+    check("and the spec Brad confirms shows it there", "Out of scope" in out and "Will not include" not in out, out)
+    reset()
+    build_spec.propose("Restrict the list to GIS roles", "Only GIS-titled roles are listed", "GIS Analyst Intern",
+                       "Civil Engineering Intern that mentions ArcGIS", "gis", out_of_scope="Changing the posting schema")
+    spec = (build_spec._load()["specs"] or [{}])[-1]
+    check("a real excluded case stays an example, and out_of_scope is kept apart",
+          spec.get("exclude") == ["Civil Engineering Intern that mentions ArcGIS"]
+          and spec.get("out_of_scope") == ["Changing the posting schema"], spec)
+    reset()
+    out = build_spec.propose("Restrict the list to GIS roles", "Only GIS-titled roles are listed", "GIS Analyst Intern", "", "gis")
+    check("includes with no line drawn on the other side are still refused", "EXAMPLES" in out and not build_spec.ids(), out)
+    reset(); model_proposing(include="`moses-project add -x` → refused", exclude=m38[1])
+    fire(BRAD, "Moses, fix the CLI flags", "40.1")
+    fire(BRAD, "yes", "40.2")
+    argv = json.loads(started()[0].read_text()) if started() else []
+    acc = argv[argv.index("--acceptance") + 1] if "--acceptance" in argv else ""
+    check("out of scope reaches the build under its own prefix, never as an example to test",
+          "- Out of scope: Switching the CLI" in acc and "It does NOT include: Switching" not in acc, acc or argv)
     return passed, failed
 
 
@@ -296,6 +328,8 @@ MUTANTS = [
     ("no TTL on reactions", lambda: setattr(build_spec, "TTL", 10 ** 9),
      "a ✅ on a spec past its TTL starts nothing"),
     ("no take", lambda: setattr(build_spec, "_take", lambda sid: True), "three confirmations at once start ONE build"),
+    ("no scope rule", lambda: setattr(build_spec, "SCOPE_RULE", re.compile(r"(?!x)x")),
+     "a change-not-to-make filed as an exclusion is moved to out of scope"),
 ]
 
 if __name__ == "__main__":

@@ -49,10 +49,30 @@ USER_ENV = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "
 
 DRIFT: list[tuple[str, str]] = []      # (what, detail)
 BLIND: list[tuple[str, str]] = []      # (what, why it could not be checked)
+OFFERS: dict[str, str] = {}             # what -> the moses-fix op that fixes it, offered under the line
 AGREED: list[str] = []
 
 
-def drift(what: str, detail: str) -> None: DRIFT.append((what, detail))
+def drift(what: str, detail: str, fix: str = "") -> None:
+    DRIFT.append((what, detail))      # a pair, as every reader of DRIFT has always unpacked it
+    if fix:
+        OFFERS[what] = fix
+
+
+# WHAT MOSES CAN FIX HIMSELF, said on the line that reports it (Brad, 2026-11-03): "I'm glad it gets
+# reported, but then I'll read it and just come back to ask you about it when Moses should be able to
+# fix the issue." A drift line that names an op from agent/moses-fix gets an offer under it; Brad
+# answers in the standup thread and Moses runs that op with fix_drift. Only ops moses-fix actually has
+# go here, and moses_fix_offer_test.py checks that the two lists agree.
+FIXES = {
+    "framework-sync": "copy the changes into the public framework, run its tests, commit and publish it",
+    "framework-push": "publish the waiting commit(s) to the public framework on GitHub",
+}
+
+
+def fix_line(op: str) -> str:
+    return (f"↳ I can fix this — {FIXES[op]} (`{op}`; it checks for private topics and secrets first). "
+            "Reply in this thread and I'll do it.")
 def blind(what: str, why: str) -> None: BLIND.append((what, why))
 def agreed(what: str) -> None: AGREED.append(what)
 
@@ -823,20 +843,24 @@ def check_framework_in_step() -> None:
     if not (fw / ".git").exists():
         return agreed(f"no public framework checkout at {fw} — nothing to keep in step")
     env = {**os.environ, **_GIT_ANY_OWNER}   # the standup reads this as root; it only reads
+    behind = False
     rc, out = sh([sys.executable, str(sync), "--check", "--quiet", "--framework", str(fw)], env=env)
     if rc == 0:
         agreed(f"the public framework matches this tree ({out.strip().split(': ', 1)[-1]})")
     elif rc == 1:
-        drift("the public framework is behind this tree",
-              f"{out.strip()} — run agent/moses-framework-sync, read the diff in {fw}, commit")
+        behind = True
+        drift("the public framework is behind this tree", out.strip(), fix="framework-sync")
     else:
         blind("the public framework", f"moses-framework-sync could not compare: {out.strip()[:200]}")
     rc, out = sh(["git", "-C", str(fw), "rev-list", "--count", "@{upstream}..HEAD"], env=env)
     if rc != 0:
         blind("the public framework's push", f"no upstream to compare against: {out.strip()[:120]}")
     elif out.strip() != "0":
+        # The sync publishes too, so when both are flagged there is one fix to offer, not two.
         drift("the public framework has commits nobody pushed",
-              f"{out.strip()} commit(s) in {fw} are not on its remote — a push is the only way anyone sees them")
+              f"{out.strip()} commit(s) in {fw} are not on its remote — a push is the only way anyone sees them"
+              + (" (the sync above publishes these too)" if behind else ""),
+              fix="" if behind else "framework-push")
     else:
         agreed("every framework commit is on its remote")
 
@@ -939,7 +963,8 @@ def main() -> int:
     if DRIFT:
         print("DRIFT — what Moses declares is not what is running:")
         for what, detail in DRIFT:
-            print(f"  ✗ {what}\n      {detail}")
+            fix = OFFERS.get(what)
+            print(f"  ✗ {what}\n      {detail}" + (f"\n      {fix_line(fix)}" if fix else ""))
     if BLIND:
         print("\nCOULD NOT CHECK — this is not the same as agreement:")
         for what, why in BLIND:

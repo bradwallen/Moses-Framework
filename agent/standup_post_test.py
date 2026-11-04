@@ -189,5 +189,55 @@ with tempfile.TemporaryDirectory() as t:
     check("… and that line is recorded like any other post",
           len(w.jobs()) == 1 and w.outcome(w.jobs()[0]).get("posted") is True, str(w.jobs()))
 
+print("Moses can't reply goes on the top line (Brad, 2026-11-03)")
+# He was down 11-01 → 11-03 and three standups said so as the first of six ✗ lines. Brad did not see
+# it. These hand the standup a stand-in moses-drift and read what was posted.
+DRIFT_DOWN = """#!/usr/bin/env bash
+cat <<'EOF'
+DRIFT
+  ✗ Moses cannot answer anyone right now
+      down: login expired — Moses cannot answer anyone until someone re-authenticates on Reserve (since 2026-11-01 07:37; last probe 07:41)
+  ✗ viatica: code moved, the registry did not
+      commit 2026-11-01 11:15 "x" is newer than the entry (2026-10-29 13:19)
+
+EOF
+"""
+DRIFT_ONLY_DOWN = DRIFT_DOWN.replace(
+    '  ✗ viatica: code moved, the registry did not\n'
+    '      commit 2026-11-01 11:15 "x" is newer than the entry (2026-10-29 13:19)\n', '')
+DRIFT_529 = DRIFT_ONLY_DOWN.replace("down: login expired — Moses cannot answer anyone until someone "
+                                    "re-authenticates on Reserve", "degraded: 529 overloaded")
+
+
+def standup_with_drift(t: str, script: str) -> str:
+    w = World(Path(t))
+    agent = w.tmp / "no-checkout" / "agent"
+    agent.mkdir(parents=True)
+    (agent / "moses-drift").write_text(script)
+    (agent / "moses-drift").chmod(0o755)
+    r = w.standup(QUIET, *OK)
+    posts = w.posts()
+    return posts[0]["text"] if posts else "(nothing posted) " + r.stderr
+
+
+with tempfile.TemporaryDirectory() as t:
+    text = standup_with_drift(t, DRIFT_DOWN)
+    check("an expired login is the FIRST line", text.startswith("🔴 *Moses can't reply to anyone*"), text)
+    check("… says it is the login, and since when", "Claude login on Reserve has expired (since 2026-11-01 07:37)" in text, text)
+    check("… and names the fix", "`claude auth login`" in text, text)
+    check("… and is not repeated in the out-of-step list", text.count("cannot answer anyone") == 0, text)
+    check("the other drift still shows, under the plain heading",
+          "*Out of step" in text and "viatica: code moved" in text, text)
+
+with tempfile.TemporaryDirectory() as t:
+    text = standup_with_drift(t, DRIFT_ONLY_DOWN)
+    check("down with no other drift is still NOT an all-clear", not text.startswith("✅"), text)
+    check("… and leaves no empty out-of-step heading", "*Out of step" not in text and text.startswith("🔴"), text)
+
+with tempfile.TemporaryDirectory() as t:
+    text = standup_with_drift(t, DRIFT_529)
+    check("down for another reason is on top too, with that reason, and no login fix",
+          text.startswith("🔴 *Moses can't reply to anyone* — degraded: 529") and "claude auth login" not in text, text)
+
 print(f"\n{'FAILED' if fails else 'OK'}{f' — {fails} failure(s)' if fails else ''}")
 raise SystemExit(1 if fails else 0)

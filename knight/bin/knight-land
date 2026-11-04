@@ -99,7 +99,10 @@ new_targets() {
 }
 
 # Existing targets a branch REPOINTS: any change, between the merge base and the branch, to an
-# uncommented line that names KT_SOURCE or KT_PUSH_REMOTE or uses eval. Text, never sourced: the
+# uncommented line that names KT_SOURCE or KT_PUSH_REMOTE or uses eval. Also KT_AUTO_LAND/KT_CONTINUE
+# (what Brad's code grants) and KT_SANDBOX_* (what the gate sandbox can see, 2026-11-04): a job that
+# could widen its own sandbox would make lib/sandbox.sh a suggestion. Those are single-line values so
+# this line check sees every change to them. Text, never sourced: the
 # branch is not merged yet, and running its contents to read two variables would execute it.
 # Comments are dropped first, so rewording one is not a repoint — a guard that fires on correct work
 # gets switched off. The limit, said out loud: an assignment hidden from this text (built from parts
@@ -113,9 +116,9 @@ repointed_targets() {
     files=$(git -C "$src" diff --no-renames --name-only --diff-filter=M "$base" "$branch" -- "$rel/*.env" 2>/dev/null) || return 1
     for f in $files; do
         a=$(git -C "$src" show "$base:$f" 2>/dev/null | sed -E '/^[[:space:]]*#/d; s/[[:space:]]+#.*$//' \
-            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
+            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|KT_SANDBOX|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
         b=$(git -C "$src" show "$branch:$f" 2>/dev/null | sed -E '/^[[:space:]]*#/d; s/[[:space:]]+#.*$//' \
-            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
+            | grep -E 'KT_SOURCE|KT_PUSH_REMOTE|KT_AUTO_LAND|KT_CONTINUE|KT_SANDBOX|(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)')
         [ "$a" = "$b" ] || basename "$f" .env
     done
     return 0
@@ -189,7 +192,7 @@ landable() {
     moved=$(repointed_targets "$KT_SOURCE" "${KT_BRANCH:-main}" "$branch") \
         || { echo "could not work out whether the branch repoints a Knight target, so it cannot land"; return; }
     if [ -n "$moved" ]; then
-        echo "the branch points the existing Knight target '$(printf '%s' "$moved" | head -1)' at a different repository (KT_SOURCE or KT_PUSH_REMOTE). Working in a new folder is starting a new project: that happens from the tracker, where Brad's one-time code is asked, never in a branch"
+        echo "the branch changes a guarded line of the existing Knight target '$(printf '%s' "$moved" | head -1)': where it points (KT_SOURCE, KT_PUSH_REMOTE), what Brad's code grants (KT_AUTO_LAND, KT_CONTINUE) or what its gate sandbox can see (KT_SANDBOX_*). Working in a new folder is starting a new project: that happens from the tracker, where Brad's one-time code is asked, never in a branch. Widening a sandbox is Brad's change on main"
         return
     fi
     added=$(new_targets "$KT_SOURCE" "${KT_BRANCH:-main}" "$branch") \

@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # knight-gate — run this clone's gate exactly as the runner will, as ONE permitted command.
 #
-#   /home/brad/Projects/moses/knight/bin/knight-gate        (from inside a Knight clone)
+#   /home/brad/Projects/moses/knight/bin/knight-gate                     (from inside a Knight clone)
+#   /home/brad/Projects/moses/knight/bin/knight-gate --only PATH         one test file from that gate
+#
+# --ONLY (2026-10-29). The moses gate takes 3½–5½ minutes, and this was the only way Knight could run a
+# test, so watching each new guard fail cost a whole gate run: on job 1993898 his edits took two minutes
+# and five gate runs took twenty. --only runs ONE file from the gate's own list, with the gate's own
+# command. The steps that support it are the loops that check GATE_ONLY themselves (`[ -z
+# "${GATE_ONLY:-}" ] || [ "${t#./}" = "${GATE_ONLY#./}" ] || continue`), so the list of files and how each
+# runs stay declared once, in KT_GATE, and a file the gate skips (test-guards.sh) is skipped here too.
+# Steps without that check are not run under --only. If nothing ran, it says so and exits 3: a run that
+# tested nothing must not read as green. It is never a substitute for the gate, which the runner runs
+# whole after every commit.
 #
 # WHY THIS EXISTS (2026-10-01). Knight's brief said "Run the gate commands above yourself" — and for the
 # Python targets the gate IS a shell loop (`fail=0; for t in $(find …); do …`), which his permission
@@ -21,6 +32,11 @@
 # target's gate or run outside the sandbox.
 set -uo pipefail
 . "$(dirname "$(readlink -f "$0")")/../../agent/lib/moses-env.sh"
+# THE RUNNER'S GATE RUNS IN A BUBBLEWRAP SANDBOX (knight/lib/sandbox.sh, 2026-11-04); this one runs inside
+# Claude Code's sandbox instead, because a sandbox cannot be started from inside another on Reserve. Both
+# refuse the network. The runner's also hides the home directory, so a test that reads ~ passes here and
+# fails there. KNIGHT_GATE_LOCAL tells knight/test-sandbox.sh it is in that nested case.
+export KNIGHT_GATE_LOCAL=1
 
 top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "knight-gate: not inside a git working tree" >&2; exit 2; }
 repos=$(readlink -f "$MOSES_ROOT/knight/repo")
@@ -39,6 +55,32 @@ KT_GATE=()
 [ "${#KT_GATE[@]}" -gt 0 ] || { echo "knight-gate: '$target' declares no gate" >&2; exit 2; }
 
 cd "$top" || exit 2
+
+if [ "${1:-}" = "--only" ]; then
+    only=${2:-}
+    [ -n "$only" ] && [ $# -eq 2 ] || { echo "usage: knight-gate --only PATH   (one test file the gate runs)" >&2; exit 2; }
+    only=${only#./}
+    case "$only" in /*|*..*) echo "knight-gate: give a path inside this clone, like agent/x_test.py" >&2; exit 2 ;; esac
+    [ -f "$only" ] || { echo "knight-gate: no file $only in this clone" >&2; exit 2; }
+    out=$(mktemp); ran=0; red=0; n=0
+    for step in "${KT_GATE[@]}"; do
+        n=$((n+1))
+        case "$step" in *GATE_ONLY*) ;; *) continue ;; esac
+        GATE_ONLY="$only" bash -c "$step" 2>&1 | tee "$out"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || red=1
+        grep -qxF -e "== $only" -e "== ./$only" "$out" && ran=1
+    done
+    rm -f "$out"
+    if [ "$ran" -eq 0 ]; then
+        echo "NOTHING RAN — $only is not a file this target's gate runs one at a time (or the gate skips it)."
+        echo "Run the whole gate:  $0"
+        exit 3
+    fi
+    [ "$red" -eq 0 ] && { echo "ONE TEST GREEN — $only. Not the gate: run the whole gate before you commit."; exit 0; }
+    echo "ONE TEST RED — $only."
+    exit 1
+fi
+
 n=0
 for step in "${KT_GATE[@]}"; do
     n=$((n+1))

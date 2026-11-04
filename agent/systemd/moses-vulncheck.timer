@@ -1,0 +1,15 @@
+[Unit]
+Description=The ops persona's weekly vulnerability check, saved for the 08:00 standup
+
+[Timer]
+# MONDAYS 07:40 Central, so the 08:00 standup can carry it (Brad, 2026-10-23: "part of the 0800 stand-up,
+# not after at 8:30"); it takes seconds, and 07:40 leaves room before drift at 07:50. The timezone is IN
+# the calendar spec because this
+# machine's clock is UTC; this keeps 08:30 meaning 08:30 across daylight saving. Weekly because advisories
+# land weekly-ish and a fix is a deliberate act; the Node.js and Next.js holes of 2026-10-21 were public
+# for two days before anyone here knew. Persistent: a Monday the machine was off still gets its check.
+OnCalendar=Mon *-*-* 07:40:00 America/Chicago
+Persistent=true
+
+[Install]
+WantedBy=timers.target

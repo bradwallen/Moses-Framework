@@ -67,3 +67,32 @@ examples_missing() {
     done < "$file"
     printf '%s' "$out"
 }
+
+# ── OUT OF SCOPE (2026-10-29) ─────────────────────────────────────────────────────────────────────────
+# Changes the build must not MAKE ("Switching the CLI to a different argument-parsing library"). They are
+# NOT examples: no test can name a change that was not made, and treating them as examples held job
+# 1993898 after a green gate. agent/build_spec.py writes them as "- Out of scope: <text>", a prefix
+# examples_extract does not read. The builder is told; the reviewer checks the diff.
+
+# scope_extract <acceptance-file> <scope-file> — one rule per line; no file when there are none.
+scope_extract() {
+    grep -E '^- Out of scope: ' "$1" 2>/dev/null | sed -E 's/^- Out of scope: //' > "$2"
+    [ -s "$2" ] || rm -f "$2"
+}
+
+# scope_brief <scope-file> — the builder's instructions.
+scope_brief() {
+    [ -s "$1" ] || return 0
+    printf '\nOUT OF SCOPE — Brad agreed this build must NOT make these changes. They are not examples and need\n'
+    printf 'no test; the reviewer checks your diff against them. If the task cannot be done without one, stop\n'
+    printf 'and say so in your report.\n'
+    sed 's/^/- /' "$1"
+}
+
+# scope_review_brief <scope-file> — the reviewer's rule for them.
+scope_review_brief() {
+    [ -s "$1" ] || return 0
+    printf '\nOUT OF SCOPE. Brad agreed the build must NOT make these changes. Judge them from the diff: a change\n'
+    printf 'that makes one is MISSED. They have no tests by design, so never mark one MISSED for lacking a test.\n'
+    sed 's/^/- /' "$1"
+}

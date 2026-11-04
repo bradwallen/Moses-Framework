@@ -100,6 +100,10 @@ check("and a machine-prompted turn still cannot capture anything",
       "add_idea" not in reactive_only)
 check("a human-directed turn can run a named repair op", "mcp__moses__remediate" in directed)
 check("a machine-prompted turn cannot repair anything", "remediate" not in reactive_only)
+# The standup's fix offers publish to the public framework: only a person may accept one (2026-11-03).
+check("a human-directed turn can run a fix the standup offered", "mcp__moses__fix_drift" in directed)
+check("a machine-prompted turn cannot run one — Atlas or an alarm cannot accept an offer",
+      "fix_drift" not in reactive_only)
 check("a machine-prompted turn CANNOT start a build",
       "knight_start" not in reactive_only,
       "Atlas or a persona's alarm text could otherwise trigger a build")
@@ -173,6 +177,8 @@ machine_text  = C._capability_text(False)
 
 check("a directed turn is told it can hand work to Knight, by proposing", "knight_propose" in directed_text)
 check("a directed turn is told about the repair ops", "remediate" in directed_text)
+check("a directed turn is told it can run the offered fixes", "fix_drift" in directed_text)
+check("a machine turn is not", "fix_drift" not in machine_text)
 check("a machine turn is told it cannot act", "cannot act on this turn" in machine_text)
 check("a machine turn is NOT told it can start a build", "knight_start" not in machine_text and "knight_propose" not in machine_text)
 

@@ -27,6 +27,9 @@ set -uo pipefail
 DIR="$1"; REPO="$2"; BRANCH="$3"; TARGET="${4:-viatica}"; INCIDENT="${5:-}"
 # shellcheck disable=SC1091
 source "$MOSES_ROOT/knight/guards.env"
+# Every prep and gate step runs in a bubblewrap sandbox: the clone, no home, no secrets, and no
+# network for the gate (#17 MF7). It refuses rather than run a step unsandboxed.
+source "$(dirname "$(readlink -f "$0")")/../lib/sandbox.sh"
 # The registry says what the gate is and where green work lands. Sourced here rather than passed in,
 # so the runner reads the same file `knight doctor` and `knight targets` print — one source of truth
 # for the three places that describe a target.
@@ -34,9 +37,12 @@ source "$MOSES_ROOT/knight/guards.env"
 # optional field (KT_PUSH_REMOTE is one) killed this runner on its first line under `set -u` — and the
 # job stayed "running" forever, because the runner is what would have written anything else. Found
 # 2026-09-21 with a target written by test-runner.sh.
-KT_DESC=""; KT_SOURCE=""; KT_BRANCH=""; KT_PUSH_MODE=""; KT_PUSH_REMOTE=""; KT_PREP=(); KT_GATE=()
+KT_DESC=""; KT_SOURCE=""; KT_BRANCH=""; KT_PUSH_MODE=""; KT_PUSH_REMOTE=""; KT_PREP=(); KT_GATE=(); KT_SANDBOX_RW=""; KT_SANDBOX_RO=""; KT_SANDBOX_ENV=""
 # shellcheck disable=SC1090
 source "$MOSES_ROOT/knight/targets/$TARGET.env" || { echo failed > "$DIR/status"; exit 1; }
+# AFTER the target file, never before: it is sourced shell, and a line in it could otherwise undo
+# this (review, 2026-11-04). From here the runner's own git ignores hooks; .git/config is checked below.
+runner_git_hardening
 [ -n "$KT_PUSH_REMOTE" ] || KT_PUSH_REMOTE=$(git -C "$KT_SOURCE" remote get-url origin 2>/dev/null)
 OPTENV=$MOSES_CONFIG_DIR/knight.env
 # THE ONE RUNNER (M20, 2026-09-14). The builder's and the reviewer's command lines are built by
@@ -88,7 +94,27 @@ if [ -s "$DIR/precheck.txt" ]; then
     esac
 fi
 
+# ── The memory notes this task matches (2026-10-29) ──────────────────────────
+# A job note (the written steps for a recurring job) and a locked decision reach Brad's sessions through
+# the plugin's hook; these runs load no plugins and cannot read the corpus from the sandbox, so the
+# runner looks them up and both briefs carry them. The reviewer gets them too: a diff that acts against
+# a locked decision is a finding, and one that skips a job note's step may be. Matched on the task
+# only, never the brief (claude_runner.job_notes says why). A lookup that cannot run says so in the
+# brief and the job goes on: it is an enhancement, not a gate. notes.txt keeps what was sent.
+if [ "$precheck_refused" -eq 0 ]; then
+    "$RUNNER" --job-notes "$DIR/task.txt" > "$DIR/notes.txt" 2>> "$DIR/stderr.log"
+    if [ -s "$DIR/notes.txt" ]; then
+        for f in brief.txt review-brief.txt; do
+            [ -f "$DIR/$f" ] || continue
+            { cat "$DIR/notes.txt"; printf '\n'; cat "$DIR/$f"; } > "$DIR/$f.new" && mv "$DIR/$f.new" "$DIR/$f"
+        done
+    fi
+fi
+
 # ── Run the agent ────────────────────────────────────────────────────────────
+# What .git/config holds BEFORE Knight has the clone. Every git the runner runs afterwards reads it, so
+# it must still be exactly this when the gate starts and again before anything is pushed.
+git_cfg0=$(git_config_fingerprint "$REPO")
 # KNIGHT_FAKE_AGENT is a TEST SEAM, not a feature: it substitutes `sleep N` for the model so the
 # timeout/kill/record path can be proven in seconds instead of an hour, and without spending any of
 # Brad's Pro allowance. The wall-clock SIGKILL is the backstop the entire unattended design leans
@@ -244,7 +270,10 @@ elif [ "$rc" -ne 0 ]; then
     gate_why="the agent exited $rc"
 elif [ "$commits" -eq 0 ]; then
     gate_why="nothing was committed, so there is nothing to push"
+elif ! gate_why=$(git_config_check "$REPO" "$git_cfg0"); then
+    :   # gate_why says what changed
 else
+    gate_why=""
     # Every command from the target's KT_GATE, in order, first red wins. Named in the failure so the
     # report says which check failed rather than "the gate failed" — Brad reads the report, not the log.
     : > "$DIR/gate.log"
@@ -258,14 +287,14 @@ else
         | grep -qE '(^|/)(prep\.sh|package(-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|requirements[^/]*\.txt|pyproject\.toml|poetry\.lock|Pipfile(\.lock)?|go\.(mod|sum)|Cargo\.(toml|lock)|Gemfile(\.lock)?)$'; then
         echo "== prep again: the job changed a dependency or setup file ==" >> "$DIR/gate.log"
         for step in ${KT_PREP+"${KT_PREP[@]}"}; do
-            ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ) \
+            ( sandbox_run prep "$REPO" "$step" >> "$DIR/gate.log" 2>&1 ) \
                 || echo "== prep step failed: $step (the gate will say what that broke) ==" >> "$DIR/gate.log"
         done
     fi
     gate_ok=1
     for step in "${KT_GATE[@]}"; do
         echo "== gate: $step ==" >> "$DIR/gate.log"
-        if ! ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ); then
+        if ! ( sandbox_run gate "$REPO" "$step" >> "$DIR/gate.log" 2>&1 ); then
             gate_ok=0
             gate_why="the gate failed at: $step"
             # Say what nobody could tell from the log: whether Knight broke it, or arrived to it
@@ -293,6 +322,10 @@ fi
 
 # ── Push, only on green ──────────────────────────────────────────────────────
 pushed=0; push_note=""
+# Again after prep and the gate: prep runs with .git writable (a target may install a hook there).
+if [ "$gate_ok" -eq 1 ] && ! cfg_why=$(git_config_check "$REPO" "$git_cfg0"); then
+    gate_ok=0; gate_why="$cfg_why"
+fi
 # Never let git stop and ask. Without these it can block on a credential prompt or an unknown host
 # key until the wall-clock ceiling kills it — turning a one-line auth failure into a lost hour of
 # Brad's allowance. GIT_TERMINAL_PROMPT=0 makes https fail fast; BatchMode does the same for ssh.
@@ -314,7 +347,7 @@ if [ "$gate_ok" -eq 1 ]; then
             regate=1
             for step in "${KT_GATE[@]}"; do
                 echo "== re-gate after rebase: $step ==" >> "$DIR/gate.log"
-                ( cd "$REPO" && bash -c "$step" >> "$DIR/gate.log" 2>&1 ) || { regate=0; break; }
+                ( sandbox_run gate "$REPO" "$step" >> "$DIR/gate.log" 2>&1 ) || { regate=0; break; }
             done
             run_review
 
@@ -335,6 +368,8 @@ $plausible" 2>>"$DIR/gate.log" || true
 Not checkable from the diff (for whoever checks it live):
 $unchecked" 2>>"$DIR/gate.log" || true
                 fi
+                # Checked BEFORE the runner adds its own push remote, which is itself a config change.
+                cfg_why=$(git_config_check "$REPO" "$git_cfg0")    # empty when unchanged
                 git -C "$REPO" remote add push-target "$KT_PUSH_REMOTE" 2>/dev/null
                 # WHERE GREEN WORK LANDS — the one difference between the two modes, and it is read
                 # from the registry, never decided here. `direct` lands on the mainline and deploys.
@@ -346,7 +381,11 @@ $unchecked" 2>>"$DIR/gate.log" || true
                 else
                     refspec="HEAD:refs/heads/$BRANCH"
                 fi
-                if git -C "$REPO" push -q push-target "$refspec" >>"$DIR/gate.log" 2>&1; then
+                if [ -n "$cfg_why" ]; then
+                    gate_why="$cfg_why"
+                elif ! pre_push_in_sandbox "$REPO" push-target "$KT_PUSH_REMOTE" "$refspec" "$main_sha" >>"$DIR/gate.log" 2>&1; then
+                    gate_why="the target's pre-push guard refused the push (it ran in the sandbox) — see gate.log"
+                elif git -C "$REPO" push -q push-target "$refspec" >>"$DIR/gate.log" 2>&1; then
                     pushed=1
                     push_note="$(git -C "$REPO" rev-parse --short HEAD)"
                     [ "$KT_PUSH_MODE" = direct ] || push_note="$push_note on branch $BRANCH — NOT merged"

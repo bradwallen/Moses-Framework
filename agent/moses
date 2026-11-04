@@ -526,12 +526,32 @@ $line"
     fi
   fi
 
+  # MOSES CAN'T REPLY GOES FIRST, IN PLAIN WORDS, WITH THE FIX (Brad, 2026-11-03). From 11-01 to
+  # 11-03 his login was expired and the standup did say so — as the first of six ✗ lines under
+  # "Declared, but not what is running", next to five that repeat most mornings. Brad read three
+  # standups and did not see it. It is the one item that stops Moses talking at all, so it is lifted
+  # out of the drift list and put on the top line, and a login problem names the command that fixes it.
+  local down="" dhead ddetail dsince
+  dhead=$(printf '%s\n' "$drift" | grep -m1 '✗ Moses cannot answer anyone' || true)
+  if [ -n "$dhead" ]; then
+    ddetail=$(printf '%s\n' "$drift" | grep -A1 -m1 '✗ Moses cannot answer anyone' | tail -n 1 | sed 's/^ *//')
+    dsince=$(printf '%s' "$ddetail" | grep -oE 'since [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}' || true)
+    if printf '%s' "$ddetail" | grep -qi 'login'; then
+      down="🔴 *Moses can't reply to anyone* — his Claude login on Reserve has expired${dsince:+ ($dsince)}.
+     Fix: on Reserve, run \`claude auth login\`, sign in, paste the code back. Nothing else needs restarting."
+    else
+      down="🔴 *Moses can't reply to anyone* — $ddetail"
+    fi
+    drift=$(printf '%s\n' "$drift" | awk '/✗ Moses cannot answer anyone/{skip=1; next} skip && /^      /{next} {skip=0; print}')
+    printf '%s' "$drift" | grep -q '[^[:space:]]' || drift=""
+  fi
+
   # THIS OPERATOR'S OWN SECTIONS (agent/local-standup, absent from the framework): whatever it prints
   # is added to the briefing. Run as the operator, like everything else the standup runs from the tree.
   local localsect=""
   [ -f "$MOSES_ROOT/agent/local-standup" ] && { localsect=$(as_op "$MOSES_ROOT/agent/local-standup" 2>/dev/null) || localsect=""; }
 
-  if [ -z "$failures" ] && [ -z "$overdue" ] && [ -z "$gap" ] && [ -z "$drift" ]; then
+  if [ -z "$down" ] && [ -z "$failures" ] && [ -z "$overdue" ] && [ -z "$gap" ] && [ -z "$drift" ]; then
     # A CLEAN MORNING SAYS SO, IN ONE LINE (Brad, 2026-10-04). It used to say nothing, on the theory
     # that silence meant all clear. It also meant crashed: this path called `say_msg`, which has never
     # existed, and on 2026-09-20, 09-21 and 10-04 the standup died on "command not found", exited 0,
@@ -552,6 +572,9 @@ $localsect"
 
   local msg="📋 *Standup — someone's behind*"
   [ -n "$drift" ] && msg="📋 *Standup*"
+  [ -n "$down" ] && msg="$down
+
+📋 *Standup*"
   DEFERRED_TAIL="$deferred"
   [ -n "$failures" ] && msg="$msg
 
@@ -561,7 +584,7 @@ $localsect"
 *Overdue against their cadence:*$overdue"
   [ -n "$drift" ] && msg="$msg
 
-*Declared, but not what is running:*
+*Out of step — what's on record vs. what's actually running:*
 $drift"
   [ -n "$gap" ] && msg="$msg
 

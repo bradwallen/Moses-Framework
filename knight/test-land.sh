@@ -266,6 +266,8 @@ mfa_world() {  # mfa_world <name> add|edit|rename
         repoint) sed -i "s|^KT_SOURCE=.*|KT_SOURCE=/somewhere/else|" "$w/repo/knight/targets/t1.env" ;;
         evil)   printf 'eval "KT_SOU""RCE=/somewhere/else"\n' >> "$w/repo/knight/targets/t1.env" ;;
         autoflag) printf 'KT_AUTO_LAND=1\nKT_CONTINUE=1\n' >> "$w/repo/knight/targets/t1.env" ;;
+        sandbox)  printf "KT_SANDBOX_RO='/home/brad'\n" >> "$w/repo/knight/targets/t1.env" ;;
+        envline)  printf 'GIT_CONFIG_COUNT=0\nSANDBOX_BWRAP=/usr/bin/env\n' >> "$w/repo/knight/targets/t1.env" ;;
         declare)  printf 'declare "KT_AUTO_""LAND=1"\n' >> "$w/repo/knight/targets/t1.env" ;;
         printfv)  printf 'printf -v "KT_CONT""INUE" 1\n' >> "$w/repo/knight/targets/t1.env" ;;
         rename) cp "$w/repo/knight/targets/t1.env" "$w/repo/knight/targets/t1.env.keep"
@@ -308,6 +310,8 @@ a5_cases() {  # a5_cases <lander> — echoes one "name=merged|refused" line per 
     merged "$w" && echo "repoint=merged" || echo "repoint=refused"
     w=$(mfa_world "a5-declare-$RANDOM" declare); mland "$w" "$L" job1 >/dev/null
     merged "$w" && echo "declare=merged" || echo "declare=refused"
+    w=$(mfa_world "a5-sandbox-$RANDOM" sandbox); mland "$w" "$L" job1 >/dev/null
+    merged "$w" && echo "sandbox=merged" || echo "sandbox=refused"
 }
 
 echo
@@ -402,6 +406,21 @@ w=$(mfa_world a5-orphan edit)
 git -C "$w/repo" checkout -q --orphan feature/x-orphan
 git -C "$w/repo" commit -qm "second, from nowhere" --allow-empty
 git -C "$w/repo" checkout -q main
+# Nor turn the runner's git hooks back on or swap out bwrap from a target file (review, 2026-11-04):
+# target files are sourced shell, so only KT_ settings may appear in one.
+w3=$(mfa_world a5-envline envline)
+out=$(mland "$w3" "$LAND" job1)
+! merged "$w3" && ok "a target line that sets GIT_CONFIG_COUNT or SANDBOX_BWRAP is refused" \
+    || bad "a target line that sets GIT_CONFIG_COUNT or SANDBOX_BWRAP is refused" "$out"
+
+# A branch may not widen its own gate sandbox (2026-11-04): KT_SANDBOX_* decide what Knight's tests can
+# read, so a job that adds /home/brad to them would undo lib/sandbox.sh from inside.
+w2=$(mfa_world a5-sandbox sandbox)
+out=$(mland "$w2" "$LAND" job1)
+! merged "$w2" && grep -q "gate sandbox" <<<"$out" \
+    && ok "a branch that widens a target's gate sandbox is refused, and says why" \
+    || bad "a branch that widens a target's gate sandbox is refused, and says why" "$out"
+
 printf 'feature/x-orphan' > "$w/jobs/job1/branch"
 out=$(mland "$w" "$LAND" --list)
 grep -qE "BLOCKED.*could not (work out|read)" <<<"$out" \
@@ -424,6 +443,7 @@ watch_fail() {  # watch_fail <label> <case> <sed expression>
 }
 watch_fail "with the check removed, a new target lands with no code" noauth 's/if \[ "\$rc" = 1 \]; then/if false; then/; s/elif \[ "\$rc" != 0 \]; then/elif false; then/; '"$SPEND"
 watch_fail "with the repoint check removed, a branch moves a target to a new folder" repoint 's/\[ -n "\$moved" \]/false/'
+watch_fail "with KT_SANDBOX dropped from the guarded lines, a branch widens its own sandbox" sandbox 's/KT_CONTINUE|KT_SANDBOX|/KT_CONTINUE|/g'
 watch_fail "with the shape check removed, an assembled setting lands" declare 's/if \[ -n "\$odd" \]; then/if false; then/'
 watch_fail "with rename detection on, a renamed target slips through" rename 's/diff --no-renames/diff/'
 watch_fail "with 'could not check' read as fine, a broken helper waves it through" broken 's/elif \[ "\$rc" != 0 \]; then/elif false; then/; '"$SPEND"
