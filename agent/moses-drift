@@ -39,13 +39,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-REGISTRY = Path(os.environ.get("MOSES_REGISTRY",
-                               str(Path.home() / ".claude" / "memory" / "projects.json")))
+# From moses_env, which also reads the settings file: since MF8 the tracker lives in moses-data, and the
+# corpus copy beside the notes stopped changing at the cutover (2026-11-06).
+REGISTRY = _env.REGISTRY
 ROSTER = Path(os.environ.get("MOSES_ROSTER", str(Path.home() / ".config" / "moses" / "roster.json")))
 SRC = Path(os.environ.get("MOSES_SRC") or _env.ROOT / "agent")
 DEPLOYED = Path(os.environ.get("MOSES_DEPLOYED", "/opt/moses"))
 MCP_URL = _env.setting("MOSES_MCP_URL", "http://127.0.0.1:8765/mcp")
-USER_ENV = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")}
+USER_ENV = {**os.environ, "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")}
 
 DRIFT: list[tuple[str, str]] = []      # (what, detail)
 BLIND: list[tuple[str, str]] = []      # (what, why it could not be checked)
@@ -150,6 +151,38 @@ def check_duplicate_units() -> None:
               ", ".join(sorted(both)) + " — system and --user; both will receive everything")
     else:
         agreed("no service is running in both system and user scope")
+
+
+# ── 1b. Moses running in TWO ACCOUNTS (MF8) ──────────────────────────────────────
+# After the move to the `moses` account, brad's copies of the units stay installed (disabled) as the
+# rollback. Started again by anything, brad's listener and moses's would both hold a Socket Mode
+# connection and answer everything twice — and check_duplicate_units cannot see it: it compares the
+# system manager with ONE user manager. Processes are visible across accounts, so ask the kernel.
+def _listener_owners() -> list[str]:
+    import pwd as _pwd
+    owners = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv = (p / "cmdline").read_bytes().split(b"\0")
+            if any(a.endswith(b"agent/listener.py") for a in argv):
+                owners.append(_pwd.getpwuid(p.stat().st_uid).pw_name)
+        except (OSError, KeyError):
+            continue
+    return owners
+
+
+def check_one_listener() -> None:
+    owners = _listener_owners()
+    if not owners:
+        return blind("one listener", "no Moses listener process is running (see 'answers')")
+    if len(set(owners)) > 1:
+        drift("Moses's listener is running in more than one account",
+              f"{', '.join(sorted(set(owners)))} — both answer Slack; stop the one that should not run",
+              "stop and disable the copy in the account Moses no longer runs as")
+    else:
+        agreed(f"Moses's listener runs in one account ({owners[0]})")
 
 
 def deployment_is_live() -> bool | None:
@@ -293,11 +326,24 @@ def check_roster_paths() -> None:
 # call something that is not there — and if it serves something new, nobody notices.
 def check_tool_allowlist() -> None:
     payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
-    rc, out = sh(["curl", "-s", "-m", "15", "-X", "POST", MCP_URL,
-                  "-H", "Content-Type: application/json",
-                  "-H", "Accept: application/json, text/event-stream", "-d", payload])
+    # The server wants a key (2026-11-06). This runs as the operator, so it uses the operator key the
+    # server publishes; the header goes to curl through stdin (-H @-), never on argv.
+    import mcp_key
+    key = (mcp_key.load("operator", _env.CONFIG, _env.PEER_STATE or _env.STATE)
+           or mcp_key.load("listener", _env.CONFIG, _env.STATE))
+    if not key:
+        return blind("tool allowlist", "no Moses MCP key readable by this account, so the server could not be asked")
+    try:
+        r = subprocess.run(["curl", "-s", "-m", "15", "-X", "POST", MCP_URL, "-H", "@-",
+                            "-H", "Content-Type: application/json",
+                            "-H", "Accept: application/json, text/event-stream", "-d", payload],
+                           input=f"Authorization: Bearer {key}\n", capture_output=True, text=True, timeout=30)
+        rc, out = r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        rc, out = 1, str(e)
     if rc != 0 or '"tools"' not in out:
-        return blind("tool allowlist", f"MCP server at {MCP_URL} did not answer")
+        return blind("tool allowlist", f"MCP server at {MCP_URL} did not answer"
+                     + (" (it refused the key)" if '"unauthorized"' in out else ""))
     live = set()
     for line in out.splitlines():
         line = line.removeprefix("data: ").strip()
@@ -878,7 +924,10 @@ LIVENESS_STALE_S = 90 * 60        # three missed 30-minute probes, the dead-man'
 def _down_since(verdict: str) -> str:
     """When the current run of non-healthy verdicts began, from the probe's log; "" if unknown."""
     try:
-        rows = [json.loads(ln) for ln in LIVENESS_LOG.read_text().splitlines() if ln.strip()]
+        # moses-liveness runs as the moses account after MF8: read his state, one way, never following a link.
+        # When a peer is set, moses runs the probe and brad's own copy is a frozen leftover (review, round 2).
+        raw = (_env.read_peer("liveness.jsonl") or "") if _env.PEER_STATE else LIVENESS_LOG.read_text()
+        rows = [json.loads(ln) for ln in raw.splitlines() if ln.strip()]
     except (OSError, ValueError):
         return ""
     start = ""
@@ -892,7 +941,10 @@ def _down_since(verdict: str) -> str:
 
 def check_moses_answers() -> None:
     try:
-        st = json.loads(LIVENESS.read_text())
+        raw = _env.read_peer("liveness.json") if _env.PEER_STATE else (LIVENESS.read_text() if LIVENESS.exists() else None)
+        if raw is None:
+            raise FileNotFoundError(LIVENESS)
+        st = json.loads(raw)
     except FileNotFoundError:
         return blind("whether Moses can answer", f"no probe record at {LIVENESS}: moses-liveness has never run")
     except (OSError, ValueError) as e:
@@ -914,9 +966,58 @@ def check_moses_answers() -> None:
           f"last probe {at.replace('T', ' ')[11:16]})")
 
 
+# ── Folders root runs from, or keeps secrets in, must be root's alone (2026-11-06) ───────────────
+# A world-writable folder root executes from is a way to root for every account on the box: anyone can
+# rename the binary and drop their own. iDrive's installer makes its folders 0777 and its services put
+# that back, so one chmod is one observation; this is the check that sees it come back. Configured by
+# the operator, since which folders matter is this machine's business:
+#   MOSES_ROOT_EXEC_DIRS   folders root runs code from: nothing inside may be group/other-writable
+#   MOSES_ROOT_ONLY_DIRS   folders that hold root's secrets: must be root-owned, mode 700, not a link
+def check_root_dirs() -> None:
+    execs = [d for d in _env.setting("MOSES_ROOT_EXEC_DIRS", "").split(":") if d]
+    only = [d for d in _env.setting("MOSES_ROOT_ONLY_DIRS", "").split(":") if d]
+    if not execs and not only:
+        return blind("root-only folders", "MOSES_ROOT_EXEC_DIRS and MOSES_ROOT_ONLY_DIRS are not set")
+    bad = []
+    for d in execs:
+        if not os.path.isdir(d):
+            bad.append(f"{d} is missing"); continue
+        # A folder this account cannot read is pruned, not a blind spot, IF it is root's and shut to
+        # everyone else: nobody but root can reach anything below it, which is the property checked.
+        # One that is unreadable for any other reason still says so.
+        r = subprocess.run(["find", d, "(", "-type", "d", "!", "-readable", "-printf", "SHUT %p\\n", "-prune", ")",
+                            "-o", "(", "-perm", "/022", "!", "-type", "l", "-print", ")"],
+                           capture_output=True, text=True, timeout=60)
+        hits, shut = [], []
+        for line in r.stdout.splitlines():
+            (shut if line.startswith("SHUT ") else hits).append(line.removeprefix("SHUT "))
+        for sd in shut:
+            st = os.lstat(sd)
+            if st.st_uid != 0 or st.st_mode & 0o007 or (st.st_mode & 0o070 and st.st_gid != 0):
+                hits.append(f"{sd} (unreadable here, and not root's alone: {oct(st.st_mode & 0o777)} uid {st.st_uid})")
+        if hits:
+            bad.append(f"{len(hits)} writable by group/other under {d}, e.g. {', '.join(hits[:3])}")
+        if r.returncode != 0 and not hits and not shut:
+            return blind("root-only folders", f"could not read all of {d} ({r.stderr.strip()[:120]})")
+    for d in only:
+        try:
+            st = os.lstat(d)
+        except OSError:
+            bad.append(f"{d} is missing"); continue
+        import stat as _st
+        if _st.S_ISLNK(st.st_mode) or not _st.S_ISDIR(st.st_mode) or st.st_uid != 0 \
+                or (st.st_mode & 0o777) != 0o700:
+            bad.append(f"{d} is {oct(st.st_mode & 0o777)} uid {st.st_uid}, not root 700")
+    if bad:
+        return drift("a folder root runs from or keeps secrets in is not root's alone",
+                     "; ".join(bad) + " — Brad: sudo agent/mf8/mf8-harden.sh shows the fix, --apply does it")
+    agreed(f"{len(execs) + len(only)} root folders are root's alone")
+
+
 CHECKS = {
     "answers": check_moses_answers,
     "units": check_duplicate_units,
+    "one-listener": check_one_listener,
     "deployed": check_deployed_matches_source,
     "status": check_declared_status,
     "roster": check_roster_paths,
@@ -931,6 +1032,7 @@ CHECKS = {
     "recorded": check_work_is_recorded,
     "self-contradiction": check_milestone_says_shipped,
     "framework": check_framework_in_step,
+    "root-dirs": check_root_dirs,
 }
 
 

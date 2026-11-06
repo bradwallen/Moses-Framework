@@ -35,8 +35,11 @@ import hashlib
 import sqlite3
 import struct
 from pathlib import Path
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "agent" / "lib"))
+import moses_env as _env  # noqa: E402 — where the transcript index lives (MF8: brad builds it)
 
-DB = Path(__file__).resolve().parent / "transcripts.db"
+DB = _env.TRANSCRIPTS_DB
 MODEL = "BAAI/bge-small-en-v1.5"
 DIM = 384
 

@@ -14,6 +14,9 @@ Two halves, and the model is in neither:
   answer()  A bare 6-digit message from the owner is caught by the listener BEFORE anything else —
             before the operator's commands, the proposal matcher and the model — and handed here. The
             code goes to `moses-mfa verify` on stdin, and the result is said in the thread.
+            WITH THE MOSES GATE SET UP (#17, 2026-11-04) none of that: root posts the prompt itself, reads
+            Brad's reply from its own thread, and refuses stdin. start() then returns a generator that
+            waits through root (_through_gate), and answer() only says where a code counts.
 
 Every check that matters lives in agent/moses-mfa, which runs as root. This module only routes:
 the note it keeps (which challenge is open, where to answer) is operator-writable, and nothing in it
@@ -101,6 +104,15 @@ def redact(messages: list[dict]) -> list[dict]:
     return out
 
 
+def gate_configured() -> bool:
+    """Is the Moses Gate set up? Asked of root: the operator cannot see inside /etc/moses/mfa."""
+    rc, out, _ = _mfa("status")
+    try:
+        return rc == 0 and bool(json.loads(out).get("gate"))
+    except ValueError:
+        return False
+
+
 def open_here(channel: str) -> bool:
     """Is a code request open, posted in this channel? The note is routing, not authority."""
     n = _note()
@@ -108,9 +120,9 @@ def open_here(channel: str) -> bool:
 
 
 # ── The helper ───────────────────────────────────────────────────────────────
-def _mfa(*args: str, stdin: str = "") -> tuple[int, str, str]:
+def _mfa(*args: str, stdin: str = "", timeout: int = 30) -> tuple[int, str, str]:
     try:
-        r = subprocess.run([*MFA_CMD, *args], input=stdin, capture_output=True, text=True, timeout=30)
+        r = subprocess.run([*MFA_CMD, *args], input=stdin, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as e:
         return 2, "", f"could not run {MFA_CMD[-1]} ({type(e).__name__})"
     err = r.stderr.strip()
@@ -198,15 +210,49 @@ def start(ref: str, channel: str, thread_ts: str = "") -> str:
         # The prompt must name what the code will authorize. If the helper says otherwise, trust neither.
         return f"⚠️ The code check opened `{purpose}`, not `{NAME}:{pid}`. Not asking for a code against it."
     if not _save_note({"challenge": cid, "purpose": purpose, "project": pid, "name": name,
-                       "channel": channel, "thread_ts": thread_ts, "opened": time.time(), "path": path}):
+                       "channel": channel, "thread_ts": thread_ts, "opened": time.time(), "path": path,
+                       "gated": bool(c.get("posted"))}):
         # Without the note, his reply would be told "no request open" while one is. Say it now instead.
         return ("⚠️ The code request opened, but I couldn't record where to expect your answer, so I'm not "
                 "asking for it. It closes by itself in five minutes; nothing was authorized.")
+    if c.get("posted"):
+        return _through_gate(pid, name, purpose, path, (p.get("scope") or "").strip(), c.get("expires", ""))
     return (f"🔐 *New build: {name}* (`{purpose}`)\n"
             f"A new directory under version control, a Knight target, and Knight building this scope:\n"
             f"> {(p.get('scope') or '').strip()[:400]}\n"
             f"Reply with the 6-digit code from your authenticator to authorize it. "
             f"The request closes at {c.get('expires', 'five minutes from now')}.")
+
+
+def _through_gate(pid: str, name: str, purpose: str, path: str, scope: str, expires: str):
+    """Root posted the prompt with the Moses Gate and reads Brad's reply from its own thread (#17).
+    This says where to answer, waits through root (`verify-slack --wait`, about 6 minutes at most),
+    then builds. It never sees the code. A generator: the listener says each line as it comes."""
+    yield f"🔐 New build for *{name}*. Code me and I'll get Knight started."
+    rc, out, err = _mfa("verify-slack", "--wait", timeout=900)   # above root's own 6-minute wait
+    _save_note({})
+    if rc == 2:
+        yield f"⚠️ Couldn't check the code ({err}), so nothing's building."
+        return
+    if rc != 0:
+        yield f"❌ No go: {err or 'no reason given'}. Nothing's building."
+        return
+    try:
+        a = json.loads(out.splitlines()[-1])
+    except (ValueError, IndexError):
+        yield "⚠️ The code check said something I can't make sense of, so nothing's building."
+        return
+    if a.get("authorized") != purpose:
+        yield f"⚠️ That code went to a different request (`{a.get('authorized')}`), so nothing's building."
+        return
+    if path:
+        try:
+            _registry().update(pid, "publish_path", path)
+        except Exception as e:                                  # noqa: BLE001
+            print(f"moses: publish_path not recorded ({type(e).__name__})", flush=True)
+    where = f" It'll be live at example.com/{path} once the first job lands." if path else ""
+    yield f"✅ Got it. Setting up *{name}* and handing it to Knight.{where}"
+    yield build(pid)
 
 
 # ── The code ─────────────────────────────────────────────────────────────────
@@ -220,6 +266,9 @@ def answer(code: str, who: str, channel: str = "", thread_ts: str = ""):
     cid = n.get("challenge")
     if not cid:
         return "There's no code request open, so nothing was checked. Ask me to build a project first.", None
+    if n.get("gated"):
+        return (f"The code for *{n.get('name') or n.get('project')}* counts only as a reply in the Moses Gate's "
+                "thread, where root reads it. Nothing was checked here.", None)
     if n.get("channel") != channel or (n.get("thread_ts") and n.get("thread_ts") != thread_ts):
         return (f"The code request for *{n.get('name') or n.get('project')}* is in another conversation. "
                 "Reply there; nothing was checked here.", None)

@@ -24,6 +24,11 @@ CASES: list[tuple[str, dict, str, str]] = [
     ("Bash", {"command": "rm -rf /mnt/data1"}, "deny", "recursive delete on the photo drive"),
     ("Bash", {"command": "rm -rf /home/brad/.claude/memory"}, "deny", "delete the project brain"),
     ("Bash", {"command": "rsync -a --delete /tmp/empty/ /mnt/bcm-archive-1/"}, "deny", "rsync --delete empties a drive"),
+    # MF8 review (2026-11-05): the rsync rule's alternation was ungrouped, so merely naming a path denied.
+    ("Bash", {"command": "cat /srv/moses-share/memory/MEMORY.md"}, "allow", "reading a shared note is not a delete"),
+    ("Bash", {"command": "cat /home/moses/.claude/memory/MEMORY.md"}, "allow", "reading a note by its corpus path is not a delete"),
+    ("Bash", {"command": "rsync -a --delete /tmp/empty/ /srv/moses-share/memory/"}, "deny", "rsync --delete into the shared corpus"),
+    ("Bash", {"command": "rm -rf /srv/moses-share"}, "deny", "recursive delete of everything shared with moses"),
 
     # ── Segment bypass: the classic way a first-word check gets beaten ───────
     ("Bash", {"command": "ls; mkfs.ext4 /dev/sdb"}, "deny", "semicolon chain"),

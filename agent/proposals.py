@@ -163,9 +163,10 @@ def open_todos(memory=None) -> list[str]:
     something finished weeks earlier. Brad retired that file: every task now hangs off a project, and
     this reads the same place the dashboard does. `memory` is still honored so tests can redirect it.
     """
-    base = memory or os.environ.get("MOSES_MEMORY_DIR", str(_env.MEMORY))
+    # MF8: the registry is wherever moses_env says (MOSES_REGISTRY), not always beside the notes.
+    reg = Path(memory) / "projects.json" if memory else _env.REGISTRY
     try:
-        d = json.loads((Path(base) / "projects.json").read_text(encoding="utf-8"))
+        d = json.loads(reg.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return []
     out: list[str] = []

@@ -95,6 +95,54 @@ ROOT = Path(setting("MOSES_ROOT") or Path(__file__).resolve().parents[2])
 MEMORY = Path(setting("MOSES_MEMORY_DIR") or HOME / ".claude" / "memory")
 STATE = Path(setting("MOSES_STATE") or HOME / ".local" / "state" / "moses")
 
+# MF8 (2026-11-05): when Moses runs as his own account, every share flows ONE way. The corpus is read-only
+# to him, so the registry he writes lives in a folder he owns (MOSES_REGISTRY); the transcript index is
+# built by brad and read-only to him (MOSES_TRANSCRIPTS_DB); and each account writes its own state and
+# reads the other's from MOSES_PEER_STATE, never writing there. Unset, everything is where it always was.
+REGISTRY = Path(setting("MOSES_REGISTRY") or MEMORY / "projects.json")
+TRANSCRIPTS_DB = Path(setting("MOSES_TRANSCRIPTS_DB") or ROOT / "mcp" / "transcripts.db")
+# What Moses writes down for Brad (look-into-further.md): his own folder once the corpus is read-only.
+DATA = Path(setting("MOSES_DATA") or MEMORY)
+PEER_STATE = Path(setting("MOSES_PEER_STATE")) if setting("MOSES_PEER_STATE") else None
+
+
+def read_state(name: str) -> str | None:
+    """A state file by name: this account's own first, then the other account's (MOSES_PEER_STATE).
+
+    The other account is less trusted in one direction or the other, so its file is opened without
+    following a symlink and must be a regular file directly in that folder: a link planted there must
+    never make this account read (and then report or post) one of its own secrets. None when absent.
+    """
+    if "/" in name or name.startswith("."):
+        raise ValueError(f"not a plain state file name: {name!r}")
+    own = STATE / name
+    try:
+        return own.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return read_peer(name)
+
+
+def read_peer(name: str) -> str | None:
+    """Only the other account's copy of a state file (see read_state), or None."""
+    if "/" in name or name.startswith("."):
+        raise ValueError(f"not a plain state file name: {name!r}")
+    if PEER_STATE is None:
+        return None
+    import stat as _stat
+    try:
+        fd = os.open(PEER_STATE / name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        if not _stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, encoding="utf-8") as fh:
+            fd = -1
+            return fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
 
 def product_name() -> str:
     """What the operator's product is called, for prompt and message text: MOSES_PRODUCT_NAME, else

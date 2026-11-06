@@ -94,7 +94,8 @@ def target_source(target: str) -> Path | None:
         m = re.search(r"^KT_SOURCE=(\S+)", f.read_text(encoding="utf-8"), re.M)
     except OSError:
         return None
-    p = Path(m.group(1).strip("'\"")).expanduser() if m else None
+    # Target files are sourced shell and say $HOME since MF8: expand it the way the shell would.
+    p = Path(os.path.expandvars(m.group(1).strip("'\""))).expanduser() if m else None
     return p if p and p.is_dir() else None
 
 

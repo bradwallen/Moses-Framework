@@ -253,6 +253,35 @@ from "no duplicates".
   the app reasons over the result and answers Brad
 ```
 
+### 2-i. Who may call the MCP server (2026-11-06, `mcp/mcp_auth.py`)
+
+Both listeners used to answer anyone who reached the port: the full one any tailnet peer or local
+process, the public one any local process that skipped Access by calling loopback directly. Now every
+request is checked before the SDK sees it. WHO may call follows the listener's ADDRESS; the profile
+chooses only which tools it serves (both units run profile=full).
+
+```
+  tailnet :8765 — auth mode KEY
+    Slack listener (moses) ── Bearer <listener key> ──▶ ok
+    blog agent, drift check (brad) ── Bearer <operator key> ──▶ ok
+    anything else ──────────────────────────────────────▶ 401
+
+  loopback :8766 — auth mode ACCESS (the tunnel's origin)
+    portal ─▶ tunnel ─▶ Access ── Cf-Access-Jwt-Assertion ──▶ checked: RS256, team keys, aud in
+                                                              mcp/access.conf, iss, exp
+    a key ──────────────────────────────────────────────▶ ok
+    no key and no token (a local process around Access) ─▶ 401, always
+    a token that fails the check ─▶ REPORT mode: let through, counted `would-refuse`; ENFORCED: 401
+```
+
+Keys (`agent/lib/mcp_key.py`): whoever needs one first makes it (written whole, then linked into place).
+The listener key lives in the agent account's config folder (600); the operator key in its state folder
+(640, read by brad through moses-share). The server re-reads them every 5 seconds and the listener before
+every turn, so revoking one is deleting its file. Keys never go on argv: the listener points the CLI at a
+600 config file, and the drift check hands curl the header on stdin. Report mode lasts until
+`<state>/mcp-auth-8766.json` (counts only, never a token) showed real portal requests passing, which it did at
+10:22 on 2026-11-06 (aud = moses-origin): ENFORCED since. Suite: `mcp/venv/bin/python mcp/mcp_auth_test.py`.
+
 ## 2b. Two domains, on purpose — the example.com migration
 
 **Written 2026-09-03, the day the estate stopped living on the product's domain.**
@@ -522,7 +551,7 @@ nodejs.org, raw.githubusercontent.com, api.github.com, the app's `/api/state`, a
   /home/brad/.claude/memory        the corpus: commandments, project state, todo, ideas, research
         │                          MASTER. Written by Claude sessions and by MCP capture tools.
         │
-        ├──▶ 02:30 reserve-nightly-backup ──▶ /home/moses/Backups/*.tar.gz
+        ├──▶ 02:30 reserve-nightly-backup ──▶ /var/backups/reserve/*.tar.gz (root 700; was /home/moses/Backups to 2026-11-06)
         │    source: agent/reserve-nightly-backup, installed by agent/install-nightly-backup.sh
         │    archives the corpus, transcripts, ~/Projects, ~/scripts, ~/retired, code-server config
         │                                          │
@@ -549,7 +578,7 @@ This is stricter than the arrangement it replaced: the old root-owned roster was
 and nothing checked what it pointed at.
   /var/lib/moses/personas/   last_success per id    ← the accountability ledger
   /var/lib/birdeye/jobs/     handed-off job state   ← survives SSH drop; orphans detected
-  ~/.claude/memory/projects.json   declared project state ← cross-checked against derived facts
+  /srv/moses-share/moses-data/projects.json   declared project state (moses writes it since MF8, brad reads) ← cross-checked against derived facts
 ```
 
 ### Transcripts — two indexes over one database
@@ -1175,6 +1204,10 @@ open, the seed never lives in a repository, and every attempt leaves an audit ro
 ### The flow
 
 ```
+  SINCE #17 (2026-11-04), WHEN THE MOSES GATE IS SET UP: root posts this prompt itself with the gate's
+  own Slack app, reads Brad's reply from that thread (`verify-slack --wait`, which new_build waits on),
+  and refuses the code on stdin. The listener path drawn below is what an install with no gate keeps.
+
   Brad (Slack): "Moses, build #13"       ← the green light; #13 must already be in the tracker
         │                                    with a scope, and must not already have a target
         ▼
@@ -1324,6 +1357,129 @@ the code before the merge. The mutants now remove both, so each pair is watched 
 suites run on every Moses job. `knight/test-land.sh` is not a `*_test.py` and is not in that gate;
 `agent/mfa-suite` runs it, and the installer runs the suite before it changes anything.
 
+## 5c. Root work for a task needs a code (#17, 2026-11-04)
+
+**Why.** Brad, 2026-11-03: *"the MFA approach means there's no question it was me who authorized him to
+do something but after that, he can just do it."* A "yes" in Slack can come from anything that gets text
+into the thread. A code comes from Brad's phone. So root work gets a code, and one code approves a whole
+**task**: a short list of typed actions, each of which may be done as root any number of times until
+the grant expires (4 hours by default, 12 at most).
+
+**The first design was refused in review** (moses:reviewer, 2026-11-04), and the reasons shaped this one:
+(1) root wrote the prompt, but an operator process carried it to Slack, so an injected session could show
+Brad an innocent task while his code granted a harmful one; (2) deny-lists over raw command lines leak
+(`/etc//moses`, the ELF loader, `sed e`, a symlink planted after approval). Two rules replace them:
+
+- **No command lines.** A caller names an action of a known shape, and root builds the command.
+- **Root owns the path to Brad's eyes.** Root posts the prompt from the *Moses Gate* Slack app (token in
+  `/etc/moses/mfa/slack-gate.env`, root, 0600), and root reads Brad's code from replies to *that*
+  message. No operator process carries the prompt or the code. A task can never be verified on stdin.
+
+```
+  a session ── moses-task request "<title>" --unit restart:x.service --install-file src:dest …
+        │
+        ▼
+  sudo moses-mfa challenge task   root: validates each action's shape, copies install-file bytes into
+        │                         its own state (staged/<sha256>), stores the task, renders the prompt
+        ▼
+  Moses Gate posts in its private channel (Brad + the gate only): the actions as root will run them,
+        │  and the full text of any file
+        │
+  moses-task waits: sudo moses-mfa verify-slack --wait — root reads the thread every 5 s until Brad
+        │   replies or the request closes. Nothing else can say "look now": Moses's bot is kept out
+        │   of the channel on purpose, so the listener never sees the reply (first live test, 2026-11-04).
+        │   It passes nothing: root fetches the thread itself, takes only Brad's user id, never a bot,
+        │   only replies to its own post, each reply tried once. Empty reads are not ledger rows; the
+        │   wait's end is. A wrong code with tries left keeps it watching. The wait is pinned to the
+        │   request open when it started: if another reader answered it first, the wait reports that
+        │   grant; it never judges a newer request. Every ending leaves a ledger row with the request's
+        │   id: three Slack failures in a row, the caller killing it, the request closing (and then root
+        │   says so in the thread, so a reply in the last seconds never meets silence). Callers with a
+        │   shorter tool timeout than ~6 minutes run it in the background or use --no-wait + look.
+        │
+  Brad replies 123456 IN THAT THREAD  (anyone else posting there closes the request: a "corrected task"
+        │                            from another bot must not be what he answers)
+        │   The code is judged at the time Slack's servers stamped his reply, clamped between the
+        │   request's opening and root's clock, not when root read it (the same test: his right code
+        │   was refused because root read it a minute late). An edited reply is judged at the edit's
+        │   stamp. The replay counter still spends each step once.
+        ▼
+  grant ── root posts "✅ Granted until …" in the thread itself
+        │
+        ▼
+  sudo moses-mfa do <grant> <n>    root rebuilds action n's command and runs it: clean environment,
+                                   cwd /, umask 022, ledger rows started + finished.
+                                   Exit = the command's own; 128+N for a signal; 125 refused, 124 could not check
+```
+
+**The action types:**
+
+| type | what root does | shape it must have |
+|---|---|---|
+| `unit` | `systemctl <verb> -- <unit>`, or `daemon-reload` | verb in start/stop/restart/reload/enable/disable; a plain unit name; not on the Never list |
+| `apt-update` | `apt-get update` | — |
+| `apt-install`, `apt-upgrade` | `apt-get install -y [--only-upgrade] -- <names>` | 1 to 20 plain package names: no versions, paths or options |
+| `install-file` | writes the bytes staged when Brad was asked, root-owned, with a mode | the source is read **as the caller** (root drops to `SUDO_UID` first), is not a symlink, and is plain text Brad can read whole: at most 60 lines and 4000 bytes, no control, bidi or zero-width characters. The dest is in `/etc/systemd/system` (units, and drop-ins, whose `.d` directory may be created), `/usr/local/bin` or `/usr/local/sbin` under a name no other PATH directory has, or `/etc/logrotate.d`. Mode 0644, 0755 or 0600 |
+
+**Units cannot smuggle the operator's code into root.** Before a unit verb runs, root asks systemd
+for the unit's real name (`Id`; an alias of a Never-list unit is refused) and checks everything the
+unit would run or load:
+- its file, its drop-ins and its environment files;
+- every Exec line's `path=` and argv paths, whatever `User=` says, because a `+` prefix runs as root
+  and `systemctl show` does not mark it;
+- for root units, also `WorkingDirectory` and any path in `Environment`, such as `LD_PRELOAD`;
+- the same, recursively, for every unit it triggers or wants. Starting a timer starts its service.
+
+The operator must not be able to change any of these, all the way up to `/`. "Can change" means owned
+by the operator, writable by a group they are in, or writable by everyone, so `/var/log` (the
+`syslog` group) passes. Against Reserve's 310 units on 2026-11-04, the only refusal was
+`idrivecron.service`, which runs out of the world-writable `/opt/IDriveForLinux` (see below).
+
+**The Never list holds by construction.** File destinations are an allow-list, so sudoers, PAM, this
+helper, its seed and its state are unreachable. Units for the audit trail and logins (journald, auditd,
+rsyslog, logind, polkit, ssh, sudo) are refused by name.
+The name check applies to the unit the action names. A unit reached as a dependency is only ever
+started (nearly every unit pulls in sysinit.target, which wants the journal), so it is not refused by
+name, but its code is checked like any other. Against Reserve's 291 units (2026-11-04) the check refuses
+six: idrivecron (below), and snapd, its socket, snapd.seeded and cloud-final, which would start more
+than 150 units, too many to check. A socket's write bit is permission to connect, not to replace it, so
+tailscaled's 666 socket passes. A path written `//x` used to loop the walk forever; it is collapsed now.
+
+**Rate:** at most 4 task requests an hour, so nothing can keep Brad's channel busy.
+**Package names** may not end in `-` or `+` (`apt-get install sudo-` removes sudo).
+
+**Found while building it (2026-11-04): `/opt/IDriveForLinux` is mode 777**, and `idrivecron.service`
+runs `/etc/idrivecron`, which resolves into it, as root. Any process on Reserve could get root by changing
+a file there, with or without this gate. **Closed 2026-11-06** (Brad ran the fix): group and other write
+removed, and `bin/.serviceLocation`, which iDrive re-chmodded to 666 seconds later, made immutable. The
+drift check `root-dirs` watches it daily, because iDrive's own code sets 0777 on its folders.
+
+**Honest limits.**
+- Packages come from the repositories root has configured, and their install scripts run as root.
+  Trusting those repositories is the same trust Brad has today.
+- An installed file is shown to Brad in full only when it is short text. Otherwise he sees its hash.
+- While Moses runs as brad (#17 MF8), anything brad can do *without* sudo needs no code. This gates
+  root, not everything.
+- #14's new-build prompt moved to the gate on 2026-11-04: root posts it, reads the reply from its own
+  thread, and refuses stdin for it. Without a gate configured, the old listener path stays.
+
+**From chat (2026-11-04):** Brad asks in plain words and Moses declares `DO: task <title> | <action>;
+…` (agent/task_grant.py). Owner only; unit and apt actions only (install-file needs a session to stage
+its file). Code asks root, waits through root for the code in the gate's thread, runs each action in
+order (stopping at the first failure), then REVOKES the grant: a chat task leaves nothing open. A code
+Brad types in chat while a gate request is open is handed to nothing, and he is told where it counts.
+The listener says an action's progress lines as they come (a generator from the action).
+agent/chat_gate_test.py drives it end to end: the real listener, the real helper, a fake Slack.
+Second review (2026-11-04): with a gate set up, stdin verify is refused outright, so a request that
+closes unread no longer spends Brad's code (that refused his immediate retry); a gate file that exists
+but is broken fails closed; root's prompt lists what runs BEFORE the asker's title, labeled as unchecked;
+a DO line inside a fenced code block is not dispatched; a chat task or new build never acts on a grant
+that came back for another request; the MCP `new_build` tool refuses where the gate exists (a tool call
+cannot wait minutes on a thread) and points at Slack. MF8, Moses as his own user: agent/docs/plans/mf8-moses-user.md.
+
+**MF6, in the same installer:** the operator is removed from the `lxd` group, which is root without
+sudo whenever the LXD daemon runs and would make this gate decorative.
+
 ---
 
 ## 6b. Deliberately not running
@@ -1452,6 +1608,13 @@ Root-owned files under `/etc` are still sourced; only root can change them. The 
 three persona scripts live in `agent/root/` (private to this machine); `agent/install-root-hardening.sh`
 installs them with sudo, once, testing before and after and restoring on failure — and is never to be
 granted in sudoers, since a password-free copy of operator files into /usr/local is this same hole.
+
+**Missed by that sweep, found 2026-11-06:** `reserve-nightly-backup` (root, 02:30) still sourced the
+operator's slack.env, and wrote its archive into `/home/moses/Backups`, which the agent's own account owns
+since MF8. It now parses the one line it needs and writes only to a root-only folder it checks first
+(`agent/reserve_backup_test.sh`; installed by `agent/mf8/mf8-harden.sh`, private to this machine). The
+drift check `root-dirs` watches the folders root runs from (MOSES_ROOT_EXEC_DIRS) and keeps secrets in
+(MOSES_ROOT_ONLY_DIRS), and goes red when anything there is writable by another account.
 `agent/root_scripts_test.sh` plants commands in settings files and runs the real scripts; against the
 copies installed before the fix it failed 10 of 12, including the standup and birdeye-customs running
 the planted commands.

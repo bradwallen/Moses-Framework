@@ -1,0 +1,7 @@
+[Unit]
+Description=Moses — take Brad's pushed changes live (MF8: runs as moses)
+
+[Service]
+Type=oneshot
+Environment=XDG_RUNTIME_DIR=/run/user/%U
+ExecStart=%h/Projects/moses/agent/moses-pull

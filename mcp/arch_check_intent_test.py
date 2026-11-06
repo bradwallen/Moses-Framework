@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory() as d:
     # cases are said as skipped; moses-selftest runs this file daily outside any sandbox, in full.
     live = not os.environ.get("KNIGHT_SANDBOX")
     if not live:
-        print("  skip  the two live-unit cases (burtbot off, moses.service running) — the systemd bus is "
+        print("  skip  the two live-unit cases (burtbot off, dbus.service running) — the systemd bus is "
               "hidden in Knight's gate sandbox; moses-selftest runs them daily")
 
     # A real user unit that is installed and NOT running — the burtbot case.
@@ -70,8 +70,9 @@ with tempfile.TemporaryDirectory() as d:
             got is not None and "the reason it is off" in got.detail,
             f"detail was: {got.detail if got else 'none'}")
 
-      # A real user unit that IS running, declared off — must fail.
-      got = findings_for("moses.service", tmp).get("moses.service")
+      # A real user unit that IS running, declared off — must fail. dbus.service runs under every account's
+      # user manager; moses.service stopped running as brad at the MF8 cutover (2026-11-06), and this failed.
+      got = findings_for("dbus.service", tmp).get("dbus.service")
       check("a unit declared off but RUNNING is drift", got is not None and got.status == "drift",
             f"got {got.status if got else 'nothing'}")
       check("and says so plainly", got is not None and "RUNNING" in got.detail,

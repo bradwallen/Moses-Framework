@@ -30,7 +30,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-REGISTRY = _env.MEMORY / "projects.json"
+REGISTRY = _env.REGISTRY
 MEMORY = _env.MEMORY
 # NEXT TO THE INDEXER, NOT NEXT TO THIS FILE. `__file__.parent` looked obviously right and was
 # wrong from the day it was written: the index is built and read by the MCP tree, this module lives
@@ -38,7 +38,7 @@ MEMORY = _env.MEMORY
 # "activity: no transcript index" — a declaration that reads exactly like a finding, on a database
 # holding 75 sessions the whole time. The failure was silent because the miss returns a caption
 # instead of raising.
-DB = Path(os.environ.get("MOSES_TRANSCRIPT_DB") or _env.ROOT / "mcp/transcripts.db")
+DB = Path(os.environ.get("MOSES_TRANSCRIPT_DB") or _env.TRANSCRIPTS_DB)
 STALE_DAYS = 14          # focus unmentioned this long ⇒ the registry is probably out of date
 
 

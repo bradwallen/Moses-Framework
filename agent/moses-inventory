@@ -167,7 +167,7 @@ _usr_hidden=$(XDG_RUNTIME_DIR="/run/user/$(id -u)" systemctl --user list-units -
 emit "> **${_usr_hidden}** further user units are desktop-session plumbing (pipewire, keyring, xdg-*)"
 emit "> and are not listed." 
 emit
-emit "> \`systemctl --user\` needs \`XDG_RUNTIME_DIR=/run/user/1000\` set, or it reports nothing and"
+emit "> \`systemctl --user\` needs \`XDG_RUNTIME_DIR=/run/user/<uid>\` set, or it reports nothing and"
 emit "> looks exactly like a stopped service. That has cost a wrong diagnosis more than once."
 emit
 
@@ -407,6 +407,11 @@ else
     echo "REFUSING TO WRITE: output contains something shaped like a credential" >&2
     rm -f "$tmp"; exit 1
   fi
+  # mktemp makes 0600; the corpus is shared with the moses account (MF8), so the note must stay
+  # group-readable or Moses loses the infrastructure map the moment it is rewritten.
+  chmod 0660 "$tmp"
   mv -f "$tmp" "$OUT"
   echo "wrote $OUT ($(wc -l < "$OUT") lines)"
+  # The credential map rides the same timer (2026-11-06). Its own failure never fails the inventory.
+  "$(dirname "$(readlink -f "$0")")/moses-credentials" --live || echo "moses-credentials failed (see above)" >&2
 fi

@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch from-brad.git for Brad's pushes (MF8)
+
+[Path]
+# A push rewrites this ref; the timer is the fallback for a packed ref or a missed event.
+PathChanged=/srv/moses-share/git/from-brad.git/refs/heads/main
+Unit=moses-pull.service
+
+[Install]
+WantedBy=default.target

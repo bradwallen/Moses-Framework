@@ -29,15 +29,17 @@ STALE_DAYS=${MOSES_INBOX_STALE_DAYS:-14}
 MODE=${1:-}
 mkdir -p "$STATE" 2>/dev/null
 
-REPORT=$(python3 - "$MEM" "$STALE_DAYS" <<'PY'
+# MF8: the registry can live outside the corpus (MOSES_REGISTRY, from moses.env).
+REG=${MOSES_REGISTRY:-$MEM/projects.json}
+REPORT=$(python3 - "$MEM" "$STALE_DAYS" "$REG" <<'PY'
 import json, os, re, sys, time
-mem, stale_days = sys.argv[1], int(sys.argv[2])
+mem, stale_days, reg = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 now = time.time()
 lines, stale_total = [], 0
 
 # What is already on a project, so an inbox item that has landed is not nagged about twice.
 try:
-    d = json.load(open(os.path.join(mem, "projects.json")))
+    d = json.load(open(reg))
 except Exception as e:
     print(f"UNREADABLE could not read the registry ({type(e).__name__}) — reporting nothing rather "
           f"than reporting all-clear"); raise SystemExit

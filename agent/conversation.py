@@ -130,7 +130,80 @@ NO_TOOLS = ("Bash,Read,Write,Edit,MultiEdit,NotebookEdit,Glob,Grep,WebSearch,Tas
 # He reads through the Moses MCP server rather than the filesystem: a curated interface with search
 # and recall semantics, and no way to wander. Read on demand beats shipping 85k tokens per message.
 MCP_URL = _env.setting("MOSES_MCP_URL", "http://127.0.0.1:8765/mcp")
-MCP_CONFIG = json.dumps({"mcpServers": {"moses": {"type": "http", "url": MCP_URL}}})
+# The server asks every caller for a key (2026-11-06, mcp/mcp_auth.py). The key goes in a 600 file the
+# CLI is pointed at, never in the JSON on its command line: argv is readable by every account on the box.
+# The server's own account (the listener) uses the listener key; the operator's jobs (the blog agent,
+# run as brad) use the operator key the server publishes in its state folder.
+#
+# THE PATH NEVER CHANGES, THE FILE DOES. claude_runner caches each profile, so whatever MCP_CONFIG says on
+# the first turn is what every later turn is handed. So it is always the same file, and _invoke rewrites
+# that file before every turn: a key made after the first turn, or a new key after a revocation, is used
+# on the next turn without a restart (review 2026-11-06). Importing this module writes nothing.
+_mcp_config_cache: str | None = None
+
+
+def _mcp_key() -> str | None:
+    import mcp_key
+    import pwd
+    peer = _env.PEER_STATE or _env.STATE
+    # The server's account is named in /etc/moses/agent-user (MF8). That account IS the listener and may
+    # make the listener key itself (written whole, then linked into place, so it and the server agree on
+    # one). Any other account only reads the operator key. A framework install with no such file runs
+    # everything as one account, which is the listener's case.
+    try:
+        agent = _pl.Path(os.environ.get("MOSES_AGENT_USER_FILE") or "/etc/moses/agent-user").read_text().strip()
+    except OSError:
+        agent = ""
+    if not agent or agent == pwd.getpwuid(os.geteuid()).pw_name:
+        try:
+            return mcp_key.load_or_create("listener", _env.CONFIG, _env.STATE)
+        except (OSError, RuntimeError) as e:
+            print(f"conversation: cannot make the MCP listener key ({e})", file=_sys.stderr)
+            return None
+    return mcp_key.load("operator", _env.CONFIG, peer)
+
+
+def _mcp_client_config(path: "_pl.Path | None" = None) -> str:
+    """Write the client config (600) with the current key and return its path. With no key it is
+    written without one: degrade, never crash (commandment 6); the server refuses and the opening event
+    shows the moses server failed, which the listener already reports."""
+    key = _mcp_key()
+    server = {"type": "http", "url": MCP_URL}
+    if key:
+        server["headers"] = {"Authorization": f"Bearer {key}"}
+    else:
+        print("conversation: no Moses MCP key readable; the MCP server will refuse this account",
+              file=_sys.stderr)
+    path = path or _env.CONFIG / "mcp-client.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".mcp-client.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"mcpServers": {"moses": server}}, f)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"conversation: cannot write {path} ({e}); this turn has no Moses MCP", file=_sys.stderr)
+        return json.dumps({"mcpServers": {"moses": {"type": "http", "url": MCP_URL}}})
+    return str(path)
+
+
+def refresh_mcp_config() -> None:
+    """Before a turn: rewrite the file the cached profile points at, with the key as it is now."""
+    if _mcp_config_cache is not None:
+        _mcp_client_config(_pl.Path(_mcp_config_cache))
+
+
+def __getattr__(name: str):
+    global _mcp_config_cache
+    if name == "MCP_CONFIG":
+        if _mcp_config_cache is None:
+            value = _mcp_client_config()
+            if value.lstrip().startswith("{"):       # could not write the file: do not pin that
+                return value
+            _mcp_config_cache = value
+        return _mcp_config_cache
+    raise AttributeError(name)
 
 
 # ── WHAT THE CLI IS NOT ALLOWED TO INHERIT ─────────────────────────────────────
@@ -642,10 +715,11 @@ def _framework_actions_text() -> str:
     """Actions every install has. Same `DO:` line as the operator's own; code does the work."""
     import new_build                                            # noqa: PLC0415
     import publish                                              # noqa: PLC0415
+    import task_grant                                           # noqa: PLC0415
     return ("\n\nACTIONS. These are not tools: ask for one with a line on its own, `DO: <name> <argument>`, "
             "and code runs it after your reply is posted and reports back here. Keep the rest of your "
             "reply to a line saying it has started.\n"
-            + "\n".join(f"- `{n}`: {d}" for n, d in new_build.actions() + publish.actions()))
+            + "\n".join(f"- `{n}`: {d}" for n, d in new_build.actions() + publish.actions() + task_grant.actions()))
 
 
 def _local_actions_text() -> str:
@@ -785,7 +859,10 @@ def local_actions() -> list[tuple[str, str]]:
 
 def extract_actions(text: str) -> tuple[str, list[tuple[str, str]]]:
     """Split a reply into (message, [(action, argument)]). Own line, starts the line, like PROPOSE."""
-    found = [(m.group(1).lower(), m.group(2).strip()) for m in DO_LINE.finditer(text or "")]
+    # A DO line inside a fenced code block is quoted text, not a request: someone pasted it, and the model
+    # repeating it back must not dispatch it (review, 2026-11-04).
+    unfenced = re.sub(r"```.*?(?:```|\Z)", "", text or "", flags=re.S)
+    found = [(m.group(1).lower(), m.group(2).strip()) for m in DO_LINE.finditer(unfenced)]
     if not found:
         return (text or "").strip(), []
     return DO_LINE.sub("", text or "").strip(), found
@@ -908,7 +985,7 @@ def looks_like_auth_failure(data: dict) -> bool:
 # Where the CLI keeps its login. A module setting so the test can point it at a fake file: Knight's gate
 # runs in a sandbox with no home directory (2026-11-04), and a test that reads the real login file to
 # prove it leaks no token material was reading a real token to do it.
-CREDENTIALS_PATH = "~brad/.claude/.credentials.json"
+CREDENTIALS_PATH = str(_env.HOME / ".claude" / ".credentials.json")   # MF8: whoever Moses runs as, not brad
 
 
 def credential_facts() -> dict:
@@ -1182,6 +1259,7 @@ def _invoke(prompt: str, allowed: str = ALLOWED_TOOLS, directed: bool = False,
     object — byte-identical to what json mode returned — is handed back unchanged. Nothing
     downstream had to change; the difference is that the turn is now auditable.
     """
+    refresh_mcp_config()                         # the key as it is now, in the file the profile names
     # THE COMMAND COMES FROM THE ONE RUNNER (M20, 2026-09-14): claude_runner.py, which always passes
     # --restricted and --strict-mcp-config and builds --tools and --allowedTools from one declaration.
     # This turn's allowance has to be one of the three chat profiles declared there, or it does not

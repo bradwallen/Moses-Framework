@@ -3,7 +3,7 @@ Description=Moses — can he actually answer right now?
 
 [Service]
 Type=oneshot
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStart=%h/Projects/moses/agent/moses-liveness
 # "Moses is down" is a FINDING, not a fault in the checker. A unit that goes `failed` every time it
 # successfully detects an outage is one that gets masked within a week — the same reasoning

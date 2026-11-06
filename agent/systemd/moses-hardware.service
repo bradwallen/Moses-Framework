@@ -3,7 +3,7 @@ Description=Moses — collect resource usage for Reserve and Labs
 
 [Service]
 Type=oneshot
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 ExecStart=%h/Projects/moses/agent/moses-hardware
 # Labs being unreachable is a RESULT the collector records, not a fault — it still writes the file
 # with Reserve's numbers and the reason Labs could not be read.

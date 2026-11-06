@@ -17,7 +17,7 @@ permission gate — which is why this direction is better than the one it replac
 Memory reads are confined to the corpus directory and the filename is sanitized to a bare stem, so
 a path cannot escape it however it is spelled.
 
-RUNS AS `brad`, NOT ROOT. It only needs to read the memory corpus (brad owns it) and run the
+RUNS AS THE AGENT ACCOUNT (`moses` since MF8, 2026-11-06), NOT ROOT. It only needs to read the corpus and run the
 read-only `moses`/`birdeye` queries. Nothing here needs privilege, so it doesn't get any.
 """
 
@@ -519,7 +519,8 @@ def knight_start(task: str, acceptance: str, target: str = "", will_include: str
 @server.tool(
     description="START A BRAND-NEW BUILD of a project already in the tracker, authorized by Brad's "
                 "one-time authenticator code (#14). Use it when Brad gives a project the green light "
-                "(\"build #13\", \"go ahead and build the listings finder\"). TWO CALLS: first with "
+                "(\"build #13\", \"go ahead and build the listings finder\"). Where the Moses Gate is set "
+                "up it refuses and says to ask Moses in Slack instead. Otherwise TWO CALLS: first with "
                 "just `project` (its tracker number, id or name) — that opens a code request and returns "
                 "a prompt; show Brad the prompt and ask for the 6-digit code from his authenticator. Then "
                 "call again with `project` and `code` exactly as he typed it. A verified code creates "
@@ -535,6 +536,12 @@ def new_build(project: str, code: str = "", path: str = "") -> str:
     # argument here can be Brad's code. Every failure comes back as text instead.
     try:
         import new_build as nb                                # agent/new_build.py — the same code Slack uses
+        if nb.gate_configured():
+            # Root posts a new build's prompt with the Moses Gate and something must wait on its thread
+            # for minutes; a tool call cannot. Refused BEFORE a request is opened, so nothing is posted
+            # in Brad's gate channel and no hourly request is spent (review, 2026-11-04).
+            return ("New builds go through the Moses Gate now: ask Moses in Slack (\"build #13\"). Root posts "
+                    "the code request there and reads Brad's reply itself. Nothing was asked.")
         if not (code or "").strip():
             return nb.start(f"{project} | {path}" if path.strip() else project, "mcp", "")
         digits = nb.is_code(code)
@@ -1211,6 +1218,7 @@ def fix_drift(op: str = "ops") -> str:
 #
 # To widen: set MOSES_MCP_PROFILE=full on the public unit once you have watched Access actually
 # challenge an unauthenticated request. That is one env line, and it should follow evidence.
+# The profile chooses TOOLS only. Who may call is the auth mode (mcp_auth.auth_mode), from the address.
 PUBLIC_WITHHELD = ["read_memory", "search_memory", "list_memory"]
 
 
@@ -1263,10 +1271,43 @@ def main() -> None:
     )
     print(f"moses-mcp: allowed hosts = {', '.join(security.allowed_hosts)}", flush=True)
 
-    import anyio
-    anyio.run(lambda: server.run_streamable_http_async(
-        host=host, port=port, streamable_http_path="/mcp", stateless_http=True,
-        transport_security=security))
+    # WHO MAY CALL (2026-11-06; mcp_auth.py has the reasons). The mode follows the ADDRESS, never the tool
+    # profile: the tailnet listener takes a bearer key and nothing else; the loopback one (the tunnel's
+    # origin) takes a key or a Cloudflare Access token. Keys are made here if missing and re-read every few
+    # seconds, so deleting a key file revokes it without a restart.
+    import mcp_key
+    import mcp_auth
+    try:
+        mode = mcp_auth.auth_mode(host, os.environ.get("MOSES_MCP_AUTH", ""))
+        enforce = mcp_auth.parse_enforce(os.environ.get("MOSES_MCP_ACCESS_ENFORCE", ""))
+    except ValueError as e:
+        raise SystemExit(f"moses-mcp: {e}")
+    _key_cache = {"at": 0.0, "keys": {}}
+
+    def current_keys() -> dict:
+        if time.monotonic() - _key_cache["at"] > 5:
+            _key_cache["keys"] = {n: mcp_key.load_or_create(n, _env.CONFIG, _env.STATE) for n in mcp_key.NAMES}
+            _key_cache["at"] = time.monotonic()
+        return _key_cache["keys"]
+    current_keys()                                   # make them now, so a bad key file stops the start
+    access_cfg = mcp_auth.load_access_config(
+        Path(os.environ.get("MOSES_MCP_ACCESS_CONF") or Path(__file__).resolve().parent / "access.conf"))
+    verifier = (mcp_auth.AccessVerifier(access_cfg["team_domain"], access_cfg["aud"])
+                if access_cfg and mode == "access" else None)
+    label = ("key only" if mode == "key" else
+             f"key or Access token, {'ENFORCED' if enforce else 'REPORT (a failed token is let through)'}"
+             + ("" if verifier else ", NO access.conf"))
+    print(f"moses-mcp: callers = {label}", flush=True)
+
+    starlette_app = server.streamable_http_app(
+        streamable_http_path="/mcp", stateless_http=True, transport_security=security, host=host)
+    gated = mcp_auth.Gate(starlette_app, keys=current_keys, mode=mode, verifier=verifier,
+                          enforce_access=enforce,
+                          status=mcp_auth.Status(_env.STATE / f"mcp-auth-{port}.json", port, label))
+
+    import uvicorn
+    # proxy_headers off: the gate never trusts an address, and the log should show the real peer.
+    uvicorn.run(gated, host=host, port=port, log_level="info", proxy_headers=False)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""moses-task — ask Brad for a code that lets this session do a task's root work (#17).
+
+    moses-task request "Install and start the backup timer" [--hours 4] [--no-wait] ACTION…
+        --unit VERB:NAME            VERB is start stop restart reload enable disable, or
+                                    --unit daemon-reload
+        --apt-update
+        --apt-install PKG[,PKG…]    --apt-upgrade PKG[,PKG…]
+        --install-file SRC:DEST[:MODE]   DEST in /etc/systemd/system, /usr/local/bin or sbin,
+                                         /etc/logrotate.d; MODE 0644 (default), 0755 or 0600
+      Root checks it, copies any file's bytes, and posts the task to Brad in the Moses Gate's private
+      channel. He replies with his code in that thread, and root watches the thread itself until he
+      does or the request closes (up to about 6 minutes). --no-wait returns at once; then
+      `moses-task look` asks root to wait for the reply later. Nothing runs yet either way.
+      AGENTS: a tool call that times out sooner (Claude Code's Bash defaults to 2 minutes) kills the
+      wait. Run it in the background, give it a 400-second timeout, or use --no-wait and then
+      `moses-task look` the same way. Never start a second wait on the same request.
+    moses-task look                        ask root to read Brad's reply now (after --no-wait)
+    moses-task grants                      what is live, with each action's number
+    moses-task do <grant> <n>              do action n as root, until the grant expires
+    moses-task revoke <grant>              end one early
+
+Every check that matters is in agent/moses-mfa, which runs as root (agent/docs/ARCHITECTURE.md §5c).
+This only shapes the request. It never sees Brad's code.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+MFA = shlex.split(os.environ.get("MOSES_MFA_CMD", "sudo -n /usr/local/bin/moses-mfa"))
+
+
+def mfa(*args, stdin=None, passthrough=False):
+    try:
+        if passthrough:
+            return subprocess.run([*MFA, *args]).returncode, "", ""
+        r = subprocess.run([*MFA, *args], input=stdin, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"moses-task: could not run the helper ({type(e).__name__}) — nothing was checked", file=sys.stderr)
+        return 2, "", ""
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def look():
+    """Root reads the thread (waiting for Brad's reply). On a grant, show it with its action numbers."""
+    rc = mfa("verify-slack", "--wait", passthrough=True)[0]
+    if rc != 0:
+        return rc
+    print("Granted. Run each action with `moses-task do <grant> <n>`:")
+    return main(["grants"])
+
+
+def parse_actions(args):
+    acts, hours, i = [], None, 0
+    while i < len(args):
+        a = args[i]
+        val = args[i + 1] if i + 1 < len(args) else ""
+        if a == "--hours":
+            hours = float(val); i += 2; continue
+        if a == "--apt-update":
+            acts.append({"type": "apt-update"}); i += 1; continue
+        if a == "--unit" and val == "daemon-reload":
+            acts.append({"type": "unit", "verb": "daemon-reload"})
+        elif a == "--unit":
+            verb, _, unit = val.partition(":")
+            acts.append({"type": "unit", "verb": verb, "unit": unit})
+        elif a in ("--apt-install", "--apt-upgrade"):
+            acts.append({"type": a[2:], "packages": [p for p in val.split(",") if p]})
+        elif a == "--install-file":
+            parts = val.split(":")
+            act = {"type": "install-file", "source": os.path.abspath(parts[0]), "dest": parts[1] if len(parts) > 1 else ""}
+            if len(parts) > 2:
+                act["mode"] = parts[2]
+            acts.append(act)
+        else:
+            raise SystemExit(f"moses-task: unknown option '{a}' (see moses-task --help)")
+        i += 2
+    return acts, hours
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    op, rest = argv[0], argv[1:]
+    if op == "request":
+        wait = "--no-wait" not in rest
+        rest = [a for a in rest if a != "--no-wait"]
+        if not rest or rest[0].startswith("--"):
+            print('usage: moses-task request "<title>" [--hours N] [--no-wait] ACTION…', file=sys.stderr)
+            return 1
+        acts, hours = parse_actions(rest[1:])
+        spec = {"title": rest[0], "actions": acts}
+        if hours is not None:
+            spec["hours"] = hours
+        rc, out, err = mfa("challenge", "task", stdin=json.dumps(spec))
+        if rc != 0:
+            print(err or "moses-task: refused, no reason given", file=sys.stderr)
+            return rc
+        c = json.loads(out)
+        print(c["prompt"])
+        print(f"\nPosted to Brad in the Moses Gate channel (request {c['challenge']}, open until {c['expires']}).")
+        if not wait:
+            print("When he replies there, `moses-task look`, then `moses-task grants` for each action's number.")
+            return 0
+        print("Waiting for his code in that thread — root reads it, this never sees it…", flush=True)
+        return look()
+    if op == "look":
+        return look()
+    if op == "do":
+        return mfa("do", *rest, passthrough=True)[0]
+    if op == "grants":
+        rc, out, err = mfa("grants")
+        if rc != 0:
+            print(err, file=sys.stderr)
+            return rc
+        for g in json.loads(out):
+            print(f"{g['grant']}  until {g['expires']}  {g['title']}")
+            for n, a in enumerate(g["actions"], 1):
+                print(f"    {n}. {a}")
+        return 0
+    if op == "revoke":
+        rc, out, err = mfa("revoke", *rest)
+        print(out if rc == 0 else err, file=sys.stdout if rc == 0 else sys.stderr)
+        return rc
+    print(f"moses-task: unknown op '{op}'", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -40,7 +40,9 @@ run() {
     [ "$rc" = 0 ] && printf '   green\n' || { printf '   RED (exit %s)\n' "$rc"; fail=1; }
 }
 run "the root helper (moses-mfa)"             "$PY" "$HERE/mfa_test.py"
+run "task grants (#17)"                       "$PY" "$HERE/task_grant_test.py"
 run "the green light and the code (listener)" "$PY" "$HERE/new_build_test.py"
+run "chat to root through the gate (#17)"   "$PY" "$HERE/chat_gate_test.py"
 run "the build itself (moses-new-target)"     "$PY" "$HERE/moses_new_target_test.py"
 run "knight-land and new targets"             bash "$ROOT/knight/test-land.sh"
 

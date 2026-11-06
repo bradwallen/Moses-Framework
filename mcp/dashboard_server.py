@@ -1030,8 +1030,16 @@ def hardware_page() -> str:
     is shown, because a stale number presented as current is worse than no number.
     """
     try:
-        with open(HARDWARE_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
+        # brad's probe writes it; as the moses account it is read from brad's state, one way (MF8).
+        try:
+            with open(HARDWARE_FILE, encoding="utf-8") as fh:
+                raw = fh.read()
+        except FileNotFoundError:
+            raw = _env.read_peer("hardware.json")
+        if raw is None:
+            with open(HARDWARE_FILE, encoding="utf-8") as fh:
+                raw = fh.read()
+        data = json.loads(raw)
     except Exception as e:
         return shell("Hardware", "/hardware",
                      f'<h1>Hardware</h1><div class="p err">No readings yet — '

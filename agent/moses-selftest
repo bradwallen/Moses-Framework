@@ -47,7 +47,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 HOME = Path(os.environ.get("HOME") or Path.home())
 RESULT = Path(os.environ.get("MOSES_SELFTEST_RESULT", HOME / ".local/state/moses/selftest.json"))
-REGISTRY = Path(os.environ.get("MOSES_REGISTRY_LIVE", HOME / ".claude/memory/projects.json"))
+sys.path.insert(0, str(REPO / "agent" / "lib"))
+import moses_env as _env  # noqa: E402 — the settings file names the live tracker (moses-data since MF8)
+# The live tracker this run must not change: MF8 moved it out of the corpus, so the old default watched a
+# copy that no longer changes.
+REGISTRY = Path(os.environ.get("MOSES_REGISTRY_LIVE") or _env.REGISTRY)
 AGENT_PY = os.environ.get("MOSES_AGENT_PY", str(HOME / "moses-venv/bin/python"))
 MCP_PY = os.environ.get("MOSES_MCP_PY", str(REPO / "mcp/venv/bin/python"))
 TIMEOUT_S = 300

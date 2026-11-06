@@ -297,8 +297,8 @@ def suite(helper: Path) -> tuple[list[str], list[str]]:
 MUTANTS = [
     ("no replay guard", "if counter is not None and counter <= s.d[\"last_counter\"]:",
      "if False:", "a used code cannot authorize again (replay)"),
-    ("unlimited tries", "if left <= 0:\n                s.d[\"challenge\"] = None",
-     "if False:\n                s.d[\"challenge\"] = None",
+    ("unlimited tries", "if left <= 0:\n            s.d[\"challenge\"] = None",
+     "if False:\n            s.d[\"challenge\"] = None",
      "three wrong codes close the challenge — the right one is then refused"),
     ("no lockout", "if len(s.d[\"failures\"]) >= LOCK_FAILS:", "if False:", "locked: no new challenge for a day"),
     ("expired codes compared", "if c[\"expires\"] <= t:", "if False:", "an expired challenge refuses even the right code"),
@@ -307,7 +307,7 @@ MUTANTS = [
     ("no lock around state", "fcntl.flock(self.lock, fcntl.LOCK_EX)", "pass",
      "four racing verifies of one code: exactly one authorizes"),
     ("any purpose", "if kind not in KINDS:", "if False:", "only new-build can be authorized"),
-    ("a new project replaces the open request", "            if old[\"purpose\"] != purpose:", "            if False:",
+    ("a new project replaces the open request", "            if old[\"purpose\"] != purpose or gated:", "            if False:",
      "while one request is open, a request for another project is refused"),
     ("not single-use", "if not a or a[\"consumed\"] or", "if not a or", "a consumed authorization cannot be used twice"),
 ]

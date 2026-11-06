@@ -313,8 +313,11 @@ finally:
 print("\nthe standup says when Moses cannot answer, and since when")
 import datetime as _dtn  # noqa: E402
 with _tf.TemporaryDirectory() as _d:
-    _was = (drift.LIVENESS, drift.LIVENESS_LOG)
+    _was = (drift.LIVENESS, drift.LIVENESS_LOG, drift._env.PEER_STATE)
     drift.LIVENESS, drift.LIVENESS_LOG = Path(_d) / "liveness.json", Path(_d) / "liveness.jsonl"
+    # Since the cutover brad's settings name MOSES_PEER_STATE, and the check reads Moses's REAL heartbeat
+    # from there (2026-11-06: these six cases read the live file and failed). The peer folder is the scratch one.
+    drift._env.PEER_STATE = Path(_d)
     _now = _dtn.datetime.now().replace(microsecond=0)
     _iso = lambda m: (_now - _dtn.timedelta(minutes=m)).isoformat()   # noqa: E731
     _down = {"verdict": "down", "reason": "login expired — Moses cannot answer anyone until someone re-authenticates"}
@@ -343,7 +346,7 @@ with _tf.TemporaryDirectory() as _d:
     check("no probe record at all is COULD NOT CHECK", not d and b and "never run" in b[0][1], (d, b))
     d, b, a = _run({"verdict": "degraded", "reason": "529", "at": _iso(3)}, [{"verdict": "degraded", "at": _iso(3)}])
     check("degraded is drift too: he is not answering", len(d) == 1, d)
-    drift.LIVENESS, drift.LIVENESS_LOG = _was
+    drift.LIVENESS, drift.LIVENESS_LOG, drift._env.PEER_STATE = _was
     drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
 
 
@@ -395,6 +398,30 @@ with _tf.TemporaryDirectory() as tmp:
     finally:
         drift.PROJECTS_DIR, drift.REGISTRY, drift.ARCH_DOCS = _was
         drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+
+# ── check_one_listener (MF8) ─────────────────────────────────────────────────────────────────────
+print("Moses's listener runs in one account")
+_was_owners = drift._listener_owners
+try:
+    for owners, want in ((["brad", "moses"], "drift"), (["moses"], "agreed"), (["moses", "moses"], "agreed"), ([], "blind")):
+        drift.DRIFT.clear(); drift.AGREED.clear(); drift.BLIND.clear()
+        drift._listener_owners = lambda o=owners: o
+        drift.check_one_listener()
+        got = "drift" if drift.DRIFT else "agreed" if drift.AGREED else "blind" if drift.BLIND else "nothing"
+        check(f"listeners owned by {owners or 'nobody'} → {want}", got == want, got)
+    # Watch it fail: the same check with the comparison broken must miss brad + moses (commandment 8).
+    _src = (HERE / "moses-drift").read_text()
+    _mut = _src.replace("if len(set(owners)) > 1:", "if False:", 1)
+    check("the mutant exists (the comparison is still where the test expects)", _mut != _src)
+    _ns = {"__name__": "moses_drift_mutant", "__file__": str(HERE / "moses-drift")}
+    exec(compile(_mut, "moses-drift-mutant", "exec"), _ns)
+    _ns["DRIFT"].clear(); _ns["_listener_owners"] = lambda: ["brad", "moses"]
+    _ns["check_one_listener"]()
+    check("with the comparison removed, brad + moses is NOT flagged (so the test above can fail)", not _ns["DRIFT"])
+finally:
+    drift._listener_owners = _was_owners
+    drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+print("  live:", drift._listener_owners())
 
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 # --save: checked and saved, not posted — the 08:00 standup prints it (agent/local-standup → --section).
 ExecStart=%h/Projects/moses/agent/moses-vulncheck --save
 # npm audit and apt can take a while on a slow network; the check is weekly, so give it room.

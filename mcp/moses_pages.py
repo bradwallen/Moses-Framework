@@ -30,7 +30,7 @@ COMMANDMENTS_SRC = MEMORY / "project_moses.md"
 ARCHITECTURE_SRC = _env.ROOT / "agent/docs/ARCHITECTURE.md"
 ROSTER_SRC = Path(os.environ.get("MOSES_ROSTER", str(Path.home() / ".config" / "moses" / "roster.json")))
 ROSTER_FALLBACK = _env.ROOT / "agent/roster.json"
-TRANSCRIPTS_DB = _env.ROOT / "mcp/transcripts.db"
+TRANSCRIPTS_DB = _env.TRANSCRIPTS_DB
 
 
 def esc(v) -> str:

@@ -66,6 +66,7 @@ IRREPLACEABLE = [
     r"/home/[a-z][a-z0-9_-]*/Backups",
     r"/home/[a-z][a-z0-9_-]*/\.claude/memory",
     r"/opt/moses/memory",
+    r"/srv/moses-share\b",           # MF8: what is shared with the moses account (with or without a slash)
 ]
 
 # ── Command patterns that are denied outright ────────────────────────────────
@@ -84,7 +85,9 @@ DENY_COMMANDS: list[tuple[str, str, str]] = [
     # Deleting the irreplaceable.
     (r"\brm\b.*\s(-\w*[rf]\w*\s+)+.*(" + "|".join(IRREPLACEABLE) + ")", "delete.irreplaceable",
      "recursive delete inside irreplaceable data"),
-    (r"\brsync\b.*--delete.*" + "|".join(IRREPLACEABLE), "delete.rsync",
+    # Grouped: without the parentheses the alternation split the pattern, and any command that merely
+    # NAMED an irreplaceable path (even `cat` of a memory note) was denied as an rsync delete (MF8 review).
+    (r"\brsync\b.*--delete.*(" + "|".join(IRREPLACEABLE) + ")", "delete.rsync",
      "rsync --delete against irreplaceable data can empty the destination"),
 
     # Turning monitoring or backups off. A stopped service is how a system goes quiet without

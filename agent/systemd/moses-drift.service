@@ -3,7 +3,7 @@ Description=Moses — does what he declares match what is running?
 
 [Service]
 Type=oneshot
-Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_RUNTIME_DIR=/run/user/%U
 # --all so the log records what AGREED too. A log that only ever contains findings cannot tell you
 # whether the checker ran and found nothing, or never ran at all.
 ExecStart=%h/Projects/moses/agent/moses-drift --all

@@ -31,7 +31,7 @@ from pathlib import Path
 # here instead of a flat file, agent/answer_test.py — which exercises the capture path — began
 # appending its fixture straight into Brad's live registry. That is the third store in one day to
 # be polluted by its own test (Knight's job records, the #viatica-dev channel, this).
-REGISTRY = Path(os.environ.get("MOSES_REGISTRY") or _env.MEMORY / "projects.json")
+REGISTRY = Path(os.environ.get("MOSES_REGISTRY") or _env.REGISTRY)
 
 STAGES = ["idea", "scope", "milestones", "building", "shipped"]
 

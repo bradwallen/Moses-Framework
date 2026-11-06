@@ -1,7 +1,18 @@
 #!/usr/bin/python3 -I
-"""moses-mfa — the one-time code that authorizes a brand-new build. Root-owned, sudo-invoked.
+"""moses-mfa — the one-time code that authorizes what needs Brad. Root-owned, sudo-invoked.
 
     sudo moses-mfa challenge new-build <project>     open the one challenge; prints JSON
+    sudo moses-mfa challenge task < spec.json        a TASK (#17): a title, typed actions, how long.
+                                                     Root posts what Brad reads, itself, from the
+                                                     Moses Gate Slack app; prints JSON
+    sudo moses-mfa verify-slack [--wait]             read Brad's code from that thread, itself; --wait
+                                                     keeps reading until he replies or it closes
+                                                     With the Moses Gate set up, a new build's prompt
+                                                     is posted by root too, and stdin verify is refused
+    sudo moses-mfa do <grant> <n>                    do action n of a live grant, as root. Exit: the
+                                                     command's own; 125 refused, 124 could not check
+    sudo moses-mfa grants                            the task grants still live
+    sudo moses-mfa revoke <grant>                    end a grant early (anyone may shrink one)
     printf %s 123456 | sudo moses-mfa verify <id> [--who <label>]
                                                      the code is read from STDIN, never argv
     sudo moses-mfa authorized new-build <project>    exit 0 + the authorization id if one is waiting
@@ -32,7 +43,22 @@ output or ledger row ever contains it. The seed is printed once, at enrollment, 
 the person enrolling.
 
 Exit codes: 0 done · 1 refused (and why, on stderr) · 2 COULD NOT CHECK — no seed, unreadable state.
-"Could not check" is never reported as "checked and refused", and never as success.
+"Could not check" is never reported as "checked and refused", and never as success. `do` is the
+exception, because it passes the command's own exit code through: there a refusal is 125 and "could
+not check" is 124, and both start their stderr line with "moses-mfa:".
+
+TASK GRANTS (#17, Brad 2026-11-03: "the MFA approach means there's no question it was me who
+authorized him to do something but after that, he can just do it"). A code approves a TASK: a short
+list of TYPED actions, which may each be done as root any number of times until the grant expires.
+agent/docs/ARCHITECTURE.md §5c has the whole design; the two rules it rests on:
+  · NO COMMAND LINES. A caller never hands root a command. It names an action of a known type — a
+    systemd unit verb, an apt install, a file to install — and root builds the command. A raw-command
+    design was refused in review (2026-11-04): deny-lists over argv leak (`//`, ld.so, `sed e`, a
+    symlink planted after approval). An allow-list of shapes does not.
+  · ROOT OWNS THE PATH TO BRAD'S EYES. The prompt is posted by root, from a Slack app whose token only
+    root can read (/etc/moses/mfa/slack-gate.env), and Brad's code is read by root from replies to
+    THAT message. Nothing the operator runs carries the prompt or the code, so no process can show
+    Brad one task and grant another. A task can never be verified through stdin.
 """
 import base64
 import fcntl
@@ -55,7 +81,38 @@ TRIES = 3                     # wrong codes before a challenge is dead
 LOCK_FAILS = 5                # failures across all challenges, within LOCK_SPAN, that lock verify…
 LOCK_SPAN = 86400             # …for this long. 5 guesses a day ≈ 0.55% a year of nonstop guessing.
 AUTH_TTL = 1800               # a verified authorization must be used within 30 minutes
-KINDS = ("new-build",)        # what a code can authorize. Nothing else exists.
+KINDS = ("new-build", "task")  # what a code can authorize. Nothing else exists.
+TASK_HOURS = 4                # a task grant lasts this long unless it asks for less or more…
+TASK_HOURS_MAX = 12           # …and never longer than this
+TASK_ACTIONS_MAX = 12
+RUN_REFUSED, RUN_COULD_NOT_CHECK = 125, 124
+SYSTEMCTL, APT_GET = "/usr/bin/systemctl", "/usr/bin/apt-get"
+
+# The typed actions, and the only shapes each may take.
+UNIT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9@._-]{0,120}\.(service|timer|socket|path|target)$")
+UNIT_VERBS = ("start", "stop", "restart", "reload", "enable", "disable")
+PKG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9+.-]{0,61}[a-z0-9])?$")   # never ending in - or +: `apt-get install sudo-` REMOVES sudo
+DEST_RES = (re.compile(r"^/etc/systemd/system/[A-Za-z0-9@._-]+\.(service|timer|socket|path|target)$"),
+            re.compile(r"^/etc/systemd/system/[A-Za-z0-9@._-]+\.(service|timer|socket|path|target)\.d/[A-Za-z0-9._-]+\.conf$"),
+            re.compile(r"^/usr/local/s?bin/[A-Za-z0-9._-]+$"),
+            re.compile(r"^/etc/logrotate\.d/[A-Za-z0-9._-]+$"))
+MODES = {"0644": 0o644, "0755": 0o755, "0600": 0o600}
+FILE_MAX = 4000                # install-file is for text Brad reads in full: units, small scripts, logrotate
+FILE_LINES = 60
+# Characters that make what Brad sees differ from what is there: controls, bidi overrides, zero-widths.
+# An ALLOW-list now (third review): printable ASCII, tab and newline. A deny-list of "hidden" characters
+# missed U+2028 (a line break that is not counted as a line), soft hyphens, tag characters, homoglyphs.
+HIDDEN = re.compile(r"[^\x20-\x7e\t\n]")
+PROMPT_MAX = 12000             # well under Slack's 40,000: nothing Brad must read is ever cut off
+# /usr/local/{s,}bin come first on PATH: a file there named like a system command would shadow it for root.
+PATH_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+NEVER_NAMES = {"moses-mfa", "sudo", "sudo-rs", "su", "visudo", "sudoedit", "doas", "pkexec"}
+# THE NEVER LIST, for units: the audit trail and what guards logins. The file destinations above are an
+# allow-list, so sudoers, PAM, this helper, its seed and its state are unreachable by construction.
+NEVER_UNITS = re.compile(r"^(systemd-journald|systemd-journal-|auditd|rsyslog|syslog|systemd-logind|polkit|"
+                         r"sudo|ssh|sshd|systemd-sysusers|moses-mfa)")
+GATE_ENV = "/etc/moses/mfa/slack-gate.env"     # SLACK_GATE_TOKEN, SLACK_GATE_CHANNEL, SLACK_OWNER_ID
+SLACK_API = "https://slack.com/api"
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")   # a tracker project id; also a directory name
 
 ROOT = os.geteuid() == 0
@@ -64,9 +121,18 @@ STATE = "/var/lib/moses/mfa"
 if not ROOT:
     SEED = os.environ.get("MOSES_MFA_SEED", SEED)
     STATE = os.environ.get("MOSES_MFA_STATE", STATE)
+    GATE_ENV = os.environ.get("MOSES_MFA_GATE_ENV", GATE_ENV)
+    SLACK_API = os.environ.get("MOSES_MFA_SLACK_API", SLACK_API)
+    SYSTEMCTL = os.environ.get("MOSES_MFA_SYSTEMCTL", SYSTEMCTL)
+    APT_GET = os.environ.get("MOSES_MFA_APT_GET", APT_GET)
+# TESTS ONLY, and never as root: where install-file writes, and whose files count as root's. As root a
+# file is root's only when its owner is uid 0, and a destination is exactly the path Brad was shown.
+DEST_PREFIX = "" if ROOT else os.environ.get("MOSES_MFA_DEST_PREFIX", "")
+TRUSTED_UIDS = (0,) if ROOT else (0, os.geteuid())
 STATE_FILE = os.path.join(STATE, "state.json")
 LEDGER = os.path.join(STATE, "audit.jsonl")
 LOCK = os.path.join(STATE, ".lock")
+STAGED = os.path.join(STATE, "staged")
 
 
 def now() -> float:
@@ -77,6 +143,11 @@ def now() -> float:
 
 def iso(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(t))
+
+
+def clock(t: float) -> str:
+    """A time as Brad reads it in Slack: "1:23 PM". Requests live minutes, so the day is never in doubt."""
+    return time.strftime("%I:%M %p", time.localtime(t)).lstrip("0")
 
 
 def caller() -> str:
@@ -186,6 +257,385 @@ def record(op: str, outcome: str, **fields) -> None:
         raise CouldNotCheck(f"cannot write the audit ledger at {LEDGER} ({e.strerror}).")
 
 
+# ── Typed actions (#17) ──────────────────────────────────────────────────────
+def _operator() -> tuple[int, set]:
+    """The operator who asked (sudo's caller) and their groups. -1 when unknown: then every group- or
+    other-writable path counts as changeable, the strict reading."""
+    if not ROOT:
+        return -1, set()
+    import pwd
+    try:
+        uid = int(os.environ.get("SUDO_UID", ""))
+        pw = pwd.getpwuid(uid)
+        return uid, set(os.getgrouplist(pw.pw_name, pw.pw_gid))
+    except (ValueError, KeyError):
+        return -1, set()
+
+
+OP_UID, OP_GROUPS = _operator()
+
+
+def operator_can_change(st, path: str = "") -> bool:
+    """Could the operator change this file or directory? Owned by them, writable by a group they are in,
+    or writable by everyone. A file the `syslog` group may write (/var/log) is not the operator's to
+    change; one in /opt/IDriveForLinux (mode 777) is. Not root's, and not a test's own files, is suspect."""
+    import stat as _stat
+    if _stat.S_ISLNK(st.st_mode):
+        return False      # a symlink's mode bits are always 777 and mean nothing; its directory decides
+    if _stat.S_ISSOCK(st.st_mode):
+        return False      # write on a socket is permission to connect, not to replace it (tailscaled's is 666)
+    if st.st_mode & 0o002:
+        return True
+    if st.st_uid not in TRUSTED_UIDS and (OP_UID == -1 or st.st_uid == OP_UID):
+        return True
+    if st.st_mode & 0o020 and (OP_UID == -1 or st.st_gid in OP_GROUPS):
+        return True
+    # A POSIX ACL can name the operator directly; with one present the group bits are its mask, and who
+    # it grants is not in st_mode. Group-write plus an ACL counts as changeable (strict, and rare).
+    if path and st.st_mode & 0o020 and not os.path.islink(path):
+        try:
+            if os.getxattr(path, "system.posix_acl_access", follow_symlinks=False):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def root_only(path: str) -> str | None:
+    """Why `path` is not something only root can change, or None. The file and every directory above it
+    must be root's and not writable by group or others — otherwise the operator could swap it. A path
+    that does not exist (an optional EnvironmentFile=-/etc/default/x) is safe when only root could
+    create it: its nearest existing directory must pass instead."""
+    # BOTH chains (third review): the path as written, whose directories decide who can repoint a symlink
+    # in it, and the path it resolves to, whose directories decide who can change what runs.
+    try:
+        for start in (os.path.abspath(path), os.path.realpath(path)):
+            # Python keeps a leading `//` (POSIX leaves it implementation-defined; Linux treats it as /),
+            # and dirname("//") is "//": a unit naming //x hung this walk forever (2026-11-04).
+            p = "/" + start.lstrip("/")
+            while not os.path.lexists(p) and os.path.dirname(p) != p:
+                p = os.path.dirname(p)
+            while True:
+                st = os.lstat(p)
+                if operator_can_change(st, p):
+                    return f"{p} can be changed by someone other than root"
+                parent = os.path.dirname(p)
+                if parent == p:
+                    break
+                p = parent
+        return None
+    except OSError as e:
+        return f"{path}: {e.strerror}"
+
+
+def unit_why_unsafe(unit: str) -> str | None:
+    """A unit root would run code the operator can change through: its file, a drop-in, an environment
+    file, or — when it runs as root — any program or script its Exec lines name. None when safe."""
+    import subprocess
+    return _unit_check(unit, set(), direct=True)
+
+
+UNIT_FANOUT_MAX = 150
+
+
+def _unit_check(unit: str, seen: set, direct: bool = False) -> str | None:
+    """unit_why_unsafe, following what the unit starts: Triggers (a timer, path or socket's service),
+    Wants, Requires, BindsTo, Upholds. Starting a target or a timer starts units this must also check."""
+    import subprocess
+    if unit in seen:
+        return None
+    seen.add(unit)
+    if len(seen) > UNIT_FANOUT_MAX:
+        return f"starting it would start more than {UNIT_FANOUT_MAX} units, too many to check"
+    props = ("Id,FragmentPath,DropInPaths,User,EnvironmentFiles,Environment,WorkingDirectory,Triggers,Wants,"
+             "Requires,BindsTo,Upholds,ConsistsOf,OnFailure,OnSuccess,ExecStart,ExecStartPre,ExecStartPost,ExecReload,ExecStop,ExecStopPost,"
+             "ExecCondition")
+    try:
+        r = subprocess.run([SYSTEMCTL, "show", unit, "-p", props, "--no-pager"], capture_output=True, text=True,
+                           timeout=30, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8"})
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"could not read {unit} from systemd ({e.__class__.__name__})"
+    vals: dict[str, str] = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.partition("=")
+        vals[k] = v
+    # The name systemd actually resolves to: an alias (dbus-org.freedesktop.login1.service is logind)
+    # must not walk past the Never list (review, 2026-11-04).
+    real = vals.get("Id") or unit
+    # The Never list guards what the ACTION names: stop, restart or mask the journal and the audit log
+    # goes dark. A unit reached as a dependency is only ever started (nearly every unit pulls in
+    # sysinit.target, which wants the journal), and starting it turns nothing off. Its code is still
+    # checked below like any other. Refusing it here refused 60 of Reserve's units (2026-11-04).
+    if direct and NEVER_UNITS.match(real):
+        return f"{unit} is {real}, which is on the Never list"
+    if not vals.get("FragmentPath"):
+        if real.endswith(".target") and vals.get("Id"):
+            pass                                  # a built-in target has no file; what it wants is checked below
+        else:
+            return f"{unit} has no unit file installed"
+    paths = ([vals["FragmentPath"]] if vals.get("FragmentPath") else []) + vals.get("DropInPaths", "").split()
+    paths += [m.group(1) for m in re.finditer(r"(?:^|\s)-?(/\S+)", vals.get("EnvironmentFiles", ""))]
+    # EVERY Exec line, whatever User= says: a `+` prefix runs it as root anyway, and `systemctl show`
+    # does not mark it. Both `path=` (what runs) and argv[] (what it is handed) are checked.
+    for k, v in vals.items():
+        if k.startswith("Exec"):
+            paths += re.findall(r"path=(/[^ ;]+)", v)
+            for argv in re.findall(r"argv\[\]=([^;]*)", v):
+                for tok in argv.split():
+                    tok = tok.split("=", 1)[1] if tok.startswith("-") and "=" in tok else tok
+                    if tok.startswith("/"):
+                        paths.append(tok)           # missing too: root_only asks who could create it
+    if vals.get("User", "") in ("", "root", "0"):
+        if vals.get("WorkingDirectory", "").startswith("/"):
+            paths.append(vals["WorkingDirectory"].lstrip("!"))
+        # Any absolute path in the environment (LD_PRELOAD=, PYTHONPATH=a:b) is something root will load.
+        for m in re.finditer(r"(?:^|\s)[A-Za-z_][A-Za-z0-9_]*=(\S+)", vals.get("Environment", "")):
+            paths += [x for x in m.group(1).split(":") if x.startswith("/")]
+    for p_ in paths:
+        why = root_only(p_)
+        if why:
+            return f"{unit} would have root run something the operator can change ({why})"
+    for dep_prop in ("Triggers", "Wants", "Requires", "BindsTo", "Upholds", "ConsistsOf", "OnFailure", "OnSuccess"):
+        for dep in vals.get(dep_prop, "").split():
+            why = _unit_check(dep, seen)
+            if why and "no unit file installed" not in why:
+                return f"starting {unit} also starts {dep}: {why}"
+    return None
+
+
+def normalize_action(a: dict, stage: bool) -> dict:
+    """One typed action, checked and made canonical. `stage` copies an install-file's bytes into root's
+    state now, so what Brad is shown is what will be installed. Raises Refused."""
+    if not isinstance(a, dict):
+        raise Refused("an action is an object with a type")
+    t = a.get("type")
+    if t == "unit":
+        verb, unit = a.get("verb"), a.get("unit")
+        if verb == "daemon-reload":
+            return {"type": "unit", "verb": "daemon-reload", "argv": [SYSTEMCTL, "daemon-reload"]}
+        if verb not in UNIT_VERBS:
+            raise Refused(f"unit verb must be one of {', '.join(UNIT_VERBS)} or daemon-reload")
+        if not isinstance(unit, str) or not UNIT_RE.match(unit):
+            raise Refused(f"'{unit}' is not a unit name (name.service, .timer, .socket, .path or .target)")
+        if NEVER_UNITS.match(unit):
+            raise Refused(f"{unit} is on the Never list — the audit trail and what guards logins are Brad's at a console")
+        return {"type": "unit", "verb": verb, "unit": unit, "argv": [SYSTEMCTL, verb, "--", unit]}
+    if t in ("apt-install", "apt-upgrade"):
+        pkgs = a.get("packages")
+        if not isinstance(pkgs, list) or not pkgs or len(pkgs) > 20 or not all(isinstance(x, str) and PKG_RE.match(x) for x in pkgs):
+            raise Refused("packages must be 1 to 20 plain package names (no versions, paths or options)")
+        extra = ["--only-upgrade"] if t == "apt-upgrade" else []
+        # --no-remove: `-y` must never quietly remove something (sudo-rs, openssh) to satisfy a dependency.
+        return {"type": t, "packages": pkgs, "argv": [APT_GET, "install", "-y", "-q", "--no-remove", *extra, "--", *pkgs]}
+    if t == "apt-update":
+        return {"type": t, "argv": [APT_GET, "update", "-q"]}
+    if t == "install-file":
+        dest, mode = a.get("dest"), a.get("mode", "0644")
+        if not isinstance(dest, str) or os.path.normpath(dest) != dest or not any(r.match(dest) for r in DEST_RES):
+            raise Refused(f"'{dest}' is not a place a task may install a file (systemd units and drop-ins, "
+                          "/usr/local/bin or sbin, /etc/logrotate.d)")
+        if mode not in MODES:
+            raise Refused(f"mode must be one of {', '.join(MODES)}")
+        if dest.startswith("/etc/systemd/system/"):
+            named = dest.split("/")[4].removesuffix(".d")
+            if NEVER_UNITS.match(named):
+                raise Refused(f"{named} is on the Never list — not its file, not a drop-in")
+        if dest.startswith("/usr/local/"):
+            name = os.path.basename(dest)
+            if name in NEVER_NAMES or any(os.path.lexists(os.path.join(d, name)) for d in PATH_DIRS
+                                          if d != os.path.dirname(dest)):
+                raise Refused(f"'{name}' is the name of a command elsewhere on root's PATH (or on the Never list), "
+                              "and a file there would stand in for it")
+        if stage:
+            src = a.get("source")
+            if not isinstance(src, str) or not src.startswith("/"):
+                raise Refused("install-file needs an absolute source path")
+            try:
+                data = read_as_caller(src)
+            except OSError as e:
+                raise Refused(f"cannot read {src} as the person who asked ({e.strerror})")
+            # ── 2. Brad approves only what he can read whole on his phone.
+            if shown_in_full(data) is None:
+                raise Refused(f"{src} cannot be shown in full (at most {FILE_LINES} lines and {FILE_MAX} bytes of "
+                              "plain UTF-8 text, no hidden characters), and Brad approves only what he can read")
+            digest = hashlib.sha256(data).hexdigest()
+            os.makedirs(STAGED, mode=0o700, exist_ok=True)
+            tmp = os.path.join(STAGED, f".{digest}.{os.getpid()}")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.replace(tmp, os.path.join(STAGED, digest))
+            return {"type": t, "dest": dest, "mode": mode, "sha256": digest, "size": len(data), "source": src}
+        return {k: a[k] for k in ("type", "dest", "mode", "sha256", "size", "source") if k in a}
+    raise Refused(f"'{t}' is not an action type. Have: unit, apt-update, apt-install, apt-upgrade, install-file")
+
+
+def read_as_caller(path: str) -> bytes:
+    """The file's bytes, read with the CALLER's identity, not root's. As root this forks, drops to
+    SUDO_UID/SUDO_GID (no supplementary groups) and reads; a file the operator cannot read, root will not
+    read for it. Otherwise "install /etc/moses/mfa/totp.seed" would print the seed (review, 2026-11-04)."""
+    def _read() -> bytes:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as f:
+            import stat as _stat
+            st = os.fstat(f.fileno())
+            if not _stat.S_ISREG(st.st_mode) or st.st_size > FILE_MAX:
+                raise OSError(27, "not a regular file of at most %d bytes" % FILE_MAX)
+            return f.read(FILE_MAX + 1)
+    if not ROOT:
+        return _read()
+    uid, gid = os.environ.get("SUDO_UID", ""), os.environ.get("SUDO_GID", "")
+    if not uid.isdigit() or not gid.isdigit() or uid == "0":
+        raise Refused("install-file is read as the person who asked, and sudo did not say who that is")
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            os.setgroups([])
+            os.setgid(int(gid))
+            os.setuid(int(uid))
+            data = _read()
+            os.write(w, b"OK" + data)
+            os._exit(0)
+        except BaseException as e:                # noqa: BLE001 — the child only ever reports and exits
+            os.write(w, b"NO" + str(getattr(e, "strerror", None) or e).encode()[:200])
+            os._exit(1)
+    os.close(w)
+    chunks = []
+    while True:
+        b = os.read(r, 65536)
+        if not b:
+            break
+        chunks.append(b)
+    os.close(r)
+    os.waitpid(pid, 0)
+    out = b"".join(chunks)
+    if out[:2] != b"OK":
+        raise OSError(13, out[2:].decode(errors="replace") or "could not read it as the caller")
+    return out[2:]
+
+
+def shown_in_full(data: bytes) -> str | None:
+    """The text Brad will read, when it can be shown honestly and whole; else None."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if len(data) > FILE_MAX or text.count("\n") > FILE_LINES or HIDDEN.search(text) or "```" in text:
+        return None
+    return text
+
+
+def slack_escape(text: str) -> str:
+    """Slack's own escaping: without it `<!channel>` pings and `<http://x|ok>` shows "ok" over a link."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def staged_bytes(digest: str) -> bytes:
+    with open(os.path.join(STAGED, digest), "rb") as f:
+        data = f.read(FILE_MAX + 1)
+    if hashlib.sha256(data).hexdigest() != digest:
+        raise CouldNotCheck("a staged file no longer matches its hash")
+    return data
+
+
+def read_task_spec() -> dict:
+    """The task from stdin, validated, with install-files staged. Raises Refused with the reason."""
+    try:
+        spec = json.loads(sys.stdin.read(65536) or "null")
+    except ValueError:
+        raise Refused('the task on stdin is not JSON: {"title": …, "actions": [{"type": …}, …], "hours": n}')
+    if not isinstance(spec, dict):
+        raise Refused("the task must be a JSON object with a title and actions")
+    title = spec.get("title")
+    if (not isinstance(title, str) or not title.strip() or len(title) > 120 or "`" in title
+            or HIDDEN.search(title)):
+        raise Refused("the task needs a one-line title of at most 120 characters, without backticks or hidden characters")
+    acts = spec.get("actions")
+    if not isinstance(acts, list) or not acts or len(acts) > TASK_ACTIONS_MAX:
+        raise Refused(f"the task needs 1 to {TASK_ACTIONS_MAX} actions")
+    hours = spec.get("hours", TASK_HOURS)
+    if not isinstance(hours, (int, float)) or isinstance(hours, bool) or not 0 < hours <= TASK_HOURS_MAX:
+        raise Refused(f"hours must be more than 0 and at most {TASK_HOURS_MAX}")
+    out = []
+    for i, a in enumerate(acts, 1):
+        try:
+            out.append(normalize_action(a, stage=True))
+        except Refused as e:
+            raise Refused(f"action {i}: {e}")
+    return {"title": title.strip(), "actions": out, "hours": hours}
+
+
+def render_action(a: dict) -> str:
+    import shlex
+    if a["type"] == "install-file":
+        return f"install {a['size']} bytes as {a['dest']} (mode {a['mode']}, root-owned) · sha256 {a['sha256'][:12]}"
+    return shlex.join(a["argv"])
+
+
+def render_task(spec: dict) -> str:
+    """What Brad reads, written by root from the stored task — including what each file will contain."""
+    # WHAT RUNS FIRST, the title after and labeled as the asker's (review, 2026-11-04): the title is
+    # whatever the model wrote, and text from others in the channel can shape it. The actions are root's.
+    span = "the next hour" if spec["hours"] == 1 else f"the next {spec['hours']:g} hours"
+    lines = [f"Runs as root, any number of times in {span}:"]
+    for i, a in enumerate(spec["actions"], 1):
+        lines.append(f"  {i}. {render_action(a)}")
+        if a["type"] == "unit" and a.get("unit"):
+            why = unit_why_unsafe(a["unit"])
+            if why and "no unit file installed" in why:
+                lines.append("     (not installed yet: checked again when it runs)")
+    lines.append(f"What they called it (their words, unchecked): {spec['title']}")
+    for i, a in enumerate(spec["actions"], 1):
+        if a["type"] == "install-file":
+            text = shown_in_full(staged_bytes(a["sha256"]))
+            if text is None:                      # staged under an older, looser rule: never shown partly
+                raise Refused(f"{a['dest']} cannot be shown in full, so it cannot be asked for")
+            lines += [f"--- {a['dest']} will contain ---", text.rstrip("\n"), "--- end ---"]
+    out = "\n".join(lines)
+    if len(slack_escape(out)) > PROMPT_MAX:
+        raise Refused(f"the whole task would be longer than {PROMPT_MAX} characters to show; split it so Brad can read all of it")
+    return out
+
+
+# ── The Moses Gate: root's own path to Brad's eyes ───────────────────────────
+def gate_settings() -> dict:
+    vals: dict[str, str] = {}
+    try:
+        with open(GATE_ENV) as f:
+            for line in f:
+                m = re.match(r"\s*([A-Z_]+)=(.*)$", line)
+                if m:
+                    vals[m.group(1)] = m.group(2).strip().strip('"').strip("'")
+    except OSError:
+        raise CouldNotCheck(f"no Moses Gate settings at {GATE_ENV} — task codes are not set up. Nothing was asked.")
+    for k in ("SLACK_GATE_TOKEN", "SLACK_GATE_CHANNEL", "SLACK_OWNER_ID"):
+        if not vals.get(k):
+            raise CouldNotCheck(f"{GATE_ENV} has no {k}. Nothing was asked.")
+    return vals
+
+
+def slack(method: str, payload: dict, g: dict) -> dict:
+    import urllib.parse
+    import urllib.request
+    body = urllib.parse.urlencode(payload).encode()
+    req = urllib.request.Request(f"{SLACK_API}/{method}", data=body,
+                                 headers={"Authorization": f"Bearer {g['SLACK_GATE_TOKEN']}",
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            got = json.load(r)
+    except (OSError, ValueError) as e:
+        raise CouldNotCheck(f"Slack could not be reached for {method} ({e.__class__.__name__})")
+    if not got.get("ok"):
+        raise CouldNotCheck(f"Slack refused {method} ({got.get('error', 'not ok')})")
+    return got
+
+
+CODE_RE = re.compile(r"^\s*(?:<@\w+>[\s,:.-]*)?([0-9]{3})[ -]?([0-9]{3})\s*[.!]?\s*$")
+
+
 def purpose_of(kind: str, name: str) -> str:
     if kind not in KINDS:
         raise Refused(f"'{kind}' is not something a code can authorize. Have: {', '.join(KINDS)}")
@@ -210,9 +660,23 @@ def fail(s: Store, t: float) -> None:
 
 # ── Operations ───────────────────────────────────────────────────────────────
 def op_challenge(args: list[str]) -> int:
-    if len(args) != 2:
-        raise Refused("usage: moses-mfa challenge new-build <project>")
-    purpose = purpose_of(*args)
+    spec = None
+    if args == ["task"]:
+        spec = read_task_spec()                   # first: the reader forks, and must not hold the gate's token
+        g = gate_settings()                       # no gate, no task: Brad would be asked by nobody root trusts
+        digest = hashlib.sha256(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:12]
+        purpose = f"task:{digest}"
+    elif len(args) != 2 or args[0] == "task":
+        raise Refused("usage: moses-mfa challenge new-build <project>   |   moses-mfa challenge task < spec.json")
+    else:
+        purpose = purpose_of(*args)
+        # Through the gate when there is one (#17): the review found #14's prompt had the weakness the
+        # task design was refused for — a brad process carried it to Slack, so a fake could sit beside
+        # it. With no gate (a framework install that never set one up), the old stdin path stays.
+        # Only a gate that does not exist falls back. One that exists but cannot be read whole fails
+        # closed: a typo in root's file must not quietly hand the prompt back to brad (review, 2026-11-04).
+        g = gate_settings() if os.path.exists(GATE_ENV) else None
+    gated = bool(spec) or g is not None
     read_seed()                                   # no seed, no challenge: Brad would be asked for nothing
     t = now()
     with Store() as s:
@@ -221,19 +685,124 @@ def op_challenge(args: list[str]) -> int:
         # ONE OPEN CHALLENGE, AND IT CANNOT BE SWAPPED. If a new one replaced it, a second request
         # arriving while Brad reads the first ("build #13", then anyone's "build #20") would make his
         # code authorize the project he did NOT read. The same project may be asked again (a new id,
-        # a fresh five minutes); a different one waits until this one is answered or expires.
+        # a fresh five minutes); a different one waits until this one is answered or expires. A task
+        # is never re-asked: its prompt is already in Slack, and re-posting would let a caller keep
+        # the one slot busy forever.
+        if gated:
+            s.d["task_asks"] = [x for x in s.d.get("task_asks", []) if x > t - 3600]
+            if len(s.d["task_asks"]) >= 4:
+                record("challenge", "refused", purpose=purpose, detail="more than 4 gate requests in an hour")
+                raise Refused("4 code requests in the last hour already — wait before asking Brad again")
         if old and old["expires"] > t:
-            if old["purpose"] != purpose:
+            # A request already posted in Slack is never re-asked or replaced: its prompt is in front of
+            # Brad, and re-posting would let a caller keep the one slot busy forever.
+            if old["purpose"] != purpose or gated:
                 record("challenge", "refused", purpose=purpose, detail=f"{old['purpose']} is still open")
                 raise Refused(f"a code request for {old['purpose']} is still open until {iso(old['expires'])}. "
                               "Answer it, or let it expire, before asking for another.")
             record("challenge", "superseded", challenge=old["id"], purpose=old["purpose"])
         c = {"id": secrets.token_hex(4), "purpose": purpose, "opened": t, "expires": t + CHALLENGE_TTL, "tries": 0}
+        if gated:
+            s.d["task_asks"] = s.d.get("task_asks", []) + [t]
+        if gated and not spec:
+            kind, name = purpose.split(":", 1)
+            posted = slack("chat.postMessage", {
+                "channel": g["SLACK_GATE_CHANNEL"],
+                "text": (f"🔐 *New build for `{slack_escape(name)}`*\n"
+                         f"A fresh repo, a Knight target, and Knight building the scope on the tracker.\n"
+                         f"Code here if you're in. Good until {clock(c['expires'])}.")}, g)
+            c.update(slack={"channel": posted.get("channel", g["SLACK_GATE_CHANNEL"]), "ts": posted["ts"]}, seen=[])
+        if spec:
+            prompt = render_task(spec)
+            posted = slack("chat.postMessage", {
+                "channel": g["SLACK_GATE_CHANNEL"],
+                "text": (f"🔐 *Root work, needs your OK*\n```\n{slack_escape(prompt)}\n```\n"
+                         f"Code here if you're in. Good until {clock(c['expires'])}.")}, g)
+            c.update(spec=spec, slack={"channel": posted.get("channel", g["SLACK_GATE_CHANNEL"]), "ts": posted["ts"]},
+                     seen=[])
         s.d["challenge"] = c
         s.save()
-        record("challenge", "opened", challenge=c["id"], purpose=purpose)
-    print(json.dumps({"challenge": c["id"], "purpose": purpose, "expires": iso(c["expires"])}))
+        record("challenge", "opened", challenge=c["id"], purpose=purpose,
+               **({"title": spec["title"], "actions": spec["actions"], "hours": spec["hours"]} if spec else {}),
+               **({"slack_ts": c["slack"]["ts"]} if gated else {}))
+    out = {"challenge": c["id"], "purpose": purpose, "expires": iso(c["expires"]), "posted": gated}
+    if spec:
+        out.update(prompt=prompt)
+    print(json.dumps(out))
     return 0
+
+
+def _spend_window(s: "Store", t: float) -> None:
+    """A task request closed without its code being checked (an intruder in the thread, or it expired)
+    may leave Brad's code readable in Slack. Spend every time step it could belong to, so it cannot
+    answer anything else — a new-build challenge on stdin included (third review)."""
+    s.d["last_counter"] = max(s.d["last_counter"], int(t // STEP) + WINDOW)
+
+
+def _check_code(s: "Store", c: dict, code: str, who: str, t: float, code_t: float | None = None) -> dict:
+    """Spend one try of challenge `c` on `code`. Returns the authorization, or raises Refused. `code_t` is
+    when the code was GIVEN, if not now: the time Slack's servers stamped on Brad's reply. Checking a
+    Slack reply against the moment root got around to reading it refused Brad's right code on the first
+    live test (2026-11-04). It is clamped between the challenge's opening and now, so it can neither
+    reach back before the request nor ahead of the clock; the replay counter still spends each step once."""
+    key = read_seed()
+    cid = c["id"]
+    if code_t is None:
+        code_t = t
+    code_t = max(min(float(code_t), t), float(c.get("opened", code_t)))
+    counter = match_counter(key, code, code_t) if re.fullmatch(r"[0-9]{%d}" % DIGITS, code) else None
+    if counter is not None and counter <= s.d["last_counter"]:
+        detail = "code already used"              # a replay: right code, spent time step
+        counter = None
+    else:
+        detail = "wrong code"
+    if counter is None:
+        c["tries"] += 1
+        left = TRIES - c["tries"]
+        if left <= 0:
+            s.d["challenge"] = None
+        fail(s, t)
+        s.save()
+        locked = s.d["locked_until"] > t
+        record("verify", "refused", challenge=cid, purpose=c["purpose"], who=who, detail=detail,
+               tries=c["tries"], locked=locked)
+        if locked:
+            raise Refused(f"{detail}. That is {LOCK_FAILS} wrong codes in a day — verify is locked until "
+                          f"{iso(s.d['locked_until'])}.")
+        if left > 0:
+            raise WrongCodeTriesLeft(f"{detail}. {left} tr{'y' if left == 1 else 'ies'} left on this challenge.")
+        raise Refused(f"{detail}. That was the last try; the challenge is closed.")
+    a = {"id": secrets.token_hex(6), "purpose": c["purpose"], "challenge": cid, "at": t,
+         "expires": t + AUTH_TTL, "consumed": None, "who": who}
+    if c.get("spec"):
+        # A task grant lasts as long as it asked (capped), and is used, not consumed.
+        a["spec"] = c["spec"]
+        a["expires"] = t + min(float(c["spec"]["hours"]), TASK_HOURS_MAX) * 3600
+        a["revoked"] = None
+    s.d["last_counter"] = counter
+    s.d["challenge"] = None
+    s.d["failures"] = []
+    s.d["authorizations"] = [x for x in s.d["authorizations"] if x["expires"] > t - 30 * 86400] + [a]
+    s.save()
+    record("verify", "authorized", challenge=cid, purpose=a["purpose"], authorization=a["id"], who=who)
+    return a
+
+
+def _open_challenge(s: "Store", cid: str | None, who: str, t: float) -> dict:
+    c = s.d["challenge"]
+    if not c or (cid is not None and c["id"] != cid):
+        record("verify", "refused", challenge=cid, who=who, detail="no such open challenge")
+        raise NoSuchChallenge(f"no open challenge{' ' + repr(cid) if cid else ''} — it was answered, superseded, or never opened.")
+    if c["expires"] <= t:
+        s.d["challenge"] = None
+        # No spend here (review, 2026-11-04): it refused Brad's code on an immediate retry and counted
+        # toward his lockout. A code left in an expired thread can answer nothing: a gated request reads
+        # only replies to its own post, and stdin is refused while the gate exists.
+        s.save()
+        # The code is not even compared: an expired challenge answers nothing, right or wrong.
+        record("verify", "refused", challenge=c["id"], purpose=c["purpose"], who=who, detail="expired")
+        raise ChallengeExpired(f"challenge '{c['id']}' expired at {iso(c['expires'])}. Ask again for a new one.")
+    return c
 
 
 def op_verify(args: list[str]) -> int:
@@ -244,51 +813,200 @@ def op_verify(args: list[str]) -> int:
         args = args[:i] + args[i + 2:]
     if len(args) != 1:
         raise Refused("usage: printf %s <code> | moses-mfa verify <challenge> [--who <label>]")
-    cid = args[0]
     code = sys.stdin.read(64).strip()
-    key = read_seed()
+    if os.path.exists(GATE_ENV):
+        # With a gate, every code is read by root from the thread of root's own post. A code on stdin was
+        # carried by someone, and is refused whatever it answers. This is also why a request that closes
+        # unread need not spend Brad's code: no path is left that could replay it.
+        record("verify", "refused", who=who, detail="code via stdin while the Moses Gate is set up")
+        raise Refused("the Moses Gate is set up, so codes are read from its thread by root, never handed in")
+    read_seed()
     t = now()
     with Store() as s:
         check_lock(s, t)
-        c = s.d["challenge"]
-        if not c or c["id"] != cid:
-            record("verify", "refused", challenge=cid, who=who, detail="no such open challenge")
-            raise Refused(f"no open challenge '{cid}' — it was answered, superseded, or never opened.")
-        if c["expires"] <= t:
-            s.d["challenge"] = None
-            s.save()
-            # The code is not even compared: an expired challenge answers nothing, right or wrong.
-            record("verify", "refused", challenge=cid, purpose=c["purpose"], who=who, detail="expired")
-            raise Refused(f"challenge '{cid}' expired at {iso(c['expires'])}. Ask again for a new one.")
-        counter = match_counter(key, code, t) if re.fullmatch(r"[0-9]{%d}" % DIGITS, code) else None
-        if counter is not None and counter <= s.d["last_counter"]:
-            detail = "code already used"          # a replay: right code, spent time step
-            counter = None
+        c = _open_challenge(s, args[0], who, t)
+        if c.get("slack"):
+            # A code for anything root posted must come from Brad's reply to ROOT's post, read by root.
+            # Through stdin, whoever carried it could have shown him a different prompt.
+            record("verify", "refused", challenge=c["id"], purpose=c["purpose"], who=who, detail="gate code via stdin")
+            raise Refused("this request's code is read from its Slack thread by root, never handed in: use verify-slack")
+        a = _check_code(s, c, code, who, t)
+    print(json.dumps({"authorized": a["purpose"], "authorization": a["id"], "expires": iso(a["expires"])}))
+    return 0
+
+
+class NoReplyYet(Refused):
+    pass
+
+
+class NoSuchChallenge(Refused):
+    pass
+
+
+class ChallengeExpired(Refused):
+    pass
+
+
+class WrongCodeTriesLeft(Refused):
+    """A wrong code with tries to spare: a wait keeps watching for Brad's next reply."""
+
+
+WAIT_POLL = 5                 # seconds between reads of the thread while waiting for Brad
+WAIT_MAX = CHALLENGE_TTL + 60  # never longer than a challenge can live, whatever the clock says
+if not ROOT and os.environ.get("MOSES_MFA_WAIT"):     # tests only ("poll,max"); ignored as root
+    WAIT_POLL, WAIT_MAX = (float(x) for x in os.environ["MOSES_MFA_WAIT"].split(","))
+
+
+def op_verify_slack(args: list[str]) -> int:
+    """Read Brad's reply to root's own post, from Slack, with root's own token, and check it. The
+    operator only says "look now"; it never sees or carries the code. With --wait, root keeps looking
+    until Brad replies or the request closes: nothing else can see the gate channel to say "look now"
+    (Moses's bot is kept out of it on purpose), which left Brad's first live reply unread (2026-11-04)."""
+    if args not in ([], ["--wait"]):
+        raise Refused("usage: moses-mfa verify-slack [--wait]")
+    if not args:
+        return _verify_slack_once(quiet_empty=False)
+    return _wait_for_reply()
+
+
+WAIT_ERRORS_MAX = 3           # Slack failing this many reads IN A ROW ends a wait; one blip does not
+
+
+def _wait_for_reply() -> int:
+    """verify-slack --wait. Pinned to the request open when it starts (review, 2026-11-04): a later poll
+    must never judge a different request, and when another reader answered OUR request first, the
+    grant is reported, not a refusal. Every way it ends leaves a ledger row with the request's id."""
+    import signal
+    g = gate_settings()
+    with Store() as s:
+        c0 = s.d["challenge"]
+        if not c0 or not c0.get("slack"):
+            record("verify", "refused", detail="wait: no gate request open")
+            raise Refused("no code request posted by the Moses Gate is open to wait for")
+        cid, purpose, where, closes = c0["id"], c0["purpose"], dict(c0["slack"]), c0["expires"]
+    # A wait killed by its caller (a timeout, Ctrl-C) still says so in the ledger.
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(128 + signal.SIGTERM))
+    deadline, errors, done = time.monotonic() + WAIT_MAX, 0, False
+    try:
+        while True:
+            try:
+                rc = _verify_slack_once(quiet_empty=True, cid=cid)
+                done = True
+                return rc
+            except (NoReplyYet, WrongCodeTriesLeft) as e:
+                errors = 0
+                if isinstance(e, WrongCodeTriesLeft):
+                    print(f"moses-mfa: {e} Still watching the thread.", file=sys.stderr, flush=True)
+            except NoSuchChallenge:
+                # Answered, superseded or expired while we slept. Answered by another reader: say so.
+                with Store() as s:
+                    a = next((x for x in s.d["authorizations"] if x.get("challenge") == cid), None)
+                if a:
+                    done = True
+                    record("verify", "authorized", challenge=cid, purpose=purpose, authorization=a["id"],
+                           detail="wait: granted by another reader of the same request")
+                    print(json.dumps({"authorized": a["purpose"], "authorization": a["id"], "expires": iso(a["expires"])}))
+                    return 0
+                done = True
+                raise Refused(f"request '{cid}' was closed or replaced while waiting; nothing was granted to it")
+            except ChallengeExpired:
+                done = True
+                # Brad may have replied in the last seconds before the close, between two reads. Tell
+                # him in the thread, so a silence is never his only answer (review, 2026-11-04).
+                try:
+                    slack("chat.postMessage", {"channel": where["channel"], "thread_ts": where["ts"],
+                                               "text": "⌛ Timed out before I saw a code, so nothing's approved. "
+                                                       "Ask again if you still want it."}, g)
+                except CouldNotCheck:
+                    pass
+                raise
+            except CouldNotCheck as e:
+                errors += 1
+                if errors >= WAIT_ERRORS_MAX:
+                    done = True
+                    record("verify", "could-not-check", challenge=cid, purpose=purpose,
+                           detail=f"wait: Slack failed {errors} reads in a row: {str(e)[:160]}")
+                    raise
+            if time.monotonic() >= deadline:
+                done = True
+                record("verify", "refused", challenge=cid, purpose=purpose,
+                       detail="wait: no code came from Brad in the thread")
+                raise Refused("no code from Brad in the request's thread before the wait ended")
+            time.sleep(WAIT_POLL)
+    except BaseException as e:
+        if not done and not isinstance(e, (Refused, CouldNotCheck)):
+            record("verify", "refused", challenge=cid, purpose=purpose,
+                   detail=f"wait: ended by {type(e).__name__} before Brad's code was read")
+        raise
+
+
+def _verify_slack_once(quiet_empty: bool, cid: str | None = None) -> int:
+    g = gate_settings()
+    read_seed()
+    t = now()
+    with Store() as s:
+        check_lock(s, t)
+        c = _open_challenge(s, cid, "", t)
+        if not c.get("slack"):
+            raise Refused("the open request is not a task posted to Slack")
+        msgs, cursor = [], ""
+        for _ in range(5):                        # every page: a flood must not push Brad's reply out of view
+            page = {"channel": c["slack"]["channel"], "ts": c["slack"]["ts"], "limit": 200}
+            if cursor:
+                page["cursor"] = cursor
+            got = slack("conversations.replies", page, g)
+            msgs += got.get("messages", [])
+            cursor = (got.get("response_metadata") or {}).get("next_cursor", "")
+            if not got.get("has_more") or not cursor:
+                break
         else:
-            detail = "wrong code"
-        if counter is None:
-            c["tries"] += 1
-            left = TRIES - c["tries"]
-            if left <= 0:
-                s.d["challenge"] = None
-            fail(s, t)
+            raise Refused("the request's thread is too long to read whole, so nothing was granted — ask again")
+        # ONLY BRAD AND THE GATE MAY SPEAK IN THE THREAD. Anyone else — the Moses bot posting a "corrected
+        # task" — could make Brad answer something other than what root posted (review, 2026-11-04).
+        mine = set(c.get("own_ts", [])) | {c["slack"]["ts"]}
+        intruders = [m for m in msgs if m.get("ts") not in mine and float(m.get("ts", 0)) > float(c["slack"]["ts"])
+                     and not (m.get("user") == g["SLACK_OWNER_ID"] and not m.get("bot_id")
+                              and m.get("subtype") in (None, "thread_broadcast"))]
+        if intruders:
+            s.d["challenge"] = None
+            _spend_window(s, t)
             s.save()
-            locked = s.d["locked_until"] > t
-            record("verify", "refused", challenge=cid, purpose=c["purpose"], who=who, detail=detail,
-                   tries=c["tries"], locked=locked)
-            if locked:
-                raise Refused(f"{detail}. That is {LOCK_FAILS} wrong codes in a day — verify is locked until "
-                              f"{iso(s.d['locked_until'])}.")
-            raise Refused(f"{detail}. " + (f"{left} tr{'y' if left == 1 else 'ies'} left on this challenge."
-                                            if left > 0 else "That was the last try; the challenge is closed."))
-        a = {"id": secrets.token_hex(6), "purpose": c["purpose"], "challenge": cid, "at": t,
-             "expires": t + AUTH_TTL, "consumed": None, "who": who}
-        s.d["last_counter"] = counter
-        s.d["challenge"] = None
-        s.d["failures"] = []
-        s.d["authorizations"] = [x for x in s.d["authorizations"] if x["expires"] > t - 30 * 86400] + [a]
+            record("verify", "refused", challenge=c["id"], purpose=c["purpose"], detail="someone else posted in the thread")
+            slack("chat.postMessage", {"channel": c["slack"]["channel"], "thread_ts": c["slack"]["ts"],
+                                       "text": "⛔ Someone besides you replied here, so I closed this one. Nothing's "
+                                               "approved; ask again for a fresh one."}, g)
+            raise Refused("someone other than Brad posted in the request's thread — closed, nothing granted")
+        fresh = []
+        for m in msgs:
+            if (m.get("user") == g["SLACK_OWNER_ID"] and not m.get("bot_id") and m.get("subtype") in (None, "thread_broadcast")
+                    and float(m.get("ts", 0)) > float(c["slack"]["ts"]) and m.get("ts") not in c["seen"]):
+                mm = CODE_RE.match(m.get("text") or "")
+                if mm:
+                    # An edited reply ("one sec" → the code) keeps its first ts; the code was given at the
+                    # edit, which Slack stamps too (review, 2026-11-04). Clamped like any other stamp.
+                    given = (m.get("edited") or {}).get("ts") or m["ts"]
+                    fresh.append((float(given), m["ts"], mm.group(1) + mm.group(2)))
+        if not fresh:
+            if quiet_empty:                       # a wait's empty reads are not attempts; its end is recorded
+                raise NoReplyYet("no new code yet")
+            record("verify", "refused", challenge=c["id"], purpose=c["purpose"], detail="no new code from Brad in the thread")
+            raise Refused("no new code from Brad in the request's thread — a code anywhere else does not count")
+        given, ts, code = max(fresh)
+        c["seen"] = c["seen"] + [x[1] for x in fresh]   # each reply is tried once, the newest first
         s.save()
-        record("verify", "authorized", challenge=cid, purpose=a["purpose"], authorization=a["id"], who=who)
+        try:
+            a = _check_code(s, c, code, g["SLACK_OWNER_ID"], t, code_t=given)
+        except Refused as e:
+            said = slack("chat.postMessage", {"channel": c["slack"]["channel"], "thread_ts": c["slack"]["ts"],
+                                              "text": f"❌ Didn't take: {e}"}, g)
+            if s.d["challenge"] is c:             # still open: our own reply must not count as an intruder
+                c["own_ts"] = c.get("own_ts", []) + [said.get("ts", "")]
+                s.save()
+            raise
+    slack("chat.postMessage", {"channel": c["slack"]["channel"], "thread_ts": c["slack"]["ts"],
+                               "text": (f"✅ Approved. Exactly that, nothing else, until {clock(a['expires'])}.")
+                                       if a.get("spec") else
+                                       (f"✅ Approved. One new build, good until {clock(a['expires'])}.")}, g)
     print(json.dumps({"authorized": a["purpose"], "authorization": a["id"], "expires": iso(a["expires"])}))
     return 0
 
@@ -313,7 +1031,7 @@ def op_consume(args: list[str]) -> int:
         raise Refused("usage: moses-mfa consume <authorization>")
     t = now()
     with Store() as s:
-        a = next((x for x in s.d["authorizations"] if x["id"] == args[0]), None)
+        a = next((x for x in s.d["authorizations"] if x["id"] == args[0] and not x.get("spec")), None)
         if not a or a["consumed"] or a["expires"] <= t:
             why = "no such authorization" if not a else ("already used" if a["consumed"] else "expired")
             record("consume", "refused", authorization=args[0], detail=why)
@@ -337,8 +1055,13 @@ def op_status(args: list[str]) -> int:
         out = {"enrolled": enrolled,
                "locked_until": iso(s.d["locked_until"]) if s.d["locked_until"] > t else None,
                "failures_today": len([f for f in s.d["failures"] if f > t - LOCK_SPAN]),
-               "open_challenge": {"id": c["id"], "purpose": c["purpose"], "expires": iso(c["expires"])} if c else None,
-               "waiting": [a["purpose"] for a in s.d["authorizations"] if not a["consumed"] and a["expires"] > t]}
+               "open_challenge": {"id": c["id"], "purpose": c["purpose"], "expires": iso(c["expires"]),
+                                  "in_gate_thread": bool(c.get("slack"))} if c else None,
+               "gate": os.path.exists(GATE_ENV),
+               "waiting": [a["purpose"] for a in s.d["authorizations"]
+                           if not a.get("spec") and not a["consumed"] and a["expires"] > t],
+               "task_grants": len([a for a in s.d["authorizations"]
+                                   if a.get("spec") and not a.get("revoked") and a["expires"] > t])}
     print(json.dumps(out))
     return 0
 
@@ -383,8 +1106,130 @@ def op_enroll(args: list[str]) -> int:
     return 0
 
 
+def _live_grant(s: "Store", gid: str, t: float) -> dict:
+    a = next((x for x in s.d["authorizations"] if x["id"] == gid), None)
+    if not a or not a.get("spec"):
+        raise Refused(f"no task grant '{gid}'")
+    if a.get("revoked"):
+        raise Refused(f"grant '{gid}' was revoked at {iso(a['revoked'])}")
+    if a["expires"] <= t:
+        raise Refused(f"grant '{gid}' expired at {iso(a['expires'])} — a new code starts a new one")
+    return a
+
+
+def _install_file(act: dict) -> int:
+    """Write the staged bytes to the destination: a temp file in the same directory, root-owned, then
+    renamed into place. The directory must be root's alone, so nothing can race the rename."""
+    data = staged_bytes(act["sha256"])
+    dest = DEST_PREFIX + act["dest"]
+    d = os.path.dirname(dest)
+    if DEST_RES[1].match(act["dest"]) and not os.path.lexists(d) and root_only(os.path.dirname(d)) is None:
+        os.mkdir(d, 0o755)                        # a unit's first drop-in: its .d directory, root's, like systemctl edit
+    why = root_only(d)
+    if why:
+        raise Refused(f"refused: {why}")
+    if os.path.islink(dest):
+        raise Refused(f"refused: {act['dest']} is a symlink")
+    tmp = os.path.join(d, f".moses-mfa.{secrets.token_hex(6)}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            if ROOT:
+                os.fchown(f.fileno(), 0, 0)
+            os.fchmod(f.fileno(), MODES[act["mode"]])
+        os.replace(tmp, dest)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return 0
+
+
+def op_do(args: list[str]) -> int:
+    """Do action n of a live grant, as root. The caller names the action; root builds the command."""
+    if len(args) != 2 or not args[1].isdigit():
+        raise Refused("usage: moses-mfa do <grant> <action number>")
+    gid, n = args[0], int(args[1])
+    t = now()
+    with Store() as s:
+        try:
+            a = _live_grant(s, gid, t)
+        except Refused as e:
+            record("do", "refused", grant=gid, action=n, detail=str(e))
+            raise
+        acts = a["spec"]["actions"]
+        if not 1 <= n <= len(acts):
+            record("do", "refused", grant=gid, action=n, detail="no such action")
+            raise Refused(f"grant '{gid}' has actions 1 to {len(acts)}")
+        act = acts[n - 1]
+        try:
+            normalize_action(act, stage=False)    # again: the helper may be stricter than when granted
+            if act["type"] == "unit" and act.get("unit"):
+                why = unit_why_unsafe(act["unit"])
+                if why:
+                    raise Refused(f"refused: {why}")
+        except Refused as e:
+            record("do", "refused", grant=gid, action=n, detail=str(e))
+            raise
+        if act["type"] != "install-file":
+            act = {**act, "argv": normalize_action(act, stage=False)["argv"]}   # root builds it, now
+        record("do", "started", grant=gid, action=n, what=render_action(act), title=a["spec"]["title"])
+    if act["type"] == "install-file":
+        try:
+            rc = _install_file(act)
+        except (OSError, Refused, CouldNotCheck) as e:
+            print(f"moses-mfa: install-file failed: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
+            rc = 1
+    else:
+        import subprocess
+        env = {"PATH": "/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": "C.UTF-8", "HOME": "/root",
+               "DEBIAN_FRONTEND": "noninteractive"}
+        old = os.umask(0o022)                     # what a person's root shell would use; not this helper's 077
+        try:
+            rc = subprocess.run(act["argv"], env=env, cwd="/", stdin=subprocess.DEVNULL).returncode
+        except OSError as e:
+            rc = 127
+            print(f"could not start {act['argv'][0]} ({e.strerror})", file=sys.stderr)
+        finally:
+            os.umask(old)
+        if rc < 0:
+            rc = 128 - rc                         # killed by a signal: the shell's convention, not a negative exit
+    with Store():
+        record("do", "finished", grant=gid, action=n, rc=rc)
+    return rc
+
+
+def op_grants(args: list[str]) -> int:
+    t = now()
+    with Store() as s:
+        live = [{"grant": a["id"], "purpose": a["purpose"], "title": a["spec"]["title"],
+                 "actions": [render_action(x) for x in a["spec"]["actions"]],
+                 "expires": iso(a["expires"])}
+                for a in s.d["authorizations"]
+                if a.get("spec") and not a.get("revoked") and a["expires"] > t]
+    print(json.dumps(live))
+    return 0
+
+
+def op_revoke(args: list[str]) -> int:
+    if len(args) != 1:
+        raise Refused("usage: moses-mfa revoke <grant>")
+    t = now()
+    with Store() as s:
+        a = _live_grant(s, args[0], t)
+        a["revoked"] = t
+        s.save()
+        record("revoke", "revoked", grant=a["id"], title=a["spec"]["title"])
+    print(f"revoked {a['id']} ({a['spec']['title']})")
+    return 0
+
+
 OPS = {"challenge": op_challenge, "verify": op_verify, "authorized": op_authorized,
-       "consume": op_consume, "status": op_status, "enroll": op_enroll}
+       "consume": op_consume, "status": op_status, "enroll": op_enroll,
+       "verify-slack": op_verify_slack, "do": op_do, "grants": op_grants, "revoke": op_revoke}
 
 
 def main(argv: list[str]) -> int:
@@ -398,10 +1243,10 @@ def main(argv: list[str]) -> int:
         return fn(args)
     except Refused as e:
         print(f"moses-mfa: {e}", file=sys.stderr)
-        return 1
+        return RUN_REFUSED if op == "do" else 1
     except CouldNotCheck as e:
         print(f"moses-mfa: COULD NOT CHECK — {e}", file=sys.stderr)
-        return 2
+        return RUN_COULD_NOT_CHECK if op == "do" else 2
 
 
 if __name__ == "__main__":

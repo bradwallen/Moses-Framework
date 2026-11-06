@@ -241,7 +241,7 @@ def _run(argv: list[str], limit: int = 2500, label: str = "", target: str = "") 
         out = f"(not installed: {argv[0]})"
         return out, coverage(argv, out, None, label, target)
     env = dict(os.environ)
-    env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")   # MF8: this account's, not 1000's
     try:
         p = subprocess.run(argv, capture_output=True, text=True, timeout=90, env=env)
     except subprocess.TimeoutExpired:

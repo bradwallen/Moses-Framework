@@ -77,6 +77,7 @@ import scout  # noqa: E402 — checks a proposal against the code before Brad we
 import silence  # noqa: E402
 import knight_notify  # noqa: E402
 import new_build  # noqa: E402 — the green light for a new build, and the one-time code (#14)
+import task_grant  # noqa: E402 — a task's one-time code, answered from Slack (#17)
 import publish  # noqa: E402 — a project on the web at example.com/<path>
 import build_spec  # noqa: E402 — a build starts only after Brad confirms its examples (#2)
 import glance  # noqa: E402 — a project is done when it is live, green, and Brad has looked (#5)
@@ -500,6 +501,13 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
         # on stdin and NOWHERE else: not to the operator's commands, not to the proposal matcher, and
         # never to the model. The journal records that one arrived, never the digits.
         code = new_build.is_code(raw)
+        if code and task_grant.gate_open():
+            # A request root posted with the Moses Gate (#17: a task, or a new build). Its code counts only
+            # as a reply in that thread, which root reads itself; whoever asked is already waiting on it.
+            # A code here is handed to nothing — not root, not the model — and Brad is told where it goes.
+            print("moses: one-time code seen outside the gate's thread — not used", flush=True)
+            say("That one didn't count. Codes only work as a reply in the gate's thread.")
+            return
         if code:
             print("moses: one-time code received — checked by code, not shown to the model", flush=True)
             said, work = new_build.answer(code, event.get("user") or "", channel, thread_ts)
@@ -980,6 +988,16 @@ def handle(req: SocketModeRequest, sm: SocketModeClient) -> None:
                 work.append(lambda a=arg: new_build.start(a, channel, thread_ts))
                 print(f"moses: DO {name} started", flush=True)
                 continue
+            if name == task_grant.NAME:
+                # Root work behind Brad's code (#17). Owner only: the helper keeps one request open, and
+                # anyone else asking could occupy it or put a prompt in front of Brad he did not ask for.
+                if event.get("user") != OWNER_ID:
+                    note += "\n_Only the owner can ask for root work. Nothing was asked._"
+                    print(f"moses: ignored DO {name} from a non-owner", flush=True)
+                    continue
+                work.append(lambda a=arg: task_grant.chat(a))
+                print(f"moses: DO {name} started", flush=True)
+                continue
             if name == publish.NAME:
                 # Owner only, like a new build: a published path is public, and Brad decides what is.
                 if event.get("user") != OWNER_ID:
@@ -1047,9 +1065,17 @@ BOT_ID = ""
 # short is cheaper to reason about than to optimize.
 SEEN: list = []
 def _local_run(say, work) -> None:
-    """Run one of the operator's own commands and say what it returned. Never raises into the thread."""
+    """Run one of the operator's own commands and say what it returned. Never raises into the thread.
+    A command that returns a generator is said line by line as it yields: a request that waits minutes
+    for Brad's code says where to answer first, then the outcome (#17)."""
     try:
-        say(work())
+        got = work()
+        if isinstance(got, str) or got is None:
+            say(got)
+            return
+        for line in got:
+            if line:
+                say(line)
     except Exception as e:                                                # noqa: BLE001
         print(f"moses: local command failed ({type(e).__name__}: {e})", flush=True)
         say(f"⚠️ That didn't work: {e}")

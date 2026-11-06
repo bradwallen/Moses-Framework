@@ -29,6 +29,25 @@ os.environ["MOSES_CHAT_CHANNELS"] = "C0BQ4PTUJV8"
 
 import budget            # noqa: E402
 import conversation      # noqa: E402
+# The MCP key (2026-11-06): build the client config against a scratch key, never the real config
+# folder, and keep it for every turn this suite runs.
+import mcp_key as _mk  # noqa: E402
+_KEYDIR = __import__('pathlib').Path(__import__('tempfile').mkdtemp(prefix="moses-mcpkey-"))
+_saved = (conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE)
+conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE = _KEYDIR, _KEYDIR, None
+import pwd as _pwd  # noqa: E402
+(_KEYDIR / "agent-user").write_text(_pwd.getpwuid(os.geteuid()).pw_name + "\n")
+os.environ["MOSES_AGENT_USER_FILE"] = str(_KEYDIR / "agent-user")
+try:
+    conversation._mcp_config_cache = conversation._mcp_client_config()
+    _KEY = _mk.load("listener", _KEYDIR, _KEYDIR)
+finally:
+    conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE = _saved
+# Every later turn refreshes the file; keep that refresh on the scratch key, never the real config.
+_real_mcp_key = conversation._mcp_key
+conversation._mcp_key = lambda: _KEY
+
+
 
 # The REAL _invoke, captured before any stub replaces it. Tests further down swap it out, so a later
 # test calling conversation._invoke would otherwise be exercising a stub and proving nothing.
@@ -253,6 +272,10 @@ finally:
 # CAPTURED from the real _invoke, not rebuilt here. This block used to rebuild the command "exactly as
 # _invoke would", which was a second copy of the command line that could only drift from the first.
 # Since M20 the command comes from claude_runner.py, and this asserts what it actually produced.
+def _mcp_servers(value):
+    return json.loads(value if value.lstrip().startswith("{") else open(value).read())["mcpServers"]
+
+
 def _argv_of(**kw):
     box = {}
 
@@ -293,7 +316,50 @@ check("ISOLATION Brad's settings are NOT loaded",
       argv[argv.index("--setting-sources") + 1] == "")
 check("ISOLATION only the declared MCP server is reachable",
       "--strict-mcp-config" in argv
-      and list(json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]) == ["moses"])
+      and list(_mcp_servers(argv[argv.index("--mcp-config") + 1])) == ["moses"])
+_cfg_arg = argv[argv.index("--mcp-config") + 1]
+check("MCP KEY the listener sends its key to the Moses server",
+      _mcp_servers(_cfg_arg)["moses"].get("headers", {}).get("Authorization") == f"Bearer {_KEY}")
+check("MCP KEY the key is never on the command line (argv is readable by every account)",
+      not any(_KEY in a for a in argv))
+check("MCP KEY the config file holding it is mode 600",
+      not _cfg_arg.lstrip().startswith("{") and (os.stat(_cfg_arg).st_mode & 0o777) == 0o600)
+check("MCP KEY the server's own account made the listener key itself (no race with the server's start)",
+      bool(_KEY))
+# Another account (the operator's blog agent): reads the operator key, never makes or reads the listener's.
+_op = __import__("pathlib").Path(__import__("tempfile").mkdtemp(prefix="moses-mcpop-"))
+(_op / "agent-user").write_text("someone-else\n")
+_peer = _op / "peer"; _peer.mkdir()
+_OPKEY = _mk.load_or_create("operator", _op, _peer)
+_saved2 = (conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE,
+           os.environ["MOSES_AGENT_USER_FILE"])
+conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE = _op / "cfg", _op / "own", _peer
+os.environ["MOSES_AGENT_USER_FILE"] = str(_op / "agent-user")
+conversation._mcp_key = _real_mcp_key
+try:
+    _opcfg = conversation._mcp_client_config()
+finally:
+    conversation._mcp_key = lambda: _KEY
+    (conversation._env.CONFIG, conversation._env.STATE, conversation._env.PEER_STATE,
+     os.environ["MOSES_AGENT_USER_FILE"]) = _saved2
+check("MCP KEY another account sends the operator key the server published",
+      _mcp_servers(_opcfg)["moses"].get("headers", {}).get("Authorization") == f"Bearer {_OPKEY}")
+check("MCP KEY another account never makes a listener key of its own",
+      not (_op / "cfg" / "mcp-keys" / "listener.key").exists())
+# A key that changes after the first turn (made late, or revoked and remade) is in the NEXT turn's file,
+# though the runner cached the profile and its path on the first.
+_new_key = "n" * 43
+conversation._mcp_key = lambda: _new_key
+_argv2 = _argv_of()
+_cfg2 = _argv2[_argv2.index("--mcp-config") + 1]
+check("MCP KEY the next turn is handed the same file, with the key as it is now",
+      _cfg2 == _cfg_arg and _mcp_servers(_cfg2)["moses"]["headers"]["Authorization"] == f"Bearer {_new_key}")
+conversation._mcp_key = lambda: None
+_argv3 = _argv_of()
+check("MCP KEY with no key at all the turn still runs, the file just has no key",
+      _argv3 and "headers" not in _mcp_servers(_argv3[_argv3.index("--mcp-config") + 1])["moses"])
+conversation._mcp_key = lambda: _KEY
+_argv_of()
 for tool in ("Bash", "Read", "Write", "Edit", "Task", "Agent", "SlashCommand"):
     check(f"ISOLATION {tool} is disabled", tool in conversation.NO_TOOLS.split(","))
 check("ISOLATION --bare is NOT used (it would ignore the OAuth login)", "--bare" not in argv)
@@ -341,7 +407,7 @@ check("CORPUS no acting tool survives into the allowlist string",
 check("CORPUS he can actually read memory", "list_memory" in conversation.READ_TOOLS
       and "search_memory" in conversation.READ_TOOLS and "read_memory" in conversation.READ_TOOLS)
 check("CORPUS the MCP config names exactly one server",
-      list(json.loads(conversation.MCP_CONFIG)["mcpServers"]) == ["moses"])
+      list(_mcp_servers(conversation.MCP_CONFIG)) == ["moses"])
 check("CORPUS the built-in filesystem tools are still denied",
       all(t in conversation.NO_TOOLS.split(",") for t in ("Read", "Bash", "Write", "Edit", "Glob", "Grep")))
 # The original form of this check asserted the module's source never MENTIONS the key. It has to

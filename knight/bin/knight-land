@@ -278,6 +278,9 @@ fi
 # Say what the review could NOT judge, rather than calling it clean (review of 2026-10-17).
 _nu=$(grep -cE '^UNCHECKED\b' "$DIR/review.txt" 2>/dev/null || true)
 [ "${_nu:-0}" -gt 0 ] && reviewed="$reviewed, $_nu criteria not checkable from the diff"
+# One writer of the live tree at a time: moses-pull merges Brad's pushes here and holds the same lock.
+exec 8>"$(git -C "$KT_SOURCE" rev-parse --absolute-git-dir)/live-tree.lock" && flock -w 120 8 \
+    || die "the live tree stayed busy (moses-pull) for two minutes, so nothing was merged; try again"
 merge_out=$(git -C "$KT_SOURCE" merge --no-ff -m "Land $BRANCH (Knight job $JOB_ID, $reviewed)" "$BRANCH" 2>&1)
 merge_rc=$?
 if [ "$merge_rc" -ne 0 ]; then
@@ -287,6 +290,14 @@ $(printf '%s' "$merge_out" | head -10)"
 fi
 after=$(git -C "$KT_SOURCE" rev-parse HEAD)
 say "Merged \`$BRANCH\` into $MAIN — \`${after:0:7}\`"
+# MF8: when Moses runs as his own account, brad sees a land only through the one-way repo (remote `out`,
+# from-moses.git). Brad merges it into his tree deliberately; nothing of moses's runs as brad by itself.
+# A failed push loses nothing (the merge is here), so it is said, not fatal.
+if git -C "$KT_SOURCE" remote get-url out >/dev/null 2>&1; then
+    git -C "$KT_SOURCE" push -q out "HEAD:$MAIN" 2>/dev/null \
+        && say "Shared with Brad's tree through from-moses.git." \
+        || say "Could not push to from-moses.git, so Brad's tree does not have this yet (the merge here stands)."
+fi
 
 # ── Making it live ───────────────────────────────────────────────────────────
 # HANDED OFF, NOT RUN HERE. Every unit that runs Moses starts from this source tree — the Slack

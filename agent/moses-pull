@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# moses-pull — MF8: bring Brad's pushed changes into the tree Moses runs from, and restart what runs it.
+#
+# Runs AS moses (moses-pull.path fires when brad pushes to from-brad.git; moses-pull.timer is the
+# fallback). Brad's account cannot touch moses's tree, so this is the only way Brad's work goes live.
+#
+# ONE WAY: brad's code runs as moses (brad is trusted by moses), never the reverse. What moses merged is
+# pushed to from-moses.git, where brad's sessions merge it deliberately, after reading it.
+#
+# Fails SAFE and LOUD: a dirty tree or a conflicting merge stops with the live tree unchanged; a restart
+# that leaves a unit down rolls the tree back to the commit that was running and restarts again. Each of
+# those posts in the alarm channel; a clean pull is only written to the journal and pull.json.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"
+
+SRC=${MOSES_PULL_TREE:-$MOSES_ROOT}
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+UNITS=(${MOSES_PULL_UNITS:-moses moses-mcp moses-mcp-public moses-dashboard})
+CHANNEL=${MOSES_ALARM_CHANNEL:-}
+SETTLE=${MOSES_PULL_SETTLE:-15}
+mkdir -p "$STATE" 2>/dev/null
+
+# record <ok|stopped|rolled-back|deferred> <message> [rejected-sha]
+# The rejected commit is REMEMBERED across other stops (a dirty tree, a failed fetch) and forgotten only
+# when a new one is rejected or a pull succeeds (review: any stop without a sha wiped it, and the broken
+# commit was merged and restarted again). "deferred" keeps when the waiting started.
+record() {
+    python3 - "$STATE/pull.json" "$1" "$2" "${3:-}" <<'PY'
+import json, os, sys, time
+path, status, msg, rejected = sys.argv[1:]
+try:
+    old = json.load(open(path))
+except Exception:
+    old = {}
+if not rejected and status != "ok":
+    rejected = old.get("rejected", "")
+out = {"status": status, "message": msg, "rejected": rejected, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+if status == "deferred":
+    out["deferred_since"] = old.get("deferred_since") or time.time()
+    out["deferral_alarmed"] = old.get("deferral_alarmed", False)
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(out, f)
+os.chmod(tmp, 0o640); os.replace(tmp, path)
+PY
+}
+
+# busy: is Knight, Zryachiy or a Claude session running as this account? Asked of the kernel by what each
+# process RUNS: Claude Code's processes are named after their version (2.1.317-…), so a name match never
+# fired (review). A Claude binary lives under ~/.local/share/claude; Knight's runners are named in argv.
+busy() {
+    python3 - "$HOME/.local/share/claude/" "$$" <<'PY'
+import os, sys
+claude_dir, me = os.path.realpath(sys.argv[1]) + "/", sys.argv[2]
+uid = os.getuid()
+for p in os.listdir("/proc"):
+    if not p.isdigit() or p == me:
+        continue
+    try:
+        if os.stat(f"/proc/{p}").st_uid != uid:
+            continue
+        argv = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+        exe = os.path.realpath(f"/proc/{p}/exe")
+    except OSError:
+        continue
+    if exe.startswith(claude_dir) or any(os.path.basename(a.decode(errors="replace")) in
+                                         ("knight-run", "zryachiy-run", "knight-land") for a in argv[:2]):
+        print(p); sys.exit(0)
+sys.exit(1)
+PY
+}
+
+alarm() {
+    echo "moses-pull: $1" >&2
+    [ -n "$CHANNEL" ] || return 0
+    local _xt=0; case $- in *x*) _xt=1; set +x ;; esac   # never trace the token (see moses-inbox)
+    set -a; . "$MOSES_CONFIG_DIR/slack.env" 2>/dev/null; set +a
+    python3 - "$CHANNEL" "$1" <<'PY'
+import json, os, sys, urllib.request
+chan, text = sys.argv[1], sys.argv[2]
+req = urllib.request.Request("https://slack.com/api/chat.postMessage",
+    data=json.dumps({"channel": chan, "text": text, "username": "Moses", "icon_emoji": ":scroll:",
+                     "unfurl_links": False}).encode(),
+    headers={"Authorization": f"Bearer {os.environ.get('SLACK_BOT_TOKEN','')}",
+             "Content-Type": "application/json; charset=utf-8"})
+try:
+    json.load(urllib.request.urlopen(req, timeout=20))
+except Exception as e:
+    print(f"error:{type(e).__name__}", file=sys.stderr)
+PY
+    [ "$_xt" = 1 ] && set -x
+    return 0
+}
+
+# stop <message> [sha]: say it once. With a sha, that commit of Brad's is remembered as rejected and not
+# retried until he pushes something new (review: the timer re-merged and re-restarted every 15 minutes).
+stop() { record stopped "$1" "${2:-}"; alarm ":warning: I couldn't take your latest Moses changes live: $1"; exit 1; }
+
+cd "$SRC" || stop "my tree at $SRC is missing."
+# One writer of the live tree at a time: knight-land merges here too, and holds the same lock (review).
+exec 9>"$(git rev-parse --git-dir)/live-tree.lock" || stop "could not open the live-tree lock."
+flock -n 9 || { echo "moses-pull: knight-land is using the tree; next time"; exit 0; }
+# A restart mid-job would cut off Knight or a conversation; wait for a quiet moment instead.
+if busy >/dev/null; then
+    record deferred "a job or a conversation was running; waiting for a quiet moment"
+    # Waiting is right; waiting forever in silence is not: say so once after six hours.
+    if python3 -c 'import json,sys,time; d=json.load(open(sys.argv[1])); sys.exit(0 if time.time()-d["deferred_since"]>21600 and not d["deferral_alarmed"] else 1)' "$STATE/pull.json" 2>/dev/null; then
+        python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(open(p)); d["deferral_alarmed"]=True; json.dump(d,open(p,"w"))' "$STATE/pull.json"
+        alarm ":hourglass: Your latest Moses changes have waited six hours to go live: something of mine has been running the whole time. They go live at the next quiet moment."
+    fi
+    echo "moses-pull: a job or a conversation is running; next time"; exit 0
+fi
+[ -z "$(git status --porcelain)" ] || stop "my tree has uncommitted changes, so I left it alone. Nothing changed."
+git fetch -q origin || stop "I couldn't fetch from from-brad.git. Nothing changed."
+before=$(git rev-parse HEAD)
+target=$(git rev-parse origin/main)
+git merge-base --is-ancestor origin/main HEAD && { record ok "already up to date at ${before:0:7}"; exit 0; }
+rejected=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rejected",""))' "$STATE/pull.json" 2>/dev/null)
+[ -n "$rejected" ] && [ "$rejected" = "$target" ] && { echo "moses-pull: ${target:0:7} was already turned down; waiting for a new push"; exit 0; }
+
+if git merge-base --is-ancestor HEAD origin/main; then
+    git merge -q --ff-only origin/main || stop "a fast-forward to your main failed. Nothing changed."
+else
+    # Knight landed something here that brad has not merged yet: combine them, or stop on a conflict.
+    if ! out=$(git merge --no-edit -m "Merge Brad's main into the live tree (moses-pull)" origin/main 2>&1); then
+        git merge --abort >/dev/null 2>&1
+        stop "your main and what Knight landed here conflict, so I backed the merge out. Merge from-moses into your tree, fix it there and push again. $(printf '%s' "$out" | grep -m3 CONFLICT | tr '\n' ' ')" "$target"
+    fi
+fi
+after=$(git rev-parse HEAD)
+n=$(git rev-list --count "$before..$after")
+
+down() {
+    local bad=""
+    for u in "${UNITS[@]}"; do systemctl --user is-active --quiet "$u" || bad="$bad $u"; done
+    printf '%s' "${bad# }"
+}
+systemctl --user restart "${UNITS[@]}"; sleep "$SETTLE"
+bad=$(down)
+if [ -n "$bad" ]; then
+    git reset -q --hard "$before"
+    systemctl --user restart "${UNITS[@]}"; sleep "$SETTLE"
+    still=$(down)
+    record rolled-back "at ${after:0:7} these did not stay up: $bad; went back to ${before:0:7}${still:+, and still down: $still}" "$target"
+    alarm ":rotating_light: Your latest Moses changes (\`${after:0:7}\`) took down: $bad. I put the tree back to \`${before:0:7}\` and restarted${still:+, but these are still down: $still}. Check \`journalctl --user -u ${bad%% *}\` as moses."
+    exit 1
+fi
+git remote get-url out >/dev/null 2>&1 && { git push -q out HEAD:main 2>/dev/null || echo "moses-pull: could not push to out" >&2; }
+record ok "took $n commit(s) live: ${before:0:7} → ${after:0:7}"
+echo "moses-pull: took $n commit(s) live: ${before:0:7} → ${after:0:7}"

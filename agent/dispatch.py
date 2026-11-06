@@ -132,7 +132,7 @@ def capture(intent: Intent, memory: Path = MEMORY) -> str:
 
 
 def file_learning(body: str, source: str = "Atlas", link: str = "",
-                  memory: Path = MEMORY) -> tuple[bool, int]:
+                  memory: Path | None = None) -> tuple[bool, int]:
     """Append something Moses learned to the look-into-further list. Returns (added, open_count).
 
     WHY THIS EXISTS (Brad, 2026-08-13): *"The ACTUAL point for Atlas and Moses to compare notes is
@@ -155,7 +155,8 @@ def file_learning(body: str, source: str = "Atlas", link: str = "",
     body = " ".join((body or "").split())
     if not body:
         return False, 0
-    path = memory / "look-into-further.md"
+    # MF8: the corpus is read-only to Moses, so the list lives in his own folder (MOSES_DATA).
+    path = Path(memory or _env.DATA) / "look-into-further.md"
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_text(

@@ -41,10 +41,12 @@ from pathlib import Path
 
 # Live sessions plus anything recovered from the laptop archives by backfill-transcripts.sh.
 # Both are scanned; the staging dir holds history from before Reserve became the dev box.
-PROJECTS = _env.HOME / ".claude/projects"
-ARCHIVE = _env.HOME / ".claude/transcripts-archive"
+# MF8: as the moses account these are the copies brad's timer keeps in /srv/moses-share (set in moses's
+# moses.env); his own ~/.claude/projects holds only his own CLI runs.
+PROJECTS = Path(_env.setting("MOSES_TRANSCRIPTS_DIR") or _env.HOME / ".claude/projects")
+ARCHIVE = Path(_env.setting("MOSES_TRANSCRIPTS_ARCHIVE") or _env.HOME / ".claude/transcripts-archive")
 SOURCES = [PROJECTS, ARCHIVE]
-DB = Path(__file__).resolve().parent / "transcripts.db"
+DB = _env.TRANSCRIPTS_DB
 
 # ── Redaction ────────────────────────────────────────────────────────────────
 # Ordered most-specific first. Each pattern keeps a short prefix so a human can still tell WHICH
