@@ -94,9 +94,65 @@ PY
 
 # stop <message> [sha]: say it once. With a sha, that commit of Brad's is remembered as rejected and not
 # retried until he pushes something new (review: the timer re-merged and re-restarted every 15 minutes).
-stop() { record stopped "$1" "${2:-}"; alarm ":warning: I couldn't take your latest Moses changes live: $1"; exit 1; }
+# The alarm is said ONCE per distinct stop: the same stop on the next run (every 15 minutes) goes only to the
+# journal and pull.json. 2026-11-09: a dirty tree posted the same line every 16 minutes all afternoon.
+stop() {
+    local said
+    said=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("status","")+"|"+d.get("message",""))' "$STATE/pull.json" 2>/dev/null)
+    record stopped "$1" "${2:-}"
+    if [ "$said" = "stopped|$1" ]; then echo "moses-pull: still stopped (already said): $1" >&2
+    else alarm ":warning: I couldn't take your latest Moses changes live: $1"; fi
+    exit 1
+}
 
 cd "$SRC" || stop "my tree at $SRC is missing."
+
+# units.json: the user units this account has, by content. The operator's drift check compares the repo
+# against it, since it cannot read this home (MF8). Written on every run, busy or not; it never stops a pull.
+python3 - "$HOME/.config/systemd/user" "$STATE/units.json" <<'PY' || echo "moses-pull: could not write units.json" >&2
+import hashlib, json, os, pwd, sys, time
+d, out = sys.argv[1:]
+units = {}
+for n in (sorted(os.listdir(d)) if os.path.isdir(d) else []):
+    p = os.path.join(d, n)
+    if n.endswith((".service", ".timer", ".path")) and os.path.isfile(p):
+        with open(p, "rb") as f:
+            units[n] = hashlib.sha256(f.read()).hexdigest()
+doc = {"written": time.time(), "account": pwd.getpwuid(os.getuid()).pw_name, "units": units}
+tmp = out + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f)
+os.chmod(tmp, 0o640); os.replace(tmp, out)
+PY
+
+# pyenvs.json: the Python packages installed in this account's venvs, for the operator's weekly
+# vulnerability check (it cannot read this home either). Names and versions only, from each METADATA.
+python3 - "$STATE/pyenvs.json" ${MOSES_PULL_VENVS:-"$HOME/moses-venv" "$SRC/mcp/venv"} <<'PY' || echo "moses-pull: could not write pyenvs.json" >&2
+import glob, json, os, pwd, re, sys, time
+out, venvs = sys.argv[1], sys.argv[2:]
+doc = {"written": time.time(), "account": pwd.getpwuid(os.getuid()).pw_name, "venvs": {}}
+for v in venvs:
+    if not os.path.isfile(os.path.join(v, "pyvenv.cfg")):
+        continue
+    pkgs = {}
+    for m in glob.glob(os.path.join(v, "lib/python*/site-packages/*.dist-info/METADATA")):
+        name = ver = ""
+        with open(m, errors="replace") as f:
+            for line in f:
+                if not line.strip():
+                    break
+                if line.startswith("Name:"):
+                    name = line[5:].strip()
+                elif line.startswith("Version:"):
+                    ver = line[8:].strip()
+        if name and ver:
+            pkgs[re.sub(r"[-_.]+", "-", name).lower()] = ver
+    doc["venvs"][os.path.abspath(v)] = pkgs
+tmp = out + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f)
+os.chmod(tmp, 0o640); os.replace(tmp, out)
+PY
 # One writer of the live tree at a time: knight-land merges here too, and holds the same lock (review).
 exec 9>"$(git rev-parse --git-dir)/live-tree.lock" || stop "could not open the live-tree lock."
 flock -n 9 || { echo "moses-pull: knight-land is using the tree; next time"; exit 0; }
@@ -110,13 +166,16 @@ if busy >/dev/null; then
     fi
     echo "moses-pull: a job or a conversation is running; next time"; exit 0
 fi
-[ -z "$(git status --porcelain)" ] || stop "my tree has uncommitted changes, so I left it alone. Nothing changed."
 git fetch -q origin || stop "I couldn't fetch from from-brad.git. Nothing changed."
 before=$(git rev-parse HEAD)
 target=$(git rev-parse origin/main)
+# Nothing new from Brad means nothing to take live and nothing to say, dirty tree or not (2026-11-09: the
+# dirty check ran first and alarmed every 16 minutes about "your latest changes" when there were none).
 git merge-base --is-ancestor origin/main HEAD && { record ok "already up to date at ${before:0:7}"; exit 0; }
 rejected=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("rejected",""))' "$STATE/pull.json" 2>/dev/null)
 [ -n "$rejected" ] && [ "$rejected" = "$target" ] && { echo "moses-pull: ${target:0:7} was already turned down; waiting for a new push"; exit 0; }
+dirty=$(git status --porcelain | head -5 | cut -c4- | tr '\n' ' ')
+[ -z "$dirty" ] || stop "my tree has uncommitted changes (${dirty% }), so I left it alone. Nothing changed."
 
 if git merge-base --is-ancestor HEAD origin/main; then
     git merge -q --ff-only origin/main || stop "a fast-forward to your main failed. Nothing changed."
@@ -130,6 +189,36 @@ fi
 after=$(git rev-parse HEAD)
 n=$(git rev-list --count "$before..$after")
 
+# PACKAGES (2026-11-16): each venv this account runs from has a pinned list in the repo. Brad's account
+# cannot touch these venvs, so a list that changed in this pull is installed here, as this account,
+# before anything restarts. A failed install puts the tree back and restarts nothing; a rollback after a
+# failed restart reinstalls the list as it was. Why: the weekly check found critical advisories in the
+# MCP venv on 2026-11-16, and there was no way for Brad's upgrade to reach it.
+LOCKS=(${MOSES_PULL_LOCKS:-"mcp/requirements.lock:$SRC/mcp/venv" "agent/requirements.lock:$HOME/moses-venv"})
+install_locks() {   # install_locks <rev> : prints what it installed, fails on the first error
+    # Each venv remembers the list it last installed (.moses-lock, the list's git blob id), so a list
+    # that arrived while an older moses-pull ran, or an install that never finished, is still installed.
+    local rev=$1 pair lock venv want tmp
+    for pair in "${LOCKS[@]}"; do
+        lock=${pair%%:*}; venv=${pair#*:}
+        [ -x "$venv/bin/python" ] || continue
+        want=$(git rev-parse -q --verify "$rev:$lock" 2>/dev/null) || continue
+        [ "$want" = "$(cat "$venv/.moses-lock" 2>/dev/null)" ] && continue
+        tmp=$(mktemp) || return 1
+        git show "$rev:$lock" > "$tmp" || { rm -f "$tmp"; return 1; }
+        if ! out=$("$venv/bin/python" -m pip install -q --disable-pip-version-check -r "$tmp" 2>&1); then
+            rm -f "$tmp"; printf '%s' "$lock: $(printf '%s' "$out" | grep -m1 -iE 'error' | cut -c1-200)"; return 1
+        fi
+        rm -f "$tmp"; printf '%s\n' "$want" > "$venv/.moses-lock"; printf '%s ' "$lock"
+    done
+}
+if ! installed=$(install_locks "$after"); then
+    git reset --hard -q "$before"
+    install_locks "$before" >/dev/null 2>&1
+    stop "installing the pinned packages failed (${installed}), so I put the tree back to ${before:0:7} and restarted nothing." "$target"
+fi
+[ -n "$installed" ] && echo "moses-pull: installed ${installed% }"
+
 down() {
     local bad=""
     for u in "${UNITS[@]}"; do systemctl --user is-active --quiet "$u" || bad="$bad $u"; done
@@ -139,6 +228,7 @@ systemctl --user restart "${UNITS[@]}"; sleep "$SETTLE"
 bad=$(down)
 if [ -n "$bad" ]; then
     git reset -q --hard "$before"
+    [ -n "$installed" ] && install_locks "$before" >/dev/null 2>&1
     systemctl --user restart "${UNITS[@]}"; sleep "$SETTLE"
     still=$(down)
     record rolled-back "at ${after:0:7} these did not stay up: $bad; went back to ${before:0:7}${still:+, and still down: $still}" "$target"

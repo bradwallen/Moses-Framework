@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# claude-keepwarm — keep the operator's own Claude login from lapsing.
+#
+# WHY (2026-11-17). Brad's login on Reserve was signed out on 2026-11-09 and again on 2026-11-16,
+# each time after it had sat unused for days. Moses's login, which the liveness probe uses every 30
+# minutes, never was. So once a day this asks one trivial question as Brad, on the smallest model,
+# and the CLI refreshes the login the way real use would. The idle-timeout explanation is a
+# hypothesis, not a confirmed fact: if the login still drops, the cause is something else.
+#
+# SUBSCRIPTION ONLY, BY MECHANISM. Reserve never spends on the Anthropic API. The CLI would bill an
+# API key over the subscription if one were in its environment, so the run strips every Anthropic
+# key variable rather than trusting that none is set. claude_keepwarm_test.sh breaks that on purpose.
+#
+# A FAILED RUN IS SAID ELSEWHERE. A signed-out login is the drift check's "operator-login" finding in
+# the 08:00 standup; this writes keepwarm.json so the reason is on disk, and exits 1.
+set -uo pipefail
+. "$(dirname "$(readlink -f "$0")")/lib/moses-env.sh"
+
+STATE=${MOSES_STATE:-$MOSES_HOME/.local/state/moses}
+RUNNER=${MOSES_CLAUDE_RUN:-$MOSES_ROOT/agent/claude-run}
+TIMEOUT=${MOSES_KEEPWARM_TIMEOUT_S:-120}
+mkdir -p "$STATE" 2>/dev/null
+
+out=$(cd /tmp && timeout "$TIMEOUT" env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+      "$RUNNER" --app login-keepwarm --prompt "reply with the single word: ok" 2>&1); rc=$?
+
+if [ "$rc" -eq 0 ]; then verdict=ok; why=""; else verdict=failed; why=$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200); fi
+python3 -c 'import json,sys,datetime; json.dump({"written": datetime.datetime.now().isoformat(timespec="seconds"),
+  "verdict": sys.argv[1], "rc": int(sys.argv[2]), "why": sys.argv[3]}, open(sys.argv[4], "w"))' \
+  "$verdict" "$rc" "$why" "$STATE/keepwarm.json"
+echo "claude-keepwarm: $verdict${why:+ — $why}"
+[ "$rc" -eq 0 ]

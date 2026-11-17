@@ -1086,13 +1086,13 @@ def read_session(session_id: str, start: int = 1, count: int = 20) -> str:
 # An idea with no project still lands somewhere: the registry inbox, rendered as its own cards on
 # the board. Refusing until someone names a project would lose the thought at the exact moment
 # capture is supposed to cost nothing.
-def _capture(body: str, project: str = "") -> str:
+def _capture(body: str, project: str = "", note: str = "") -> str:
     body = (body or "").strip()
     if len(body) < 3:
         return "Give me something to write down."
     import projects
     if (project or "").strip():
-        return projects.add_idea(project, body)
+        return projects.add_idea(project, body, note=(note or "").strip())
     return projects.add_inbox_idea(body)
 
 
@@ -1101,9 +1101,12 @@ def _capture(body: str, project: str = "") -> str:
                         "capturing it, so do not suppress that part of the answer. Pass `project` "
                         "(an id or name, e.g. 'moses') when the idea belongs to one, and it is "
                         "also added to that project's candidate list, which the Projects page "
-                        "shows separately from its milestones. Ideas are never counted as progress.")
-def add_idea(idea: str, project: str = "") -> str:
-    saved = _capture(idea, project)
+                        "shows separately from its milestones. Ideas are never counted as progress. "
+                        "`note` is an optional longer explanation kept with a project's idea.")
+def add_idea(idea: str, project: str = "", note: str = "") -> str:
+    # `note` (2026-11-11): moses-project's `idea --note` now comes through here, because after MF8 the
+    # operator's account cannot write the registry itself, and dropping the note would lose it silently.
+    saved = _capture(idea, project, note)
     # FILED TO A PROJECT TOO, when one is named. The idea log is cross-project on purpose — that is
     # what makes the linking below able to spot an overlap between the whitepaper and Viatica — but
     # a shipped product also needs its own shortlist of what might come next, and until now there

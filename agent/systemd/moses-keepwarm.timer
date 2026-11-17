@@ -1,0 +1,13 @@
+[Unit]
+Description=Use the operator's Claude login once a day so it does not lapse
+
+[Timer]
+# 05:45, before the morning jobs that need this login and the 07:30 sweep that checks it.
+# Persistent=true is safe on a calendar timer (the trap is monotonic ones), and a missed day runs
+# at the next boot.
+OnCalendar=*-*-* 05:45:00 America/Chicago
+Persistent=true
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -31,11 +31,13 @@ _sys.path.insert(0, str(_pl.Path(__file__).resolve().parent / "lib"))
 import moses_env as _env  # noqa: E402 — whose home, where Moses lives, the operator's settings
 import persona as _persona  # noqa: E402 — persona display names come from the roster, by id
 import datetime as _dt
+import hashlib
 import json
 import os
 import pwd
 import re
 import subprocess
+import time
 import sys
 from pathlib import Path
 
@@ -667,12 +669,28 @@ def check_tracked_units() -> None:
         pairs.append((f, user_unit_dir() / f.name))
     for f in tracked_dir.glob("*.timer"):
         pairs.append((f, user_unit_dir() / f.name))
+    for f in tracked_dir.glob("*.path"):                 # moses-pull.path: what takes a push live
+        pairs.append((f, user_unit_dir() / f.name))
     for f in (tracked_dir / "system").glob("*"):
         if f.suffix in (".service", ".timer"):
             pairs.append((f, Path("/etc/systemd/system") / f.name))
 
+    # MF8 (2026-11-06): some units run as the agent account, whose home this account cannot read. That
+    # account says what it has in units.json (moses-pull writes it every run). Without this, every unit
+    # that moved read as "not installed" or as the operator's switched-off leftover, eleven lines a
+    # morning from 2026-11-06 until 2026-11-13, and real drift in the agent's copies was invisible.
+    agent = agent_units()
     bad = 0
     for tracked, installed in pairs:
+        if agent and installed.parent == user_unit_dir() and tracked.name in agent[1]:
+            who, theirs = agent
+            if hashlib.sha256(tracked.read_bytes()).hexdigest() != theirs[tracked.name]:
+                drift("a tracked unit no longer matches what runs",
+                      f"{tracked.name} — {who}'s copy differs from the repo (as {who}'s own units.json says)")
+                bad += 1
+            # The operator's own copy is checked too, unless the move switched it off on purpose.
+            if not installed.exists() or moved_off(installed):
+                continue
         if not installed.exists():
             drift("a tracked unit is not installed",
                   f"{tracked.name} — the repo describes a unit systemd does not have")
@@ -700,8 +718,50 @@ def check_tracked_units() -> None:
                 drift("a running unit is recorded nowhere",
                       f"{f.name} ({scope}) has no copy in {tracked_dir}")
                 bad += 1
+    if agent:
+        for name in sorted(agent[1]):
+            if name.startswith("moses") and ("user", name) not in have:
+                drift("a running unit is recorded nowhere",
+                      f"{name} ({agent[0]}'s) has no copy in {tracked_dir}")
+                bad += 1
     if not bad:
-        agreed(f"{len(pairs)} systemd units match their tracked copies")
+        whose = f", {len([t for t, _ in pairs if t.name in agent[1]])} of them as {agent[0]} runs them" if agent else ""
+        agreed(f"{len(pairs)} systemd units match their tracked copies{whose}")
+
+
+UNITS_STALE = 2 * 3600  # moses-pull writes units.json every run, at least every 15 minutes
+
+
+def moved_off(installed: Path) -> bool:
+    """Did the MF8 move switch this copy of the operator's off (mf8-moved.conf on it or on its timer)?"""
+    d = installed.parent
+    return any((d / f"{n}.d" / "mf8-moved.conf").exists()
+               for n in (installed.name, installed.with_suffix(".timer").name))
+
+
+def agent_units(now: float | None = None):
+    """(account, {unit file: sha256}) from the agent account's own units.json, or None.
+
+    None, said as blind, when there is no agent account or its report is missing or old: then the
+    units it runs were not looked at, and the check falls back to this account's folder alone.
+    """
+    if _env.PEER_STATE is None:
+        return None
+    raw = _env.read_peer("units.json")
+    if raw is None:
+        blind("the units the agent account runs", "it has written no units.json (moses-pull writes it)")
+        return None
+    try:
+        doc = json.loads(raw)
+        age = (now or time.time()) - float(doc["written"])
+        units = {str(k): str(v) for k, v in dict(doc["units"]).items()}
+    except (ValueError, KeyError, TypeError):
+        blind("the units the agent account runs", "units.json is not a report this understands")
+        return None
+    if age > UNITS_STALE:
+        blind("the units the agent account runs", f"units.json is {int(age // 3600)}h old: moses-pull is not running")
+        return None
+    return doc.get("account") or "the agent", units
 
 
 # ── 10. The activity cross-check must not be silently blind ────────────────────
@@ -1014,6 +1074,80 @@ def check_root_dirs() -> None:
     agreed(f"{len(execs) + len(only)} root folders are root's alone")
 
 
+SEALED_STALE = 2 * 3600  # moses-creds-check.timer rewrites it hourly
+
+
+def check_sealed_tokens(now: float | None = None) -> None:
+    """The agent account's token files are sealed to the TPM (agent/moses-seal), and none is plaintext.
+
+    Read from the agent's sealed.json, never from its config folder (this account cannot see it). Red
+    when a sealed token's old path holds a plain file again, a link is broken, or a plaintext token file
+    sits beside sealed ones; blind when there is no report or it is old, since then nothing was looked at.
+    """
+    # The agent's own report, never a copy of the operator's: one brad wrote by running moses-seal as
+    # himself would otherwise hide moses's for good (review 2026-11-06). Same rule as the liveness check.
+    raw = _env.read_peer("sealed.json") if _env.PEER_STATE is not None else _env.read_state("sealed.json")
+    if raw is None:
+        return blind("sealed tokens", "the agent has written no sealed.json: sealing is not in use yet "
+                     "(agent/moses-seal plan, run as the agent account, shows what it would seal)")
+    try:
+        doc = json.loads(raw)
+        age = (now or time.time()) - float(doc["written"])
+        seal, plain = dict(doc["sealed"]), dict(doc["plaintext"])
+    except (ValueError, KeyError, TypeError):
+        return blind("sealed tokens", "sealed.json is not a report this understands")
+    if age > SEALED_STALE:
+        return blind("sealed tokens", f"sealed.json is {int(age // 3600)}h old: moses-creds-check.timer is not running")
+    who = doc.get("account", "the agent")
+    broken = {n: s for n, s in seal.items() if s != "ok"}
+    if broken:
+        return drift(f"a sealed token file of {who}'s is not working as sealed",
+                     "; ".join(f"{n}: {s}" for n, s in sorted(broken.items())))
+    if plain and seal:
+        return drift(f"{who} has plaintext token files beside the sealed ones",
+                     ", ".join(f"{n} ({', '.join(k)})" for n, k in sorted(plain.items()))
+                     + " — seal them with agent/moses-seal seal NAME, as the agent account")
+    if plain:
+        return blind("sealed tokens", f"none of {who}'s token files is sealed yet: {', '.join(sorted(plain))}")
+    if not seal:
+        return blind("sealed tokens", f"{who}'s report lists no token file at all, sealed or plain: "
+                     "the wrong folder, or nothing to look at")
+    # What was looked at, and who looked: the agent writes this report about itself.
+    agreed(f"{len(seal)} token .env files of {who}'s are sealed to the TPM and none is plaintext "
+           f"(as {who}'s own hourly report says)")
+
+
+
+def check_operator_login(now: float | None = None) -> None:
+    """The operator's own Claude login on this machine is still signed in.
+
+    WHY (2026-11-13): after MF8 the agent has its own login, kept fresh by the liveness probe, and the
+    operator's is used only by the operator's own weekly jobs. It was signed out on 2026-11-09 and the
+    only sign was a weekly job's line, four days later, that did not say what to do. This runs as the
+    operator (the standup runs it that way) and reads only whether a login is there and when it lapses.
+    """
+    path = Path(os.environ.get("CLAUDE_CONFIG_DIR") or _env.HOME / ".claude") / ".credentials.json"
+    who = pwd.getpwuid(os.getuid()).pw_name
+    try:
+        o = json.loads(path.read_text()).get("claudeAiOauth") or {}
+    except FileNotFoundError:
+        return  # this account never signed in: nothing of its own runs the model
+    except (OSError, ValueError, AttributeError) as e:
+        return blind("the operator's Claude login", f"{path} unreadable: {type(e).__name__}")
+    now = now or time.time()
+    lapses = float(o.get("refreshTokenExpiresAt") or 0) / 1000
+    fix = f"Fix: run `claude auth login` as {who} on this machine."
+    if not o.get("refreshToken") or lapses <= now:
+        since = _dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        return drift(f"{who}'s own Claude login on this machine is signed out",
+                     f"since about {since}; anything that starts the model as {who} fails until it is signed in again. {fix}")
+    if lapses - now < 3 * 86400:
+        return drift(f"{who}'s own Claude login on this machine lapses soon",
+                     f"on {_dt.datetime.fromtimestamp(lapses):%Y-%m-%d %H:%M} unless it is used before then. {fix}")
+    agreed(f"{who}'s own Claude login on this machine is signed in until at least "
+           f"{_dt.datetime.fromtimestamp(lapses):%Y-%m-%d}")
+
+
 CHECKS = {
     "answers": check_moses_answers,
     "units": check_duplicate_units,
@@ -1033,6 +1167,8 @@ CHECKS = {
     "self-contradiction": check_milestone_says_shipped,
     "framework": check_framework_in_step,
     "root-dirs": check_root_dirs,
+    "sealed": check_sealed_tokens,
+    "operator-login": check_operator_login,
 }
 
 

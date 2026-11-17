@@ -423,5 +423,82 @@ finally:
     drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
 print("  live:", drift._listener_owners())
 
+# ── MF8: a unit the agent account runs is checked against ITS copy (2026-11-13) ──────────────────────
+# After the move, eleven units read daily as "not installed" or as the operator's switched-off leftover,
+# because this check only saw the operator's folder. The agent now reports its own units in units.json.
+import hashlib as _h, json as _j, shutil as _sh, tempfile as _tf, time as _t  # noqa: E401,E402
+
+def _units_world(agent_units, op_units, moved=(), report="fresh"):
+    w = Path(_tf.mkdtemp(prefix="drift-units-"))
+    src, op, peer = w / "agent", w / "op", w / "peer"
+    (src / "systemd" / "system").mkdir(parents=True); op.mkdir(); peer.mkdir()
+    for n, body in TRACKED.items():
+        (src / "systemd" / n).write_text(body)
+    for n, body in op_units.items():
+        (op / n).write_text(body)
+    for n in moved:
+        (op / f"{n}.d").mkdir(); (op / f"{n}.d" / "mf8-moved.conf").write_text("[Unit]\n")
+    if report != "none":
+        doc = {"written": _t.time() - (3 * 3600 if report == "old" else 0), "account": "moses",
+               "units": {n: _h.sha256(b.encode()).hexdigest() for n, b in agent_units.items()}}
+        (peer / "units.json").write_text(_j.dumps(doc))
+    saved = (drift.SRC, drift.user_unit_dir, drift._env.PEER_STATE)
+    drift.SRC, drift.user_unit_dir, drift._env.PEER_STATE = src, (lambda: op), peer
+    drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+    try:
+        drift.check_tracked_units()
+    finally:
+        drift.SRC, drift.user_unit_dir, drift._env.PEER_STATE = saved
+        _sh.rmtree(w, ignore_errors=True)
+    # The real /etc/systemd/system is still read; only this world's user units are the point here.
+    return [d for _, d in drift.DRIFT if "(system)" not in d], [w for w, _ in drift.BLIND]
+
+TRACKED = {"moses-pull.path": "path\n", "moses-pull.service": "pull\n", "moses-deadman.service": "%U\n", "moses-deadman.timer": "t\n",
+           "moses-drift.service": "%U drift\n"}
+print("units the agent account runs are checked against its own copy")
+d, b = _units_world(TRACKED, {"moses-drift.service": "%U drift\n", "moses-deadman.service": "1000\n",
+                              "moses-deadman.timer": "t\n"}, moved=("moses-deadman.timer",))
+check("a unit only the agent has is not 'not installed', and a switched-off leftover is not drift",
+      not d and not b, f"drift={d} blind={b}")
+d, _ = _units_world({**TRACKED, "moses-pull.service": "pull, edited by hand\n"}, {"moses-drift.service": "%U drift\n"})
+check("the agent's copy differing from the repo is drift, and names whose copy",
+      any("moses-pull.service" in x and "moses's copy" in x for x in d), str(d))
+d, _ = _units_world(TRACKED, {"moses-drift.service": "1000 drift\n"})
+check("a unit both accounts have: the operator's live copy is still checked", any("moses-drift.service" in x for x in d), str(d))
+d, _ = _units_world({**TRACKED, "moses-secret.timer": "x\n"}, {})
+check("a unit the agent runs that the repo does not track is said", any("moses-secret.timer" in x for x in d), str(d))
+d, b = _units_world(TRACKED, {}, report="none")
+check("no report: said as blind, and the units are reported as before", b and any("moses-pull.service" in x for x in d), f"{d} {b}")
+d, b = _units_world(TRACKED, {}, report="old")
+check("an old report is not trusted", b and any("moses-pull.service" in x for x in d), f"{d} {b}")
+
+# ── The operator's own Claude login (2026-11-13) ─────────────────────────────────────────────────────
+# It was signed out from 2026-11-09 and the only sign was a weekly job's raw error four days later.
+print("the operator's own Claude login")
+def _login(doc):
+    w = Path(_tf.mkdtemp(prefix="drift-login-"))
+    if doc is not None:
+        (w / ".credentials.json").write_text(_j.dumps({"claudeAiOauth": doc}))
+    saved = os.environ.get("CLAUDE_CONFIG_DIR"); os.environ["CLAUDE_CONFIG_DIR"] = str(w)
+    drift.DRIFT.clear(); drift.BLIND.clear(); drift.AGREED.clear()
+    try:
+        drift.check_operator_login()
+    finally:
+        os.environ.pop("CLAUDE_CONFIG_DIR") if saved is None else os.environ.__setitem__("CLAUDE_CONFIG_DIR", saved)
+        _sh.rmtree(w, ignore_errors=True)
+    return [x for x, _ in drift.DRIFT], [d for _, d in drift.DRIFT], list(drift.AGREED)
+ms = lambda days: int((_t.time() + days * 86400) * 1000)
+what, detail, ok = _login({"accessToken": "", "refreshToken": "", "expiresAt": 0, "refreshTokenExpiresAt": ms(19)})
+check("emptied tokens (what the CLI leaves after a failed refresh) read as signed out, with the fix",
+      any("signed out" in x for x in what) and any("claude auth login" in d for d in detail), f"{what} {detail}")
+what, _, _ = _login({"refreshToken": "r" * 20, "refreshTokenExpiresAt": ms(-1)})
+check("a lapsed refresh token reads as signed out", any("signed out" in x for x in what), str(what))
+what, _, _ = _login({"refreshToken": "r" * 20, "refreshTokenExpiresAt": ms(1)})
+check("one that lapses within three days is said early", any("lapses soon" in x for x in what), str(what))
+what, _, ok = _login({"refreshToken": "r" * 20, "refreshTokenExpiresAt": ms(20)})
+check("a good login is agreed, not drift", not what and ok, f"{what} {ok}")
+what, _, ok = _login(None)
+check("an account that never signed in is left alone", not what and not ok, f"{what} {ok}")
+
 print(f"\n  {len(fails)} failed" if fails else "\n  all good")
 sys.exit(1 if fails else 0)

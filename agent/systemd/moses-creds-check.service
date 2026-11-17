@@ -1,0 +1,6 @@
+[Unit]
+Description=Moses — report the sealed token files (sealed.json, for the drift check)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/Projects/moses/agent/moses-seal status

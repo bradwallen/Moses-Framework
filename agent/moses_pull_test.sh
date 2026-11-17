@@ -27,7 +27,7 @@ EOF
 pull() {   # pull [script]: run moses-pull against the world
     PATH="$W/bin:$PATH" MOSES_PULL_TREE="$W/live" MOSES_STATE="$W/state" MOSES_ALARM_CHANNEL= \
         MOSES_PULL_SETTLE=0 MOSES_CONFIG_DIR="$W/none" GIT_AUTHOR_NAME=m GIT_AUTHOR_EMAIL=m@x \
-        GIT_COMMITTER_NAME=m GIT_COMMITTER_EMAIL=m@x bash "${1:-$HERE/moses-pull}" >/dev/null 2>&1
+        GIT_COMMITTER_NAME=m GIT_COMMITTER_EMAIL=m@x bash "${1:-$HERE/moses-pull}" >/dev/null 2>>"$W/said"
 }
 brad_commits() {   # brad_commits <file> [content]
     printf '%s\n' "${2:-x}" > "$W/brad/$1"
@@ -40,6 +40,46 @@ run_cases() {   # run_cases <script>: prints PASS/FAIL per case
     setup; brad_commits a.txt; pull "$S"
     [ -f "$W/live/a.txt" ] && grep -q restart "$W/restarts" 2>/dev/null; t "brad's new commit goes live and the units restart" $?
     rm -rf "$W"
+
+    # units.json: what this account runs, for the operator's drift check (it cannot read this home).
+    setup; mkdir -p "$HOME/.config/systemd/user"; printf 'x\n' > "$HOME/.config/systemd/user/moses-x.timer"
+    pull "$S"   # nothing new from brad: it must still be written
+    python3 -c 'import hashlib,json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["units"]=={"moses-x.timer":hashlib.sha256(b"x\n").hexdigest()} else 1)' "$W/state/units.json" 2>/dev/null
+    t "every run reports this account's units by content, even with nothing to take" $?
+    rm -rf "$W"
+
+    # pyenvs.json: the packages installed in this account's venvs, for the operator's vulnerability check.
+    setup; V="$HOME/moses-venv"; mkdir -p "$V/lib/python3.14/site-packages/Star_lette-1.0.0.dist-info"; : > "$V/pyvenv.cfg"
+    printf 'Name: Star_lette\nVersion: 1.0.0\n\nName: not-this\n' > "$V/lib/python3.14/site-packages/Star_lette-1.0.0.dist-info/METADATA"
+    pull "$S"
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["venvs"].get(sys.argv[2])=={"star-lette":"1.0.0"} else 1)' "$W/state/pyenvs.json" "$V" 2>/dev/null
+    t "every run reports the packages installed in this account's venvs" $?
+    rm -rf "$W"
+
+    # Pinned packages: a changed list is installed as this account BEFORE the restart; a failure restarts nothing.
+    lockworld() {   # a venv whose python records each call, and fails while $W/PIPFAIL exists
+        mkdir -p "$W/venv/bin"; printf '#!/bin/sh\n[ -e "%s/PIPFAIL" ] && { echo "ERROR: no matching distribution" >&2; exit 1; }\necho "$*" >> "%s/pip"\necho pip >> "%s/restarts"\n' "$W" "$W" "$W" > "$W/venv/bin/python"
+        chmod +x "$W/venv/bin/python"; export MOSES_PULL_LOCKS="mcp/requirements.lock:$W/venv"
+    }
+    setup; lockworld; brad_commits mcp_lock_dir_placeholder; pull "$S"   # the first pull: no list yet
+    mkdir -p "$W/brad/mcp"; brad_commits mcp/requirements.lock "pillow==13.0.0"; : > "$W/restarts"; pull "$S"
+    grep -q -- "-m pip install" "$W/pip" 2>/dev/null && [ "$(head -1 "$W/restarts")" = pip ] && [ -f "$W/live/mcp/requirements.lock" ]
+    t "a changed package list is installed as this account, before anything restarts" $?
+    n=$(wc -l < "$W/pip"); brad_commits other.txt; pull "$S"
+    [ "$(wc -l < "$W/pip")" = "$n" ]; t "an unchanged package list is not installed again" $?
+    unset MOSES_PULL_LOCKS; rm -rf "$W"
+
+    # The bootstrap: a list that went live under an older moses-pull is installed on the next pull.
+    setup; lockworld; MOSES_PULL_LOCKS="none:$W/nowhere"; mkdir -p "$W/brad/mcp"; brad_commits mcp/requirements.lock "pillow==13.0.0"; pull "$S"
+    export MOSES_PULL_LOCKS="mcp/requirements.lock:$W/venv"; brad_commits other.txt; pull "$S"
+    grep -q -- "-m pip install" "$W/pip" 2>/dev/null; t "a list that went live without being installed is installed on the next pull" $?
+    unset MOSES_PULL_LOCKS; rm -rf "$W"
+
+    setup; lockworld; brad_commits a.txt; pull "$S"; : > "$W/restarts"; : > "$W/PIPFAIL"
+    mkdir -p "$W/brad/mcp"; brad_commits mcp/requirements.lock "pillow==99"; pull "$S"
+    [ ! -f "$W/live/mcp/requirements.lock" ] && ! grep -q restart "$W/restarts" && grep -q "pinned packages" "$W/state/pull.json"
+    t "a failed install puts the tree back, restarts nothing, and says so" $?
+    unset MOSES_PULL_LOCKS; rm -rf "$W"
 
     setup; brad_commits shared.txt brad; echo knight > "$W/live/shared.txt"
     git -C "$W/live" add shared.txt && git -C "$W/live" -c user.email=m@x -c user.name=m commit -q -m knight
@@ -74,8 +114,18 @@ run_cases() {   # run_cases <script>: prints PASS/FAIL per case
     [ ! -f "$W/live/e.txt" ]; t "while Knight runs, nothing restarts" $?
     rm -rf "$W"
 
-    setup; brad_commits BREAK; pull "$S"; echo dirty > "$W/live/scratch"; pull "$S"; rm "$W/live/scratch"; : > "$W/restarts"; pull "$S"
+    # The unrelated stop is a failed fetch: a dirty tree no longer stops anything once the commit is rejected.
+    setup; brad_commits BREAK; pull "$S"; git -C "$W/live" remote set-url origin "$W/gone.git"; pull "$S"
+    git -C "$W/live" remote set-url origin "$W/hub.git"; : > "$W/restarts"; pull "$S"
     [ ! -s "$W/restarts" ]; t "a rejected commit stays rejected across an unrelated stop" $?
+    rm -rf "$W"
+
+    setup; echo dirty > "$W/live/scratch"; pull "$S"; pull "$S"
+    ! grep -q ":warning:" "$W/said" 2>/dev/null; t "a dirty tree with nothing new to take says nothing" $?
+    rm -rf "$W"
+
+    setup; brad_commits f.txt; echo dirty > "$W/live/scratch"; pull "$S"; pull "$S"; pull "$S"
+    [ "$(grep -c ":warning:" "$W/said")" = 1 ] && grep -q "scratch" "$W/said"; t "the same stop is said once, and names the dirty files" $?
     rm -rf "$W"
 
     setup; brad_commits c.txt; exec 7>"$W/live/.git/live-tree.lock"; flock -n 7; pull "$S"; rc=$?; exec 7>&-
@@ -98,11 +148,19 @@ PY
 }
 mutate "no merge --abort on conflict" 'git merge --abort >/dev/null 2>&1' 'true' "a conflict with Knight's land leaves the live tree exactly as it was"
 mutate "no rollback after a failed restart" 'git reset -q --hard "$before"' 'true' "a change that takes a unit down is rolled back to the commit that was running"
-mutate "no dirty-tree check" '[ -z "$(git status --porcelain)" ] || stop' 'true || stop' "a dirty live tree is left alone"
+mutate "no dirty-tree check" '[ -z "$dirty" ] || stop' 'true || stop' "a dirty live tree is left alone"
 mutate "rejected commit retried" '[ "$rejected" = "$target" ] &&' '[ "$rejected" = "never" ] &&' "a commit that was rolled back is not retried until Brad pushes again"
 mutate "restarts mid-job" 'if busy >/dev/null; then' 'if false; then' "while a Claude session runs (named after its version), nothing restarts"
 mutate "Claude found by name only" 'exe.startswith(claude_dir) or ' '' "while a Claude session runs (named after its version), nothing restarts"
 mutate "rejected forgotten on any stop" 'if not rejected and status != "ok":' 'if False:' "a rejected commit stays rejected across an unrelated stop"
+mutate "dirty check before the up-to-date check" 'git fetch -q origin || stop' '[ -z "$(git status --porcelain)" ] || stop "dirty"; git fetch -q origin || stop' "a dirty tree with nothing new to take says nothing"
+mutate "same stop said every run" 'if [ "$said" = "stopped|$1" ]; then' 'if false; then' "the same stop is said once, and names the dirty files"
+mutate "packages never installed" 'if ! installed=$(install_locks "$after"); then' 'if false; then' "a changed package list is installed as this account, before anything restarts"
+mutate "only a list changed in this pull" '[ "$want" = "$(cat "$venv/.moses-lock" 2>/dev/null)" ] && continue' 'git diff --quiet "$before" "$rev" -- "$lock" 2>/dev/null && continue' "a list that went live without being installed is installed on the next pull"
+mutate "installed every time" '[ "$want" = "$(cat "$venv/.moses-lock" 2>/dev/null)" ] && continue' 'true' "an unchanged package list is not installed again"
+mutate "a failed install ignored" 'if ! installed=$(install_locks "$after"); then' 'if ! installed=$(install_locks "$after"; true); then' "a failed install puts the tree back, restarts nothing, and says so"
+mutate "no venv report" '"$STATE/pyenvs.json"' '"/dev/null"' "every run reports the packages installed in this account's venvs"
+mutate "no units report" '"$STATE/units.json"' '"/dev/null"' "every run reports this account's units by content, even with nothing to take"
 mutate "no lock" 'flock -n 9 ||' 'true ||' "while knight-land holds the tree, nothing is merged"
 
 echo "$good_pass passed, $good_fail failed"

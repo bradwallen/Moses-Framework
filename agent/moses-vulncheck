@@ -27,6 +27,12 @@ WHAT IT CHECKS, and where each answer comes from — never from memory:
   3. THE OPERATING SYSTEM: apt's pending updates from the security pocket, and pending updates of the
      software that faces the internet here (the Cloudflare tunnel, Tailscale, SSH), whatever pocket.
   4. CODE-SERVER: whether a newer release exists than the one installed.
+  5. PYTHON PACKAGES (2026-11-16): every virtualenv a running Python process was started from, and the
+     project venvs, read from what is INSTALLED (each package's METADATA), never a requirements line,
+     and looked up in OSV (osv.dev, which carries the GitHub and PyPI advisories). The agent account's
+     venvs, which this account cannot read, come from its own pyenvs.json (moses-pull writes it).
+     WHY: Atlas raised a Starlette bug on CISA's exploited list that every Python MCP server inherits.
+     Reserve was patched, but only by luck: nothing here looked at Python at all.
 
 A check that could not run is SAID, by name, never read as "nothing found" — commandment 3. The report is
 posted every week, all clear included, so a week with no post is itself a signal.
@@ -53,6 +59,9 @@ UA = "moses-vulncheck/1 (+operator's own machine)"   # Cloudflare refuses Python
 NODE_INDEX = "https://nodejs.org/dist/index.json"
 NODE_SCHEDULE = "https://raw.githubusercontent.com/nodejs/Release/main/schedule.json"
 CODE_SERVER_LATEST = "https://api.github.com/repos/coder/code-server/releases/latest"
+OSV_BATCH = "https://api.osv.dev/v1/querybatch"
+OSV_VULN = "https://api.osv.dev/v1/vulns/"
+VENV_REPORT_STALE = 2 * 3600   # moses-pull rewrites pyenvs.json at least every 15 minutes
 PROJECTS = Path(_env.setting("MOSES_PROJECTS_DIR") or _env.ROOT.parent)
 CHANNEL = _env.setting("MOSES_VULNCHECK_CHANNEL") or _env.setting("MOSES_LIVENESS_CHANNEL")
 STATE = _env.STATE / "vulncheck.json"
@@ -142,6 +151,74 @@ def code_server_verdict(installed: str, latest_tag: str) -> dict:
     return {"state": "ok", "why": f"{'.'.join(map(str, inst))} is the latest"}
 
 
+_SEV = {"CRITICAL": 4, "HIGH": 3, "MODERATE": 2, "MEDIUM": 2, "LOW": 1}
+
+
+def _pv(s: str) -> tuple:
+    """A version as numbers, enough to order the fixed versions OSV names (1.10.0 > 1.9.2)."""
+    return tuple(int(x) for x in re.findall(r"\d+", s.split("+")[0])[:4])
+
+
+def _norm(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def read_metadata(text: str) -> tuple[str, str]:
+    """(name, version) from a dist-info METADATA file's header."""
+    name = ver = ""
+    for line in text.splitlines():
+        if not line.strip():
+            break
+        if line.startswith("Name:"):
+            name = line[5:].strip()
+        elif line.startswith("Version:"):
+            ver = line[8:].strip()
+    return name, ver
+
+
+def summarize_osv(pkg: str, version: str, vulns: list[dict]) -> list[dict]:
+    """OSV records for one installed package → one finding per advisory (aliases folded together),
+    worst first, each with its severity and the first version that fixes it."""
+    seen: set[str] = set()
+    out = []
+    for v in vulns:
+        names = {v.get("id", "")} | set(v.get("aliases") or [])
+        if names & seen:
+            continue
+        seen |= names
+        fixed = [e["fixed"] for a in v.get("affected") or []
+                 if _norm((a.get("package") or {}).get("name", "")) == _norm(pkg)
+                 for rg in a.get("ranges") or [] for e in rg.get("events") or [] if "fixed" in e]
+        later = sorted((f for f in fixed if _pv(f) > _pv(version)), key=_pv)
+        sev = str((v.get("database_specific") or {}).get("severity") or "unknown").upper()
+        cve = next((a for a in sorted(names) if a.startswith("CVE-")), v.get("id", ""))
+        out.append({"id": cve, "severity": sev, "fix": later[0] if later else "none yet",
+                    "summary": (v.get("summary") or "")[:90]})
+    out.sort(key=lambda f: -_SEV.get(f["severity"], 3))   # unknown ranks with high: not known to be mild
+    return out
+
+
+def python_groups(findings: list[dict]) -> list[dict]:
+    """A venv's findings by package, worst first: the version that fixes them all, and a severity tally."""
+    by: dict[tuple[str, str], list[dict]] = {}
+    for f in findings:
+        by.setdefault((f["pkg"], f["version"]), []).append(f)
+    out = []
+    for (pkg, ver), fs in by.items():
+        fixes = [f["fix"] for f in fs if f["fix"] != "none yet"]
+        fix = max(fixes, key=_pv) if fixes else "no fix yet"
+        if fixes and len(fixes) < len(fs):
+            fix += " (some have no fix yet)"
+        counts: dict[str, int] = {}
+        for f in fs:
+            counts[f["severity"].lower()] = counts.get(f["severity"].lower(), 0) + 1
+        tally = ", ".join(f"{k} {counts[k]}" for k in sorted(counts, key=lambda k: -_SEV.get(k.upper(), 3)))
+        out.append({"pkg": pkg, "version": ver, "fix": fix, "tally": tally,
+                    "rank": max(_SEV.get(f["severity"], 3) for f in fs)})
+    out.sort(key=lambda g: (-g["rank"], g["pkg"]))
+    return out
+
+
 def render(r: dict) -> str:
     """The Slack post. Findings first, each with what fixes it; could-not-check said by name."""
     lines, n = [], 0
@@ -171,6 +248,18 @@ def render(r: dict) -> str:
         n += 1
         lines.append("🟠 *Internet-facing software has updates*: "
                      + ", ".join(f"{u['pkg']} {u['old']} → {u['new']}" for u in facing))
+    for env in r.get("python", []):
+        groups = python_groups(env["findings"])
+        if not groups:
+            continue
+        what = "; ".join(f"{g['pkg']} {g['version']} → {g['fix']} ({g['tally']})" for g in groups[:5])
+        more = f" and {len(groups) - 5} more package(s)" if len(groups) > 5 else ""
+        if env["running"]:
+            n += 1
+            icon = "🔴" if groups[0]["rank"] >= 3 else "🟠"
+            lines.append(f"{icon} *Python: {env['label']}* runs known vulnerabilities in {len(groups)} package(s): {what}{more}")
+        else:
+            lines.append(f"🟡 *Python: {env['label']}* (not running) has known vulnerabilities in {len(groups)} package(s): {what}{more}")
     cs = r.get("code_server")
     if cs and cs["state"] == "behind":
         lines.append(f"🟡 *code-server* is behind: {cs['why']} (it bundles its own Node)")
@@ -190,6 +279,9 @@ def render(r: dict) -> str:
         fine.append("system updates")
     if cs and cs["state"] == "ok":
         fine.append("code-server")
+    py_ok = [e for e in r.get("python", []) if not e["findings"]]
+    if py_ok:
+        fine.append(f"Python packages in {len(py_ok)} venv(s), {sum(e['running'] for e in py_ok)} of them running")
     body = "\n".join(lines) if lines else "Nothing known and unpatched."
     ok_line = f"\n✅ Checked and fine: {'; '.join(fine)}." if fine else ""
     tail = ("\n⚠️ *Could not check* (not the same as clear): " + "; ".join(blind)) if blind else ""
@@ -273,6 +365,141 @@ def audit(project: Path, omit_dev: bool) -> tuple[dict | None, str]:
         return None, f"npm audit gave no report (exit {rc})"
 
 
+def running_venvs() -> dict[str, dict]:
+    """{venv: {"who", "runs"}} for every Python process on this machine started from a virtualenv.
+
+    Read from /proc/<pid>/cmdline, which every account can read: a venv's python is a link to the
+    system one, so the venv shows in argv[0], not in the executable."""
+    out: dict[str, dict] = {}
+    import pwd                                      # noqa: PLC0415
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            argv = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            uid = os.stat(f"/proc/{pid}").st_uid
+        except OSError:
+            continue
+        a0 = argv[0].decode(errors="replace")
+        if not re.search(r"/bin/python[\d.]*$", a0):
+            continue
+        venv = str(Path(a0).parent.parent)
+        if venv in ("/usr", "/usr/local", "/"):
+            continue
+        try:
+            who = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            who = str(uid)
+        script = next((Path(x.decode(errors="replace")).name for x in argv[1:]
+                       if x and not x.startswith(b"-")), "")
+        e = out.setdefault(venv, {"who": who, "runs": []})
+        if script and script not in e["runs"]:
+            e["runs"].append(script)
+    return out
+
+
+def project_venvs() -> list[str]:
+    try:
+        dirs = [d for d in PROJECTS.iterdir() if (d / ".git").is_dir()]
+    except OSError:
+        return []
+    return sorted(str(d / sub) for d in dirs for sub in (".venv", "venv", "mcp/venv")
+                  if (d / sub / "pyvenv.cfg").is_file())
+
+
+def venv_packages(venv: str) -> dict[str, str] | None:
+    """{name: version} as installed, or None when this account cannot read the venv."""
+    root = Path(venv)
+    try:
+        if not os.access(root, os.R_OK | os.X_OK) or not (root / "pyvenv.cfg").is_file():
+            return None
+        metas = list(root.glob("lib/python*/site-packages/*.dist-info/METADATA"))
+    except OSError:
+        return None
+    out = {}
+    for m in metas:
+        try:
+            name, ver = read_metadata(m.read_text(errors="replace"))
+        except OSError:
+            continue
+        if name and ver:
+            out[_norm(name)] = ver
+    return out
+
+
+def peer_venvs(now: float) -> tuple[dict, str]:
+    """The agent account's own report of its venvs, and its name, or ({}, why not)."""
+    raw = _env.read_peer("pyenvs.json")
+    if raw is None:
+        return {}, ""
+    try:
+        doc = json.loads(raw)
+        if now - float(doc["written"]) > VENV_REPORT_STALE:
+            return {}, f"{doc.get('account', 'the agent')}'s pyenvs.json is old (moses-pull is not running)"
+        return {k: dict(v) for k, v in dict(doc["venvs"]).items()}, ""
+    except (ValueError, KeyError, TypeError):
+        return {}, "pyenvs.json is not a report this understands"
+
+
+def osv_lookup(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], list[dict]]:
+    """{(name, version): [full OSV records]} for the pairs that have any. Raises when OSV fails."""
+    pairs = sorted(set(pairs))
+    hits: dict[tuple[str, str], list[str]] = {}
+    for i in range(0, len(pairs), 500):
+        chunk = pairs[i:i + 500]
+        body = json.dumps({"queries": [{"package": {"name": n, "ecosystem": "PyPI"}, "version": ver}
+                                       for n, ver in chunk]}).encode()
+        req = urllib.request.Request(OSV_BATCH, data=body, headers={"User-Agent": UA, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            results = json.load(resp)["results"]
+        for n, res in zip(chunk, results):
+            ids = [v["id"] for v in res.get("vulns") or []]
+            if ids:
+                hits[n] = ids
+    cache: dict[str, dict] = {}
+    for ids in hits.values():
+        for i in ids:
+            if i not in cache:
+                cache[i] = _get_json(OSV_VULN + i)
+    return {n: [cache[i] for i in ids] for n, ids in hits.items()}
+
+
+def collect_python(now: float) -> tuple[list[dict], list[str]]:
+    blind: list[str] = []
+    running = running_venvs()
+    venvs = list(running) + [v for v in project_venvs() if v not in running]
+    peer, why = peer_venvs(now)
+    if why:
+        blind.append(f"the agent account's venvs ({why})")
+    envs, wanted = [], set()
+    for v in venvs:
+        info = running.get(v, {"who": "", "runs": []})
+        pkgs = venv_packages(v)
+        if pkgs is None:
+            pkgs = peer.get(v)
+            if pkgs is None:
+                blind.append(f"Python packages in {v} ({info['who'] or 'another account'}'s; this account "
+                             "cannot read it and it is not in the agent's pyenvs.json)")
+                continue
+        what = ", ".join(info["runs"]) or v.replace(str(_env.HOME) + "/", "~/")
+        label = f"{what} ({info['who']})" if info["who"] else what
+        envs.append({"venv": v, "label": label, "running": v in running, "pkgs": pkgs, "findings": []})
+        wanted |= set(pkgs.items())
+    if not envs:
+        return [], blind
+    try:
+        found = osv_lookup(list(wanted))                # one query per distinct (name, version)
+    except Exception as e:  # noqa: BLE001
+        blind.append(f"Python advisories (osv.dev did not answer: {type(e).__name__})")
+        return [], blind
+    for e in envs:
+        for n, ver in sorted(e.pop("pkgs").items()):
+            for f in summarize_osv(n, ver, found.get((n, ver), [])):
+                e["findings"].append({"pkg": n, "version": ver, **f})
+        e["findings"].sort(key=lambda f: -_SEV.get(f["severity"], 3))
+    return envs, blind
+
+
 def collect(today: dt.date) -> dict:
     r: dict = {"checked_at": dt.datetime.now().isoformat(timespec="seconds"), "host": os.uname().nodename,
                "runtimes": [], "projects": [], "apt_security": [], "apt_facing": [], "code_server": None,
@@ -322,6 +549,10 @@ def collect(today: dt.date) -> dict:
             blind.append(f"code-server releases (GitHub did not answer: {type(e).__name__})")
         if tag:
             r["code_server"] = code_server_verdict(out.split()[0] if out.strip() else "", tag)
+
+    # 5. Python packages, as installed in each venv.
+    r["python"], why = collect_python(dt.datetime.now().timestamp())
+    blind.extend(why)
     return r
 
 

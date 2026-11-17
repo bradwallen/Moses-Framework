@@ -244,6 +244,15 @@ def _liveness() -> Profile:
                    effort=os.environ.get("MOSES_CHAT_EFFORT", "low"), output="text")
 
 
+def _keepwarm() -> Profile:
+    # Keeps the OPERATOR's own Claude login from lapsing (agent/claude-keepwarm, once a day). His login
+    # was signed out on 2026-11-09 and again 2026-11-16, each time after days unused, while Moses's,
+    # used every 30 minutes by the liveness probe, never was. One short question a day on the smallest
+    # model makes the CLI refresh the login the way real use does. Nothing granted, nothing read.
+    return Profile("login-keepwarm", model=os.environ.get("MOSES_KEEPWARM_MODEL", "claude-haiku-5-5"),
+                   effort="low", output="text")
+
+
 def _scout() -> Profile:
     # Checks an idea against the code before it is proposed or built (agent/scout.py). Read, Grep and
     # Glob only: it cannot write and cannot run anything — not even git — so what it reports is what the
@@ -275,6 +284,7 @@ APPS: dict[str, tuple[str, object]] = {
     "moses-diagnosis": ("", _diagnosis),
     # The sixth launcher, found 2026-09-15: M20's inventory searched for `-p` and this used `--print`.
     "moses-liveness": ("", _liveness),
+    "login-keepwarm": ("", _keepwarm),
     "knight-builder": ("writes and tests code in his own clone, which has no remote; the Bash commands "
                        "are the short list in guards.env", _knight_builder),
     "zryachiy-reviewer": ("reads Knight's diff and runs read-only git commands; a reviewer that could "
@@ -284,7 +294,7 @@ APPS: dict[str, tuple[str, object]] = {
     "moses-scout": ("reads one repository to check whether an idea's premise exists in the code before "
                     "it is proposed or built; it can read and search, never write or run", _scout),
 }
-GRANTS_NOTHING = {"moses-diagnosis", "moses-liveness"}
+GRANTS_NOTHING = {"moses-diagnosis", "moses-liveness", "login-keepwarm"}
 
 # OPERATOR-LOCAL APPS. Agents that are one operator's own business rather than the framework's are
 # declared in agent/local_apps.py, which framework.map keeps private.

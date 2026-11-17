@@ -25,15 +25,80 @@ or Slack; he does not open a terminal to do it. This exists for when someone is 
 Every command is a call into mcp/projects.py — the same module the MCP tools use. Deliberately
 a wrapper with no logic of its own: this codebase has already been bitten by the same logic living in
 two files and quietly drifting apart.
+
+CHANGES GO THROUGH MOSES WHEN THIS ACCOUNT CANNOT WRITE THE REGISTRY (2026-11-11). Since MF8
+(2026-11-06) the registry belongs to the agent account and the operator only reads it: every share
+has one writer. This command kept writing the file directly, so every change failed with "Permission
+denied" (J57, found from another session). Reads still come straight from the file. Writes go to the
+Moses MCP server's own project tools, called with the operator key — the same door the Claude app's
+connector uses, so the registry keeps one writer and the same checks. Where this account CAN write
+the registry (a framework install with no agent account, the tests), it still writes it directly.
 """
 
 from __future__ import annotations
 
+import json
+import os
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent / "mcp"))
+_HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE.parent / "mcp"))
+sys.path.insert(0, str(_HERE / "lib"))
 import projects  # noqa: E402
+import moses_env as _env  # noqa: E402
+import mcp_key  # noqa: E402
+
+
+def _can_write() -> bool:
+    """projects.save writes a temp file beside the registry and renames it, so the FOLDER must be writable."""
+    reg = Path(projects.REGISTRY)
+    return os.access(reg.parent, os.W_OK) and (not reg.exists() or os.access(reg, os.W_OK))
+
+
+def _via_moses(tool: str, args: dict) -> str:
+    """Call one of the Moses MCP server's project tools as the operator. Returns its answer."""
+    why = f"this account cannot write {projects.REGISTRY} (since MF8 it belongs to Moses's account)"
+    key = mcp_key.load("operator", _env.CONFIG, _env.PEER_STATE or _env.STATE)
+    if not key:
+        raise projects.ProjectError(f"{why}, and no Moses MCP operator key is readable to send the change "
+                                    "through Moses. Nothing was changed. Use the Moses connector instead.")
+    url = os.environ.get("MOSES_MCP_URL") or _env.setting("MOSES_MCP_URL", "http://127.0.0.1:8765/mcp")
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Authorization": f"Bearer {key}", "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        hint = " (it refused the operator key)" if e.code in (401, 403) else ""
+        raise projects.ProjectError(f"{why}, and Moses's MCP server answered HTTP {e.code}{hint}. "
+                                    "Nothing was changed.")
+    except (urllib.error.URLError, OSError) as e:
+        raise projects.ProjectError(f"{why}, and Moses's MCP server at {url} did not answer "
+                                    f"({getattr(e, 'reason', e)}). Nothing was changed.")
+    for line in raw.splitlines():
+        line = line.removeprefix("data: ").strip()
+        if not line.startswith("{"):
+            continue
+        msg = json.loads(line)
+        if "error" in msg:
+            raise projects.ProjectError(f"Moses refused the call: {msg['error'].get('message', msg['error'])}")
+        res = msg.get("result") or {}
+        text = "\n".join(c.get("text", "") for c in res.get("content", []) if c.get("type") == "text").strip()
+        if res.get("isError") or text.startswith("Could not"):
+            raise projects.ProjectError(text or "Moses reported an error with no text")
+        return text or "(done)"
+    raise projects.ProjectError(f"Moses's MCP server answered, but not in a shape this understands: {raw[:200]!r}")
+
+
+def _write(local, tool: str, args: dict) -> str:
+    """The change itself: written here when this account may, otherwise sent through Moses."""
+    return local() if _can_write() else _via_moses(tool, args)
 
 
 def _target(rest: list[str]) -> tuple[str, str]:
@@ -59,35 +124,53 @@ def main(argv: list[str]) -> int:
                 i = rest.index("--rank"); rank = int(rest[i + 1]); rest = rest[:i] + rest[i + 2:]
             if "--scope" in rest:
                 i = rest.index("--scope"); scope = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
-            print(projects.add(" ".join(rest).strip(), rank=rank, scope=scope))
+            name = " ".join(rest).strip()
+            print(_write(lambda: projects.add(name, rank=rank, scope=scope), "project_add",
+                         {"name": name, "scope": scope, "rank": rank}))
         elif cmd == "set" and len(rest) >= 2:
-            print(projects.update(rest[0], rest[1], " ".join(rest[2:])))
+            value = " ".join(rest[2:])
+            print(_write(lambda: projects.update(rest[0], rest[1], value), "project_update",
+                         {"project": rest[0], "field": rest[1], "value": value}))
         elif cmd == "milestone" and len(rest) >= 2:
-            print(projects.add_milestone(rest[0], " ".join(rest[1:])))
+            title = " ".join(rest[1:])
+            print(_write(lambda: projects.add_milestone(rest[0], title), "project_add_milestone",
+                         {"project": rest[0], "title": title}))
         elif cmd == "idea" and len(rest) >= 2:
             note = ""
             if "--note" in rest:
                 i = rest.index("--note"); note = rest[i + 1]; rest = rest[:i] + rest[i + 2:]
-            print(projects.add_idea(rest[0], " ".join(rest[1:]), note=note))
+            title = " ".join(rest[1:])
+            print(_write(lambda: projects.add_idea(rest[0], title, note=note), "add_idea",
+                         {"idea": title, "project": rest[0], "note": note}))
         elif cmd == "item" and rest:
             print(projects.item(rest[0]))
         elif cmd == "promote" and rest:
-            print(projects.promote_idea(*_target(rest)))
+            pid, item = _target(rest)
+            print(_write(lambda: projects.promote_idea(pid, item), "project_promote_idea",
+                         {"item": item, "project": pid}))
         elif cmd == "unidea" and rest:
-            print(projects.remove_idea(*_target(rest)))
+            pid, item = _target(rest)
+            print(_write(lambda: projects.remove_idea(pid, item), "project_remove_idea",
+                         {"item": item, "project": pid}))
         elif cmd == "done" and rest:
             undo = "--undo" in rest
             rest = [r for r in rest if r != "--undo"]
-            print(projects.complete_milestone(*_target(rest), undo=undo))
+            pid, item = _target(rest)
+            print(_write(lambda: projects.complete_milestone(pid, item, undo=undo), "project_complete_milestone",
+                         {"item": item, "project": pid, "undo": undo}))
         elif cmd == "block" and len(rest) >= 2:
-            print(projects.add_blocker(rest[0], " ".join(rest[1:])))
+            text = " ".join(rest[1:])
+            print(_write(lambda: projects.add_blocker(rest[0], text), "project_add_blocker",
+                         {"project": rest[0], "blocker": text}))
         elif cmd == "unblock" and len(rest) >= 2:
-            print(projects.remove_blocker(rest[0], " ".join(rest[1:])))
+            text = " ".join(rest[1:])
+            print(_write(lambda: projects.remove_blocker(rest[0], text), "project_remove_blocker",
+                         {"project": rest[0], "blocker": text}))
         elif cmd == "rm" and rest:
             p = projects.find(projects.load(), rest[0])
             if input(f"remove '{p['name']}'? [y/N] ").strip().lower() != "y":
                 print("left alone"); return 0
-            print(projects.remove(rest[0]))
+            print(_write(lambda: projects.remove(rest[0]), "project_remove", {"project": rest[0]}))
         else:
             print("unknown command — try: moses-project help", file=sys.stderr)
             return 2

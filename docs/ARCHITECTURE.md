@@ -362,6 +362,40 @@ again — see [[project_labs_decommission_audit]].
 
 A service token needs Action `Service Auth`, never `Allow` — an Emails rule can never match a machine.
 
+### 2-ii. The agent's tokens are sealed to the TPM (2026-11-06, `agent/moses-seal`)
+
+Each `~/.config/moses/NAME.env` of the agent account's that holds a token (the name rule is
+`agent/lib/secret_names.py`, shared with the credential inventory) is sealed (`systemd-creds --user
+--with-key=host+tpm2`) to `creds/NAME.env.cred`, which opens only on this machine, for this account. The old path stays, as a link, so none of the ~25 readers changed:
+
+```
+ disk (and every backup)                 memory (tmpfs, gone at shutdown)
+ ~/.config/moses/creds/slack.env.cred ──► /run/user/<uid>/moses-creds/slack.env   mode 400
+           (sealed)          moses-creds.service      ▲
+                             (boot, Before= every     │ link
+                              unit that reads one)    │
+ ~/.config/moses/slack.env ───────────────────────────┘  ◄── `. slack.env`, EnvironmentFile=, read_text
+```
+
+- **Boot:** `moses-creds.service` (oneshot) unseals every `.cred` and restores a missing link; it never
+  overwrites a plain file at a sealed path (that is someone's newer token) — it reports it.
+- **Watched:** `moses-creds-check.timer` writes `sealed.json` hourly (names, never values). brad's drift
+  check `sealed` reads it (the agent's own copy, via MOSES_PEER_STATE): red when a sealed path is
+  plaintext again, a link is broken, or a plaintext token file sits beside sealed ones; blind when the
+  report is missing, over 2h old, or lists nothing. Its green is the agent's report about itself.
+- **Rewriting a token:** the memory copy is mode 400, so an in-place write fails loudly. To change one:
+  `moses-seal restore NAME`, edit, `moses-seal seal NAME`.
+- **Not covered:** anything running AS the agent can read its own tokens. Today's values are still in
+  every past backup, in the disk blocks the plain files used, and possibly in swap (unencrypted
+  `/swap.img`): only tokens issued after sealing have never been on disk, so rotate each one after
+  sealing. Key files (`mcp-keys/`) and CLI logins are not `.env` files and are not sealed.
+- **Unopenable if** the TPM is cleared or replaced, root's `/var/lib/systemd/credential.secret` is lost,
+  the machine-id changes, or the agent account is recreated (new uid or name). Recovery: new tokens.
+- **Boot failure:** `moses-creds.service` retries every minute (`Restart=on-failure`, no start limit)
+  and the readers retry on their own; `sealed.json` says which file failed, and drift turns red.
+- **Applied by** `sudo agent/mf8/mf8-seal.sh` (plan) / `--apply` / `--rollback`, every seal run as the
+  agent account. brad's own token files are not sealed: MF8 part 5 retires them.
+
 ---
 
 ## 2c. The delivery chain — who holds what, and where it stops

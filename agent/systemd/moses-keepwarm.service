@@ -1,0 +1,10 @@
+[Unit]
+Description=Moses — keep the operator's own Claude login from lapsing (agent/claude-keepwarm)
+
+[Service]
+Type=oneshot
+ExecStart=%h/Projects/moses/agent/claude-keepwarm
+# A signed-out login is a finding the 08:00 standup reports (drift's operator-login), not a unit fault.
+SuccessExitStatus=0 1
+TimeoutStartSec=5min
+Nice=10

@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""moses-seal — this account's token files, sealed to this machine's TPM on disk, unsealed into memory.
+
+    moses-seal plan           which token files would be sealed; changes nothing
+    moses-seal seal NAME      seal ~/.config/moses/NAME (slack.env, say) and point NAME at the unsealed copy
+    moses-seal unseal         unseal every sealed file into memory (moses-creds.service runs it at boot)
+    moses-seal status         write sealed.json to the state folder: names and counts, never a value
+    moses-seal restore NAME   undo one: NAME is a plain file again and its sealed copy is gone
+
+WHY (2026-11-06, from the Atlas comparison). Every token Moses holds was a plaintext KEY=value file, and a
+plaintext secret also lives in every backup that ever copied it (iDrive keeps them all). Sealed, the disk
+holds only `creds/NAME.cred`, which opens only on this machine: it needs both this TPM and root's host key
+(systemd-creds --with-key=host+tpm2, stated, so it never quietly falls back to the host key alone).
+A sealed copy taken off the box, or out of an archive, is noise. (The plain copies already made are not;
+see WHAT IT DOES NOT DO.)
+
+HOW, WITHOUT CHANGING A READER. About 25 programs read these files by path (`. slack.env`,
+EnvironmentFile=, read_text). So the path stays: after sealing, `~/.config/moses/NAME` is a link to
+`$XDG_RUNTIME_DIR/moses-creds/NAME`, a mode-400 copy in memory (tmpfs) that this command writes at boot.
+Mode 400 so a program that tries to rewrite a token in place fails loudly instead of writing into memory
+and losing it at the next reboot. A program that replaces the file (mv over it) turns the link back into
+plaintext, and status reports that as a problem, which the drift check turns red.
+
+WHAT IT DOES NOT DO.
+- Anything running AS this account can read its own tokens, sealed or not. Sealing narrows what can be
+  carried away; it does not stop a compromised process from using what it may use.
+- It does not take TODAY's values out of the copies that already exist: every past backup archive, the
+  disk blocks the plain file used (unlinked, not wiped), and swap (the memory copy can be paged out to
+  an unencrypted swap file). Only a token issued AFTER sealing has never been on disk. So: seal, then
+  rotate each token at its provider (restore NAME, put the new value in, seal NAME).
+- Nobody can open a sealed copy once any of these changes: this machine's TPM (cleared or replaced),
+  root's host key (/var/lib/systemd/credential.secret), this machine's machine-id, or this account's
+  uid or user name (a recreated account is a different one). The recovery is new tokens from each
+  provider. That is the price of copies being useless anywhere else.
+- It covers `~/.config/moses/*.env` only: not key files (mcp-keys/), not a CLI's own login file.
+
+Values travel on stdin and stdout only, never argv, and never into the status file or any message.
+"""
+from __future__ import annotations
+
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+import moses_env as _env  # noqa: E402
+from secret_names import env_keys, is_secret_name  # noqa: E402 — the inventory's rule, one copy
+
+CONFIG = _env.CONFIG
+CREDS = Path(os.environ.get("MOSES_SEAL_CREDS") or CONFIG / "creds")
+STATUS_NAME = "sealed.json"
+NAME_OK = re.compile(r"[a-z0-9][a-z0-9_-]*\.env")
+NOT_SEALED = {"moses.env"}  # settings, declared secret-free (moses_env.py), read before anything else
+
+
+class Refused(Exception):
+    pass
+
+
+def runtime_dir() -> Path:
+    explicit = os.environ.get("MOSES_SEAL_RUNTIME")
+    if explicit:
+        return Path(explicit)
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if not base:
+        raise Refused("XDG_RUNTIME_DIR is not set, so there is no in-memory folder to unseal into")
+    return Path(base) / "moses-creds"
+
+
+def own_dir(path: Path) -> Path:
+    """Create path (700) if needed and insist it is a real folder of this account's, shut to others."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise Refused(f"{path} is not a folder owned by this account")
+    if st.st_mode & 0o077:
+        os.chmod(path, 0o700)
+    return path
+
+
+def check_name(name: str) -> str:
+    if not NAME_OK.fullmatch(name) or name in NOT_SEALED:
+        raise Refused(f"{name!r} is not a token file name this seals (NAME.env, not moses.env)")
+    return name
+
+
+def secret_names(data: bytes) -> list[str]:
+    return [k for k in env_keys(data.decode(errors="replace")) if is_secret_name(k)]
+
+
+def _creds(args: list[str], data: bytes | None = None) -> bytes:
+    r = subprocess.run(["systemd-creds", "--user", *args], input=data, capture_output=True, timeout=60)
+    if r.returncode != 0:
+        # stderr is systemd's own message; it never contains the plaintext.
+        raise Refused(f"systemd-creds {args[0]} failed: {r.stderr.decode(errors='replace').strip()[:200]}")
+    return r.stdout
+
+
+def encrypt(name: str, data: bytes) -> bytes:
+    return _creds(["encrypt", "--with-key=host+tpm2", f"--name={name}", "-", "-"], data)
+
+
+def decrypt(name: str, blob_path: Path) -> bytes:
+    return _creds(["decrypt", f"--name={name}", str(blob_path), "-"])
+
+
+def _write_new(path: Path, data: bytes, mode: int) -> None:
+    """Write to a fresh temp file beside path, then rename over it: never a half-written token."""
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fd = -1
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if fd != -1:
+            os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _link_over(path: Path, target: Path) -> None:
+    tmp = path.with_name(f".{path.name}.link-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    os.symlink(target, tmp)
+    os.replace(tmp, path)
+
+
+def link_state(name: str, run: Path) -> str:
+    """'ok', or what is wrong with ~/.config/moses/NAME for a sealed NAME."""
+    p = CONFIG / name
+    try:
+        st = os.lstat(p)
+    except FileNotFoundError:
+        return "missing: no link at the old path"
+    if stat.S_ISREG(st.st_mode):
+        return "PLAINTEXT: a plain file is back at the old path beside its sealed copy"
+    if not stat.S_ISLNK(st.st_mode) or Path(os.readlink(p)) != run / name:
+        return f"the old path points somewhere else ({os.readlink(p) if stat.S_ISLNK(st.st_mode) else 'not a link'})"
+    try:
+        rt = os.lstat(run / name)
+    except FileNotFoundError:
+        return "not unsealed: the in-memory copy is missing (moses-creds.service did not run, or failed)"
+    if not stat.S_ISREG(rt.st_mode) or rt.st_uid != os.geteuid() or (rt.st_mode & 0o777) != 0o400:
+        return f"the in-memory copy is not a mode-400 file of this account's ({oct(rt.st_mode & 0o777)})"
+    return "ok"
+
+
+def sealed() -> list[str]:
+    if not CREDS.is_dir():
+        return []
+    return sorted(p.name[: -len(".cred")] for p in CREDS.iterdir()
+                  if p.name.endswith(".cred") and NAME_OK.fullmatch(p.name[: -len(".cred")]))
+
+
+def plaintext_token_files() -> dict[str, list[str]]:
+    out = {}
+    for p in sorted(CONFIG.glob("*.env")):
+        if p.name in NOT_SEALED or p.is_symlink() or not p.is_file():
+            continue
+        try:
+            names = secret_names(p.read_bytes())
+        except OSError:
+            continue
+        if names:
+            out[p.name] = names
+    return out
+
+
+# ── commands ──────────────────────────────────────────────────────────────────
+
+def cmd_plan() -> int:
+    plain = plaintext_token_files()
+    done = sealed()
+    for name, keys in plain.items():
+        print(f"would seal {name}  ({', '.join(keys)})")
+    for name in done:
+        print(f"sealed     {name}  ({link_state(name, runtime_dir())})")
+    if not plain and not done:
+        print(f"no token files in {CONFIG}")
+    return 0
+
+
+def cmd_seal(name: str) -> int:
+    check_name(name)
+    run = own_dir(runtime_dir())
+    own_dir(CREDS)
+    p = CONFIG / name
+    st = os.lstat(p)  # FileNotFoundError is the honest answer
+    if stat.S_ISLNK(st.st_mode):
+        raise Refused(f"{name} is already a link ({link_state(name, run)}); nothing to seal")
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
+        raise Refused(f"{name} is not a plain file of this account's")
+    data = p.read_bytes()
+    if not secret_names(data):
+        raise Refused(f"{name} holds no token-like name; nothing to seal")
+    blob = encrypt(name, data)
+    cred = CREDS / f"{name}.cred"
+    _write_new(cred, blob, 0o600)
+    # Prove the sealed copy opens to exactly what was there, before the plain file goes.
+    if decrypt(name, cred) != data:
+        cred.unlink(missing_ok=True)
+        raise Refused(f"the sealed copy of {name} did not open to the same bytes; nothing changed")
+    _write_new(run / name, data, 0o400)
+    now = os.lstat(p)
+    if (now.st_ino, now.st_mtime_ns, now.st_size) != (st.st_ino, st.st_mtime_ns, st.st_size):
+        cred.unlink(missing_ok=True)
+        (run / name).unlink(missing_ok=True)
+        raise Refused(f"{name} changed while it was being sealed; nothing changed, run it again")
+    _link_over(p, run / name)
+    print(f"sealed {name}: {cred} on disk, {run / name} in memory, {p} -> it")
+    write_status()
+    return 0
+
+
+def cmd_unseal() -> int:
+    run = own_dir(runtime_dir())
+    bad = 0
+    try:
+        for name in sealed():
+            # One file's trouble (a TPM hiccup, a full tmpfs) never stops the others, or the report.
+            try:
+                data = decrypt(name, CREDS / f"{name}.cred")
+                _write_new(run / name, data, 0o400)
+                p = CONFIG / name
+                if not os.path.lexists(p):
+                    _link_over(p, run / name)
+            except (Refused, OSError) as e:
+                print(f"moses-seal: {name}: {e}", file=sys.stderr)
+                bad += 1
+                continue
+            state = link_state(name, run)
+            if state != "ok":
+                # Never overwrite what is at the old path: a plain file there is someone's newer token.
+                print(f"moses-seal: {name}: {state}", file=sys.stderr)
+                bad += 1
+    finally:
+        write_status()
+    return 1 if bad else 0
+
+
+def cmd_restore(name: str) -> int:
+    check_name(name)
+    run = runtime_dir()
+    cred = CREDS / f"{name}.cred"
+    if not cred.is_file():
+        raise Refused(f"{name} has no sealed copy")
+    p = CONFIG / name
+    if os.path.lexists(p) and not (p.is_symlink() and Path(os.readlink(p)) == run / name):
+        raise Refused(f"{p} is not the link this made ({link_state(name, run)}); restore it by hand")
+    data = decrypt(name, cred)
+    _write_new(p, data, 0o600)
+    cred.unlink()
+    (run / name).unlink(missing_ok=True)
+    print(f"restored {name}: a plain mode-600 file again; its sealed copy is gone")
+    write_status()
+    return 0
+
+
+def write_status() -> dict:
+    try:
+        run = runtime_dir()
+    except Refused as e:
+        run = None
+        why = str(e)
+    names = sealed()
+    doc = {
+        "written": int(time.time()),
+        "written_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "account": pwd.getpwuid(os.geteuid()).pw_name,
+        "sealed": {n: (link_state(n, run) if run else why) for n in names},
+        "plaintext": plaintext_token_files(),
+    }
+    state = Path(_env.STATE)
+    state.mkdir(parents=True, exist_ok=True)
+    _write_new(state / STATUS_NAME, (json.dumps(doc, indent=1, sort_keys=True) + "\n").encode(), 0o640)
+    os.chmod(state / STATUS_NAME, 0o640)  # the operator's account reads it (MOSES_PEER_STATE)
+    return doc
+
+
+def cmd_status() -> int:
+    doc = write_status()
+    for n, s in doc["sealed"].items():
+        print(f"sealed     {n}: {s}")
+    for n, keys in doc["plaintext"].items():
+        print(f"PLAINTEXT  {n}: {', '.join(keys)}")
+    return 0 if all(s == "ok" for s in doc["sealed"].values()) else 1
+
+
+def main(argv: list[str]) -> int:
+    cmds = {"plan": (cmd_plan, 0), "unseal": (cmd_unseal, 0), "status": (cmd_status, 0),
+            "seal": (cmd_seal, 1), "restore": (cmd_restore, 1)}
+    if not argv or argv[0] not in cmds or len(argv) - 1 != cmds[argv[0]][1]:
+        print(__doc__.split("\n\n")[1], file=sys.stderr)
+        return 2
+    if os.geteuid() == 0:
+        print("moses-seal: run it as the account whose tokens these are, not root "
+              "(a sealed file opens only for the account that sealed it)", file=sys.stderr)
+        return 2
+    os.umask(0o077)
+    try:
+        return cmds[argv[0]][0](*argv[1:])
+    except (Refused, FileNotFoundError) as e:
+        print(f"moses-seal: STOPPED — {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

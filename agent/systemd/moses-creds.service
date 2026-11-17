@@ -1,0 +1,19 @@
+[Unit]
+Description=Moses — unseal this account's token files into memory (agent/moses-seal)
+# The sealed copies live in ~/.config/moses/creds; the readers find them at the old paths, which are
+# links into $XDG_RUNTIME_DIR/moses-creds. Before every unit that reads a token, so they find it at boot.
+Before=moses.service moses-mcp.service moses-mcp-public.service moses-dashboard.service
+Before=moses-liveness.service moses-deadman.service moses-inbox.service moses-pull.service
+# A TPM or varlink hiccup at boot must not need a person: it tries again every minute, for good. The
+# readers retry on their own (moses.service: Restart=on-failure) and find the file once it is there.
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=60
+ExecStart=/usr/bin/python3 %h/Projects/moses/agent/moses-seal unseal
+
+[Install]
+WantedBy=default.target
